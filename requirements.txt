@@ -1,0 +1,14 @@
+# Core Frameworks
+torch>=2.4.0                 # PyTorch for running the Perplexity Scorer (GPT-2)
+transformers>=4.44.0         # Hugging Face interface for downloading/running models
+
+# NLP Libraries
+spacy>=3.8.0                 # Natural language processing for style analysis (markov.py)
+sentence-transformers>=2.2.0 # For semantic similarity with embeddings
+
+# Utilities
+requests>=2.32.0             # To communicate with the local Ollama API
+accelerate>=0.33.0           # Optimizes model loading (crucial for local inference)
+sentencepiece>=0.2.0         # Tokenizer dependency required by many modern models
+numpy>=1.26.0                # Math operations for tensor manipulation
+protobuf>=5.27.0             # Serialization protocol often needed by Transformers

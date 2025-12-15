@@ -1104,6 +1104,231 @@ class AgenticHumanizer:
 
         return patterns
 
+    def _get_sample_sentence_patterns(self):
+        """
+        Extract sentence patterns from sample text for voice matching.
+
+        Returns dict with:
+        - examples: Sample sentences showing the voice/style
+        - avg_sentence_length: Average words per sentence
+        - sentence_structures: Common sentence structure patterns
+        - voice_characteristics: Direct vs complex, active vs passive, etc.
+        """
+        try:
+            sample_path = Path(__file__).parent / "prompts" / "sample.txt"
+            if not sample_path.exists():
+                return self._default_sentence_patterns()
+
+            with open(sample_path, 'r') as f:
+                sample_text = f.read()
+
+            doc = self.markov_agent.analyzer.nlp(sample_text[:5000])  # First 5000 chars
+            sentences = [str(s).strip() for s in doc.sents if len(str(s).split()) > 5]
+
+            if not sentences:
+                return self._default_sentence_patterns()
+
+            # Calculate average sentence length
+            lengths = [len(s.split()) for s in sentences]
+            avg_length = sum(lengths) / len(lengths) if lengths else 15
+
+            # Get example sentences that represent the voice
+            good_examples = [s for s in sentences if 10 <= len(s.split()) <= 30][:10]
+
+            # Analyze sentence structures
+            structures = self._analyze_sentence_structures(sentences[:50])
+
+            return {
+                'examples': '\n'.join(good_examples),
+                'avg_sentence_length': avg_length,
+                'sentence_structures': structures,
+                'voice_characteristics': {
+                    'is_direct': avg_length < 20,
+                    'uses_complex_clauses': any('which' in s or 'that is' in s for s in sentences[:20]),
+                    'uses_references': any('said' in s or 'according' in s.lower() for s in sentences[:20]),
+                    'declarative_style': True  # Sample is declarative/analytical
+                }
+            }
+        except Exception as e:
+            print(f">> Warning: Could not extract sample patterns: {e}")
+            return self._default_sentence_patterns()
+
+    def _default_sentence_patterns(self):
+        """Default patterns if sample cannot be analyzed."""
+        return {
+            'examples': 'The law of contradiction in things is the most basic law in materialist dialectics.',
+            'avg_sentence_length': 18,
+            'sentence_structures': {'declarative': 0.7, 'complex': 0.2, 'compound': 0.1},
+            'voice_characteristics': {
+                'is_direct': True,
+                'uses_complex_clauses': True,
+                'uses_references': True,
+                'declarative_style': True
+            }
+        }
+
+    def _analyze_sentence_structures(self, sentences):
+        """Analyze the structural patterns of sample sentences."""
+        structures = {'declarative': 0, 'complex': 0, 'compound': 0, 'question': 0}
+
+        for sent in sentences:
+            sent_lower = sent.lower()
+            if '?' in sent:
+                structures['question'] += 1
+            elif ', and ' in sent or ', but ' in sent:
+                structures['compound'] += 1
+            elif 'which' in sent_lower or 'that' in sent_lower or 'because' in sent_lower:
+                structures['complex'] += 1
+            else:
+                structures['declarative'] += 1
+
+        total = sum(structures.values()) or 1
+        return {k: v / total for k, v in structures.items()}
+
+    def _matches_sample_voice(self, text, sample_patterns):
+        """
+        Check if text roughly matches the sample's voice patterns.
+
+        Returns True if the text already sounds like the sample.
+        """
+        if not text or not sample_patterns:
+            return True
+
+        doc = self.markov_agent.analyzer.nlp(text)
+        sentences = list(doc.sents)
+
+        if not sentences:
+            return True
+
+        # Check average sentence length (should be within 30% of sample)
+        avg_length = sum(len(str(s).split()) for s in sentences) / len(sentences)
+        sample_avg = sample_patterns.get('avg_sentence_length', 18)
+
+        if abs(avg_length - sample_avg) > sample_avg * 0.5:
+            return False  # Too different in length
+
+        # Check for AI-typical patterns that don't match sample
+        text_lower = text.lower()
+        ai_patterns = ['it is important to note', 'significantly', 'furthermore', 'moreover',
+                       'plays a crucial role', 'in conclusion', 'the implications']
+
+        if any(p in text_lower for p in ai_patterns):
+            return False  # Has AI patterns
+
+        return True
+
+    def _restructure_sentence_groups(self, paragraph):
+        """
+        Restructure groups of 2-3 sentences to match sample voice.
+
+        This allows content to move BETWEEN sentences while preserving meaning.
+        The goal is to match the sentence patterns and voice of the sample text.
+        """
+        doc = self.markov_agent.analyzer.nlp(paragraph)
+        sentences = [str(s).strip() for s in doc.sents]
+
+        if len(sentences) < 2:
+            return paragraph
+
+        # Get sample sentence patterns for comparison
+        sample_patterns = self._get_sample_sentence_patterns()
+
+        result_groups = []
+        i = 0
+        groups_restructured = 0
+
+        while i < len(sentences):
+            # Take groups of 2-3 sentences
+            group_size = min(3, len(sentences) - i)
+            group = sentences[i:i + group_size]
+            group_text = ' '.join(group)
+
+            # Check if group needs restructuring
+            if not self._matches_sample_voice(group_text, sample_patterns) and groups_restructured < 3:
+                # Restructure to match sample voice
+                restructured = self._restructure_to_sample_voice(group_text, sample_patterns)
+                if restructured and restructured != group_text:
+                    result_groups.append(restructured)
+                    groups_restructured += 1
+                    print(f"      >> Restructured sentence group to match sample voice")
+                else:
+                    result_groups.append(group_text)
+            else:
+                result_groups.append(group_text)
+
+            i += group_size
+
+        return ' '.join(result_groups)
+
+    def _restructure_to_sample_voice(self, sentence_group, sample_patterns):
+        """
+        Use LLM to restructure sentence group to match sample voice.
+
+        Key constraints:
+        1. Preserve ALL factual content
+        2. Match sample sentence structure patterns
+        3. Can combine/split sentences
+        4. Can move clauses between sentences
+        """
+        examples = sample_patterns.get('examples', '')[:600]
+        voice_char = sample_patterns.get('voice_characteristics', {})
+        avg_len = sample_patterns.get('avg_sentence_length', 18)
+
+        voice_desc = []
+        if voice_char.get('is_direct'):
+            voice_desc.append("direct and clear")
+        if voice_char.get('uses_complex_clauses'):
+            voice_desc.append("uses subordinate clauses (which, that, because)")
+        if voice_char.get('declarative_style'):
+            voice_desc.append("declarative and analytical")
+
+        voice_str = ", ".join(voice_desc) if voice_desc else "clear and direct"
+
+        prompt = f"""Restructure these sentences to match this writing style:
+
+SAMPLE STYLE (match this voice):
+{examples}
+
+STYLE CHARACTERISTICS:
+- Voice: {voice_str}
+- Average sentence length: ~{int(avg_len)} words
+- Can combine short sentences or split long ones
+- Can move clauses between sentences
+
+SENTENCES TO RESTRUCTURE:
+{sentence_group}
+
+CRITICAL RULES:
+1. Preserve ALL factual content and meaning - do NOT remove any information
+2. Match the sentence structure patterns of the sample
+3. You MAY combine sentences or split them
+4. You MAY move clauses between sentences to improve flow
+5. AVOID these AI-typical phrases: "It is important to note", "significantly impacts", "plays a crucial role", "furthermore", "moreover"
+6. Use simple, direct language like the sample
+7. AVOID semicolons unless absolutely necessary
+8. Output ONLY the restructured text, nothing else"""
+
+        try:
+            result = self.call_model(self.editor_model, prompt, system_prompt=self.structural_editor_prompt)
+            if result and result.strip():
+                # Validate the result preserves key content
+                original_words = set(sentence_group.lower().split())
+                result_words = set(result.lower().split())
+
+                # Check that we haven't lost too many content words
+                content_words = {w for w in original_words if len(w) > 4 and w.isalpha()}
+                preserved = len(content_words & result_words) / len(content_words) if content_words else 1
+
+                if preserved >= 0.7:  # At least 70% of content words preserved
+                    return result.strip()
+                else:
+                    print(f"      >> Restructure rejected: only {preserved:.0%} content preserved")
+                    return sentence_group
+            return sentence_group
+        except Exception as e:
+            print(f"      >> Warning: Could not restructure sentences: {e}")
+            return sentence_group
+
     def _simplify_metaphors(self, text):
         """
         Simplify AI-typical metaphors and flowery language.
@@ -2029,10 +2254,21 @@ Output ONLY the polished text."""
             else:
                 simplified_para = para
 
+            # ========== PHASE 0.5: SENTENCE GROUP RESTRUCTURING ==========
+            # Restructure groups of 2-3 sentences to match sample voice
+            # This can move content BETWEEN sentences to match the sample's tone
+            print(f"    [VOICE] Checking voice match...")
+            sample_patterns = self._get_sample_sentence_patterns()
+            if not self._matches_sample_voice(simplified_para, sample_patterns):
+                print(f"    [VOICE] Restructuring sentences to match sample voice...")
+                voice_matched_para = self._restructure_sentence_groups(simplified_para)
+            else:
+                voice_matched_para = simplified_para
+
             # ========== PHASE 1: STRUCTURAL TEMPLATE TRANSFER ==========
             # Apply structural templates from sample text
             # This transfers punctuation patterns WITHOUT changing words
-            structured_para = self._apply_structural_templates(simplified_para)
+            structured_para = self._apply_structural_templates(voice_matched_para)
 
             # ========== PHASE 2: ALGORITHMIC MANIPULATION ==========
             # Apply algorithmic sentence manipulation (NO AI INVOLVED)

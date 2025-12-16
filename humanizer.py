@@ -466,9 +466,17 @@ class StyleTransferPipeline:
                         print(f"  [Stats] Document-level hints: {len(accumulated_hints)}")
             else:
                 # Fallback to original if transformation failed
-                transformed_paragraphs.append(para)
+                # Use item text (could be paragraph string or semantic chunk)
+                if hasattr(item, 'original_text'):
+                    fallback_text = item.original_text
+                elif isinstance(item, str):
+                    fallback_text = item
+                else:
+                    # For semantic chunks, try to reconstruct from claims
+                    fallback_text = " ".join([claim.text for claim in item.claims[:3]]) if hasattr(item, 'claims') else str(item)
+                transformed_paragraphs.append(fallback_text)
                 if verbose:
-                    print(f"  WARNING: Using original paragraph (transformation failed)")
+                    print(f"  WARNING: Using original {item_type.rstrip('s')} (transformation failed)")
 
             total_iterations += result.iterations
             if result.final_verification:

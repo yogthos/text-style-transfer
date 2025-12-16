@@ -27,7 +27,7 @@ from structural_analyzer import (
 from example_selector import ExampleSelector
 from ai_word_replacer import AIWordReplacer
 from semantic_word_mapper import SemanticWordMapper
-from template_generator import TemplateGenerator
+from template_generator import TemplateGenerator, ParagraphTemplate
 
 
 @dataclass
@@ -42,6 +42,7 @@ class SynthesisResult:
     hints_applied: List[str] = field(default_factory=list)
     template_opener_type: Optional[str] = None  # For tracking variety across paragraphs
     template_opener_phrase: Optional[str] = None  # For exact repetition avoidance
+    paragraph_template: Optional[ParagraphTemplate] = None  # Template used for generation
 
 
 class LLMProvider:
@@ -287,6 +288,7 @@ class Synthesizer:
         # Generate structural template based on CONTEXT (input + preceding output)
         structural_template = None
         template_opener_type = None
+        paragraph_template = None
         if self.template_generator and position_in_document:
             para_idx, total_paras = position_in_document
             position_ratio = para_idx / max(total_paras - 1, 1) if total_paras > 1 else 0.5
@@ -325,7 +327,7 @@ class Synthesizer:
             )
 
             # Track opener type from this template for variety tracking
-            template = self.template_generator.generate_template_from_context(
+            paragraph_template = self.template_generator.generate_template_from_context(
                 input_text=input_text,
                 preceding_output=preceding_output,
                 example_selector=self.example_selector,
@@ -337,8 +339,8 @@ class Synthesizer:
                 paragraph_index=para_idx
             )
             template_opener_phrase = None
-            if template.sentences:
-                template_opener_type = template.sentences[0].opener_type
+            if paragraph_template and paragraph_template.sentences:
+                template_opener_type = paragraph_template.sentences[0].opener_type
                 # Note: opener phrase will be extracted from output text after synthesis
 
         # Build the synthesis prompt with structural awareness
@@ -394,7 +396,8 @@ class Synthesizer:
             iteration=iteration,
             hints_applied=hints_applied,
             template_opener_type=template_opener_type,
-            template_opener_phrase=template_opener_phrase
+            template_opener_phrase=template_opener_phrase,
+            paragraph_template=paragraph_template
         )
 
     def synthesize_from_chunk(self,
@@ -453,8 +456,9 @@ class Synthesizer:
 
         # Get template if available
         structural_template = ""
+        paragraph_template = None
         if self.template_generator:
-            template = self.template_generator.generate_template_from_context(
+            paragraph_template = self.template_generator.generate_template_from_context(
                 input_text=dummy_input,
                 preceding_output=preceding_output,
                 example_selector=self.example_selector,
@@ -464,8 +468,8 @@ class Synthesizer:
                 used_openers=used_openers,
                 used_phrases=used_phrases,
             )
-            if template:
-                structural_template = template.to_constraint_string(used_phrases=used_phrases)
+            if paragraph_template:
+                structural_template = paragraph_template.to_constraint_string(used_phrases=used_phrases)
 
         # Add target length/sentence constraints if provided
         if target_length > 0 or target_sentence_count > 0:
@@ -525,7 +529,8 @@ class Synthesizer:
             provider_used=self.llm.provider,
             model_used=self.llm.model,
             iteration=iteration,
-            hints_applied=[hint.suggestion for hint in transformation_hints] if transformation_hints else []
+            hints_applied=[hint.suggestion for hint in transformation_hints] if transformation_hints else [],
+            paragraph_template=paragraph_template
         )
 
     def _build_system_prompt(self, style_profile: StyleProfile, is_refinement: bool = False) -> str:

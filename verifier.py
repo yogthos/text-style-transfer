@@ -28,6 +28,8 @@ from structural_analyzer import (
     StructuralPattern
 )
 from style_statistics import StyleStatisticsAnalyzer
+from sentence_validator import SentenceValidator
+from template_generator import ParagraphTemplate
 
 
 @dataclass
@@ -245,7 +247,9 @@ class Verifier:
                previous_score: float = 0.0,
                accumulated_context: Optional[str] = None,
                position_in_document: Optional[Tuple[int, int]] = None,
-               used_phrases: Optional[List[str]] = None) -> VerificationResult:
+               used_phrases: Optional[List[str]] = None,
+               paragraph_template: Optional[ParagraphTemplate] = None,
+               sentence_validator: Optional[SentenceValidator] = None) -> VerificationResult:
         """
         Verify synthesis output against input and target style.
 
@@ -299,6 +303,13 @@ class Verifier:
             accumulated_context=accumulated_context,
             position_in_document=position_in_document
         )
+
+        # Add sentence template validation hints (CRITICAL - must be checked)
+        sentence_template_hints = self._validate_sentence_templates(
+            output_text, paragraph_template, sentence_validator
+        )
+        if sentence_template_hints:
+            transformation_hints.extend(sentence_template_hints)
 
         # Calculate overall improvement score
         current_score = self._calculate_overall_score(
@@ -455,6 +466,54 @@ class Verifier:
         # LIMIT: Return max 15 hints, sorted by priority
         hints.sort(key=lambda h: h.priority)
         return hints[:15]
+
+    def _validate_sentence_templates(self,
+                                    output_text: str,
+                                    paragraph_template: Optional[ParagraphTemplate],
+                                    sentence_validator: Optional[SentenceValidator]) -> List[TransformationHint]:
+        """
+        Validate each sentence in output against its template.
+
+        Returns list of transformation hints for sentences that don't match their templates.
+        """
+        hints = []
+
+        if not paragraph_template or not sentence_validator:
+            return hints
+
+        # Split output into sentences
+        doc = self.semantic_extractor.nlp(output_text)
+        output_sentences = list(doc.sents)
+
+        if not output_sentences:
+            return hints
+
+        # Match each output sentence to its template
+        for i, output_sent in enumerate(output_sentences):
+            if i >= len(paragraph_template.sentences):
+                break  # More sentences than template (might be OK, but could be an issue)
+
+            sentence_template = paragraph_template.sentences[i]
+            sentence_text = output_sent.text.strip()
+
+            # Validate sentence against template
+            issues = sentence_validator.validate_sentence(sentence_text, sentence_template)
+
+            for issue in issues:
+                # Determine priority: mismatches are critical, others are important
+                priority = 1 if "mismatch" in issue.description.lower() else 2
+
+                hints.append(TransformationHint(
+                    sentence_index=i,
+                    current_text=sentence_text[:100],
+                    structural_role=paragraph_template.structural_role,
+                    expected_patterns=[sentence_template.to_template_string()],
+                    issue=f"S{i+1}: {issue.description}",
+                    suggestion=f"S{i+1}: {issue.fix_guidance}",
+                    priority=priority
+                ))
+
+        return hints
 
     def _extract_opener_phrase(self, text: str) -> str:
         """Extract the actual opener phrase (first 2-3 words) from text.

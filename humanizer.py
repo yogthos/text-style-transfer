@@ -28,6 +28,7 @@ from structural_analyzer import StructuralAnalyzer, StructuralPattern
 from cadence_analyzer import CadenceAnalyzer, CadenceProfile
 from semantic_regrouper import SemanticRegrouper, SemanticChunk
 from phrase_distribution_analyzer import PhraseDistributionAnalyzer
+from sentence_validator import SentenceValidator
 
 
 @dataclass
@@ -148,6 +149,20 @@ class StyleTransferPipeline:
                 print(f"  - Analyzed {dist.total_paragraphs} paragraphs")
                 print(f"  - Found {len(dist.phrase_frequencies)} unique opener phrases")
 
+        # Initialize sentence validator (if enabled)
+        self.sentence_validator = None
+        sentence_config = self._get_sentence_config()
+        if sentence_config.get("enabled", True):
+            print("Initializing sentence validator...")
+            word_count_tolerance = sentence_config.get("word_count_tolerance", 0.2)
+            require_exact_opener = sentence_config.get("require_exact_opener", True)
+            self.sentence_validator = SentenceValidator(
+                word_count_tolerance=word_count_tolerance,
+                require_exact_opener=require_exact_opener
+            )
+            print(f"  - Word count tolerance: ±{word_count_tolerance*100:.0f}%")
+            print(f"  - Require exact opener: {require_exact_opener}")
+
         print(f"Pipeline ready (provider: {self.synthesizer.llm.provider}, max_retries: {self.max_retries})")
 
     def _load_pipeline_config(self, max_retries_override: Optional[int] = None):
@@ -213,6 +228,23 @@ class StyleTransferPipeline:
                 with open(config_path, 'r', encoding='utf-8') as f:
                     config = json.load(f)
                     return config.get("phrase_distribution", {})
+            except (json.JSONDecodeError, IOError):
+                pass
+
+        return {}  # Return empty dict with defaults
+
+    def _get_sentence_config(self) -> Dict[str, Any]:
+        """Get sentence validation configuration from config file."""
+        if self.config_path is None:
+            config_path = Path(__file__).parent / "config.json"
+        else:
+            config_path = Path(self.config_path)
+
+        if config_path.exists():
+            try:
+                with open(config_path, 'r', encoding='utf-8') as f:
+                    config = json.load(f)
+                    return config.get("sentence_validation", {})
             except (json.JSONDecodeError, IOError):
                 pass
 
@@ -606,6 +638,31 @@ class StyleTransferPipeline:
                     print("    WARNING: Empty output from synthesizer")
                 continue
 
+            # Validate sentences against template BEFORE verification
+            sentence_hints = []
+            paragraph_template = synthesis_result.paragraph_template
+            if paragraph_template and self.sentence_validator:
+                sentence_hints = self.verifier._validate_sentence_templates(
+                    synthesis_result.output_text,
+                    paragraph_template,
+                    self.sentence_validator
+                )
+
+            # If CRITICAL sentence hints exist, add to transformation hints and continue iteration
+            critical_sentence_hints = [h for h in sentence_hints if h.priority == 1]
+            if critical_sentence_hints:
+                if transformation_hints:
+                    transformation_hints.extend(critical_sentence_hints)
+                else:
+                    transformation_hints = critical_sentence_hints
+
+                # Force another iteration (don't accept this output)
+                if verbose:
+                    print(f"    REJECTED: {len(critical_sentence_hints)} sentences don't match templates")
+                    for hint in critical_sentence_hints[:3]:
+                        print(f"      - {hint.issue}")
+                continue  # Skip verification, regenerate
+
             # Track opener type and phrase for variety
             if synthesis_result.template_opener_type:
                 last_opener_type = synthesis_result.template_opener_type
@@ -628,7 +685,9 @@ class StyleTransferPipeline:
                 previous_score=best_score,
                 accumulated_context=accumulated_text,
                 position_in_document=self._current_position,  # Set by caller
-                used_phrases=used_phrases  # For phrase repetition detection
+                used_phrases=used_phrases,  # For phrase repetition detection
+                paragraph_template=paragraph_template,  # For sentence validation
+                sentence_validator=self.sentence_validator  # For sentence validation
             )
 
             # Calculate score and track improvement
@@ -795,6 +854,29 @@ class StyleTransferPipeline:
             if not synthesis_result.output_text:
                 continue
 
+            # Validate sentences against template BEFORE verification
+            sentence_hints = []
+            paragraph_template = synthesis_result.paragraph_template
+            if paragraph_template and self.sentence_validator:
+                sentence_hints = self.verifier._validate_sentence_templates(
+                    synthesis_result.output_text,
+                    paragraph_template,
+                    self.sentence_validator
+                )
+
+            # If CRITICAL sentence hints exist, add to transformation hints and continue iteration
+            critical_sentence_hints = [h for h in sentence_hints if h.priority == 1]
+            if critical_sentence_hints:
+                if transformation_hints:
+                    transformation_hints.extend(critical_sentence_hints)
+                else:
+                    transformation_hints = critical_sentence_hints
+
+                # Force another iteration (don't accept this output)
+                if verbose:
+                    print(f"    REJECTED: {len(critical_sentence_hints)} sentences don't match templates")
+                continue  # Skip verification, regenerate
+
             # Verify (create dummy input text from claims for verification)
             dummy_input_text = " ".join([claim.text for claim in chunk_semantics.claims[:3]])
             verification = self.verifier.verify(
@@ -803,7 +885,9 @@ class StyleTransferPipeline:
                 input_semantics=chunk_semantics,
                 target_style=self._style_profile,
                 iteration=iteration,
-                position_in_document=position_in_document
+                position_in_document=position_in_document,
+                paragraph_template=paragraph_template,  # For sentence validation
+                sentence_validator=self.sentence_validator  # For sentence validation
             )
 
             score = self._calculate_score(verification)

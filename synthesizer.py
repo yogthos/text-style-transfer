@@ -39,6 +39,7 @@ class SynthesisResult:
     model_used: str
     iteration: int = 0
     hints_applied: List[str] = field(default_factory=list)
+    template_opener_type: Optional[str] = None  # For tracking variety across paragraphs
 
 
 class LLMProvider:
@@ -215,7 +216,8 @@ class Synthesizer:
                    preceding_output: Optional[str] = None,
                    transformation_hints: Optional[List[TransformationHint]] = None,
                    iteration: int = 0,
-                   position_in_document: Optional[tuple] = None) -> SynthesisResult:
+                   position_in_document: Optional[tuple] = None,
+                   used_openers: Optional[List[str]] = None) -> SynthesisResult:
         """
         Synthesize new text expressing input meaning in sample style.
 
@@ -228,6 +230,7 @@ class Synthesizer:
             transformation_hints: Hints from previous iteration to guide refinement
             iteration: Current iteration number
             position_in_document: Tuple of (paragraph_index, total_paragraphs) for template selection
+            used_openers: List of opener types already used in this document (for variety)
 
         Returns:
             SynthesisResult with output text and metadata
@@ -248,6 +251,7 @@ class Synthesizer:
 
         # Generate structural template based on position
         structural_template = None
+        template_opener_type = None
         if self.template_generator and position_in_document:
             para_idx, total_paras = position_in_document
             position_ratio = para_idx / max(total_paras - 1, 1) if total_paras > 1 else 0.5
@@ -262,11 +266,22 @@ class Synthesizer:
             else:
                 role = 'body'
 
-            # Get template with claim count for sizing
+            # Get template with claim count for sizing, using used_openers for variety
             claim_count = len(semantic_content.claims)
             structural_template = self.template_generator.get_template_prompt(
-                role, position_ratio, claim_count
+                role, position_ratio, claim_count,
+                used_openers=used_openers,
+                paragraph_index=para_idx
             )
+
+            # Track opener type from this template for variety tracking
+            template = self.template_generator.generate_template(
+                role, position_ratio, claim_count // 2,
+                used_openers=used_openers,
+                paragraph_index=para_idx
+            )
+            if template.sentences:
+                template_opener_type = template.sentences[0].opener_type
 
         # Build the synthesis prompt with structural awareness
         system_prompt = self._build_system_prompt(style_profile, iteration > 0)
@@ -315,7 +330,8 @@ class Synthesizer:
             provider_used=self.llm.provider,
             model_used=self.llm.model,
             iteration=iteration,
-            hints_applied=hints_applied
+            hints_applied=hints_applied,
+            template_opener_type=template_opener_type
         )
 
     def _build_system_prompt(self, style_profile: StyleProfile, is_refinement: bool = False) -> str:

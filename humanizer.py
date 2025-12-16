@@ -39,6 +39,7 @@ class PipelineResult:
     error: Optional[str]
     improvement_history: List[float] = field(default_factory=list)
     convergence_achieved: bool = False
+    opener_type_used: Optional[str] = None  # For tracking variety across paragraphs
 
     def to_dict(self) -> Dict:
         return {
@@ -48,7 +49,8 @@ class PipelineResult:
             'final_verification': self.final_verification.to_dict() if self.final_verification else None,
             'error': self.error,
             'improvement_history': self.improvement_history,
-            'convergence_achieved': self.convergence_achieved
+            'convergence_achieved': self.convergence_achieved,
+            'opener_type_used': self.opener_type_used
         }
 
     def to_json(self, indent: int = 2) -> str:
@@ -241,6 +243,9 @@ class StyleTransferPipeline:
         # Track accumulated output for statistical verification
         accumulated_hints = []  # Hints that apply to the whole document
 
+        # Track used opener types for variety across paragraphs
+        used_openers = []
+
         for i, para in enumerate(paragraphs):
             if verbose:
                 print(f"\n--- Paragraph {i + 1}/{len(paragraphs)} ---")
@@ -254,7 +259,7 @@ class StyleTransferPipeline:
             # Position tracking for position-aware style checks
             position = (i, len(paragraphs))
 
-            # Transform this paragraph with full document context
+            # Transform this paragraph with full document context and variety tracking
             result = self._transform_paragraph_with_context(
                 paragraph=para,
                 full_document=input_text,
@@ -262,11 +267,18 @@ class StyleTransferPipeline:
                 preceding_output=preceding_output,
                 doc_level_hints=doc_level_hints,
                 position_in_document=position,
+                used_openers=used_openers,  # Pass for variety
                 verbose=verbose
             )
 
             if result.output_text:
                 transformed_paragraphs.append(result.output_text)
+
+                # Track the opener type used for variety
+                if result.opener_type_used:
+                    used_openers.append(result.opener_type_used)
+                    if verbose:
+                        print(f"  [Variety] Opener type: {result.opener_type_used} (avoiding: {used_openers[-3:] if len(used_openers) > 1 else 'none yet'})")
 
                 # Every 3 paragraphs, run statistical check on accumulated output
                 if (i + 1) % 3 == 0 and self.verifier._stats_initialized:
@@ -333,6 +345,7 @@ class StyleTransferPipeline:
                                           preceding_output: Optional[str],
                                           doc_level_hints: Optional[List[str]] = None,
                                           position_in_document: Optional[Tuple[int, int]] = None,
+                                          used_openers: Optional[List[str]] = None,
                                           verbose: bool = False) -> PipelineResult:
         """
         Transform a single paragraph with full document context and iterative refinement.
@@ -344,6 +357,7 @@ class StyleTransferPipeline:
             preceding_output: Already-transformed preceding paragraphs
             doc_level_hints: Document-level hints (e.g., avoid overused words)
             position_in_document: (current_index, total_paragraphs) for position-aware checks
+            used_openers: List of opener types already used in document (for variety)
             verbose: Print progress information
         """
         # Extract paragraph-specific semantics
@@ -355,6 +369,7 @@ class StyleTransferPipeline:
         improvement_history = []
         transformation_hints = None
         convergence_achieved = False
+        last_opener_type = None  # Track the opener type used for variety
 
         # Store position for use in verification
         self._current_position = position_in_document
@@ -383,7 +398,7 @@ class StyleTransferPipeline:
                 hint_info = f" (with {len(transformation_hints)} hints)" if transformation_hints else ""
                 print(f"    Iteration {iteration}/{max_para_iterations}{hint_info}...")
 
-            # Synthesize with document context, preceding output, and hints
+            # Synthesize with document context, preceding output, hints, and variety tracking
             synthesis_result = self.synthesizer.synthesize(
                 paragraph,
                 semantic_content=para_semantics,
@@ -392,13 +407,18 @@ class StyleTransferPipeline:
                 preceding_output=preceding_output,
                 transformation_hints=transformation_hints,
                 iteration=iteration - 1,
-                position_in_document=self._current_position
+                position_in_document=self._current_position,
+                used_openers=used_openers  # For template variety
             )
 
             if not synthesis_result.output_text.strip():
                 if verbose:
                     print("    WARNING: Empty output from synthesizer")
                 continue
+
+            # Track opener type for variety
+            if synthesis_result.template_opener_type:
+                last_opener_type = synthesis_result.template_opener_type
 
             # Build accumulated context for full-document statistical analysis
             if preceding_output:
@@ -440,7 +460,8 @@ class StyleTransferPipeline:
                     style_profile=self._style_profile,
                     error=None,
                     improvement_history=improvement_history,
-                    convergence_achieved=True
+                    convergence_achieved=True,
+                    opener_type_used=last_opener_type
                 )
 
             # Check for convergence
@@ -462,7 +483,8 @@ class StyleTransferPipeline:
             style_profile=self._style_profile,
             error=None if best_output else "Failed to generate valid output",
             improvement_history=improvement_history,
-            convergence_achieved=convergence_achieved
+            convergence_achieved=convergence_achieved,
+            opener_type_used=last_opener_type
         )
 
     def _calculate_score(self, verification: VerificationResult) -> float:

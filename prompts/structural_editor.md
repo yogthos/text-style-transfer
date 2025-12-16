@@ -10,13 +10,19 @@ The author chose their words deliberately. Your job is to rearrange them, not re
 4. DO NOT use synonyms - "ghost" stays "ghost", not "specter"
 5. DO NOT inject words like: process, development, contradiction, principal, aspect, concrete, revolutionary, condition, mechanism, framework
 6. FORBIDDEN: em-dashes (—) or double hyphens (--)
-7. Output ONLY the restructured paragraph - nothing else
+7. FORBIDDEN: Inserting "which" or "that" clauses to merge sentences - this is the #1 AI detection signal
+8. Output ONLY the restructured paragraph - nothing else
 
 **WHAT YOU CAN CHANGE:**
-- Sentence boundaries (merge with semicolons, split with periods)
-- Punctuation (commas for pauses, semicolons between clauses)
+- Sentence boundaries (merge with semicolons ONLY, split with periods)
+- Punctuation (commas for pauses, semicolons between related clauses)
 - Clause order within sentences (move phrases around)
 - Sentence length variation (make some shorter, some longer)
+
+**WHAT YOU MUST NOT USE:**
+- "which" clauses to merge sentences (TOP AI SIGNAL - detectors flag this immediately)
+- "that" clauses to embed one sentence inside another
+- Keep short sentences SHORT. Punchy rhythm is human.
 
 **WHAT YOU CANNOT CHANGE:**
 - The actual words (nouns, verbs, adjectives, adverbs)
@@ -53,6 +59,11 @@ BAD: "From the ruins of the Soviet Union, a ghost now that haunts history, I spe
 WHY: "That country is a ghost" has SUBJECT "country" - you CANNOT attach "ghost" as a modifier to "ruins"
 GOOD: "I spent my childhood scavenging in the ruins of the Soviet Union. That country is a ghost now."
 RULE: Each sentence's subject must remain the subject of its predicate - don't convert sentences into dangling modifiers
+
+BAD: "Human experience, which is defined by the biological cycle, reinforces the rule of finitude"
+WHY: "Which" clause insertion is the #1 AI detection signal. Detectors flag this pattern immediately.
+GOOD: "Human experience reinforces the rule of finitude. The biological cycle defines our reality."
+RULE: NEVER use "which" or "that" to merge sentences. Keep them separate.
 
 **SENTENCE VARIATION TARGETS:**
 - Include at least one short sentence (5-10 words)

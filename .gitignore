@@ -42,4 +42,5 @@ Thumbs.db
 config.json
 input/
 output/
-
+structural_cache.db
+.cursor/

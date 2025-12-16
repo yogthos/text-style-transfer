@@ -11,6 +11,9 @@ You are rearranging furniture in a room, not buying new furniture. Keep every pi
 - DO NOT add vocabulary from other texts or academic sources.
 - DO NOT inject philosophical or formal terminology.
 - FORBIDDEN: em-dashes (—), double hyphens (--), and these words: process, development, contradiction, principal, aspect, concrete, revolutionary, mechanism, framework, paradigm
+- FORBIDDEN: Inserting "which" or "that" clauses to merge sentences. This is a major AI pattern detector flag.
+  - BAD: "Human experience, which is defined by the biological cycle, reinforces finitude"
+  - GOOD: "Human experience reinforces the rule of finitude. The biological cycle defines our reality."
 
 ### 2. COHERENCE (NON-NEGOTIABLE)
 Narrative flow and logical relationships MUST be preserved. Structure changes cannot break meaning.
@@ -45,6 +48,8 @@ AI text has these patterns - fix them by changing STRUCTURE, not WORDS:
 3. **Filler adverbs** ("Crucially," "Significantly") → Remove them
 4. **Passive hedging** ("It is important to note...") → Just state the fact
 5. **Em-dashes everywhere** → Use commas, semicolons, or periods instead
+6. **"Which/that" clause insertion** → NEVER insert "which" or "that" to merge sentences. This is a TOP AI SIGNAL.
+7. **Over-merging short sentences** → Keep some short sentences. Punchy rhythm is human.
 
 ### 4. FORBIDDEN VOCABULARY
 NEVER add these AI-signaling words:
@@ -53,10 +58,11 @@ NEVER add these AI-signaling words:
 - process, development, contradiction, principal, aspect, concrete, revolutionary, condition
 
 ### 5. HOW TO RESTRUCTURE
-- **Merge short sentences:** "The sky darkened. Rain began." → "The sky darkened; rain began."
+- **Preserve short sentences:** Short punchy sentences are HUMAN. Don't merge them all. "Every object breaks. Every star dies." is good.
+- **Merge ONLY when natural:** Use semicolons sparingly. "The sky darkened; rain began." (related ideas, same moment)
 - **Split long sentences:** Use periods or semicolons at natural pauses.
 - **Vary starters:** If 3 sentences start with "The", change 2 of them by moving clauses.
-- **Keep the flow:** Ensure sentences connect naturally.
+- **NEVER use "which" to merge:** This is the #1 AI pattern. Keep sentences separate instead.
 - **Coherence first:** If restructuring would break narrative flow, don't do it.
 
 ### 6. FORMATTING

@@ -13,6 +13,7 @@ YOUR DIRECTIVES:
 3. MIMIC REFERENCE: You must write using the exact rhythm, sentence length, and vocabulary density of the 'Structural Reference'.
    - However, if the input contains more content than the reference structure can accommodate, you MUST expand the structure to fit all content
    - Never omit content to match structure - always adapt structure to preserve all content
+   - **PREFERENCE: Minimize em-dashes (—) in your output. Prefer commas, parentheses, or restructuring sentences. Only use em-dashes if the Structural Reference explicitly requires them.**
 4. PRESERVE REFERENCES AND QUOTATIONS: All [^number] style citation references and all direct quotations must be preserved EXACTLY as they appear in the original. This is non-negotiable.
 5. NO AI TROPES: Do not use flowery, generic AI language. Be specific, grounded, and human.
 6. Generate ONLY the rewritten text, nothing else (no explanations, no notes).

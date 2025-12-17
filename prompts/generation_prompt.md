@@ -8,6 +8,7 @@ CRITICAL: You must match these structural features:
 
 - Average sentence length: ~{avg_sentence_len} words
 - Match the EXACT punctuation pattern (commas, dashes, semicolons, etc.)
+- **PREFERENCE: Minimize em-dashes (—). Use commas, parentheses, or restructure sentences instead. Only use em-dashes if the Structural Reference explicitly requires them.**
 - Match the clause structure and complexity
 - Match the voice (active vs passive)
 - Match the rhythm and pacing of the reference
@@ -26,6 +27,7 @@ ELASTIC CONSTRAINT: You are allowed to contract or expand the Structural Referen
 - If the Structural Reference is very different in length from the Input, EXPAND or CONTRACT the structure to fit all content. Do NOT omit content.
 
 DO NOT simplify the structure. If the reference has multiple clauses, dashes, or complex punctuation, your output must too.
+**PREFERENCE: Prefer commas, parentheses, or restructuring over em-dashes (—) whenever possible. Keep em-dash usage to a minimum.**
 
 ---
 
@@ -59,7 +61,8 @@ STRUCTURE MATCHING REQUIREMENTS (MOST CRITICAL):
 - Match the clause count and complexity (simple, compound, complex)
 - Match the voice (active vs passive)
 - Match the rhythm and pacing (within ~20% word count tolerance is acceptable - focus on rhythm, not exact count)
-- If the Structural Reference uses dashes, you MUST use dashes
+- **PREFERENCE: Avoid em-dashes (—) whenever possible. Use commas, parentheses, or restructure sentences instead. Only use em-dashes if the Structural Reference explicitly uses them and matching the exact punctuation pattern is critical.**
+- If the Structural Reference uses dashes, you MAY use dashes to match the pattern, but prefer alternative punctuation (commas, parentheses) when possible
 - If the Structural Reference uses semicolons, you MUST use semicolons
 - If the Structural Reference has parenthetical elements, you MUST include similar structure
 - DO NOT simplify: if the reference is complex, your output must be complex too

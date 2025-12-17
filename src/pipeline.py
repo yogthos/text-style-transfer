@@ -29,7 +29,6 @@ from src.atlas import (
 from src.generator.llm_interface import generate_sentence
 from src.validator.critic import generate_with_critic, ConvergenceError
 from src.analyzer.style_metrics import get_style_vector
-from src.analyzer.vocabulary import extract_global_vocabulary
 from src.ingestion.semantic import _detect_sentiment
 
 
@@ -68,23 +67,20 @@ def _determine_current_cluster(
 
 def process_text(
     input_text: str,
-    sample_text: str,
     config_path: str = "config.json",
     max_retries: int = 3,
     output_file: Optional[str] = None,
     atlas_cache_path: Optional[str] = None,
-    clear_db: bool = False,
     blend_ratio: Optional[float] = None
 ) -> List[str]:
     """Process input text through Style Atlas pipeline.
 
     Args:
         input_text: The input text to transform.
-        sample_text: The sample text defining the target style.
         config_path: Path to configuration file.
         max_retries: Maximum number of retries per generation (default: 3).
         output_file: Optional path to write output incrementally.
-        atlas_cache_path: Optional path to cache/load Style Atlas.
+        atlas_cache_path: Optional path to ChromaDB persistence directory.
 
     Returns:
         List of generated paragraphs.
@@ -122,29 +118,18 @@ def process_text(
     else:
         print(f"Phase 1: Single-author mode")
 
-    # Clear ChromaDB if requested
-    if clear_db:
-        from src.atlas.builder import clear_chromadb_collection
-        print("Clearing ChromaDB collection...")
-        cleared = clear_chromadb_collection(
-            collection_name=collection_name,
-            persist_directory=atlas_cache_path
-        )
-        if cleared:
-            print("  ✓ Cleared ChromaDB collection")
-        else:
-            print("  ⚠ Collection did not exist (nothing to clear)")
-
-    # Phase 1: Build or load Style Atlas
-    print("Phase 1: Building Style Atlas...")
+    # Phase 1: Load existing Style Atlas from ChromaDB
+    print("Phase 1: Loading Style Atlas from ChromaDB...")
+    print(f"  Collection: {collection_name}")
+    print(f"  Persist directory: {atlas_cache_path or '(in-memory)'}")
     atlas = None
 
-    # If we cleared the DB, we must rebuild (don't load from cache)
-    if not clear_db and atlas_cache_path:
+    # Try to load existing atlas from ChromaDB
+    if atlas_cache_path:
         cache_file = Path(atlas_cache_path) / "atlas.json"
         if cache_file.exists():
             try:
-                print(f"  Loading atlas from cache: {cache_file}")
+                print(f"  Attempting to load from cache: {cache_file}")
                 atlas = load_atlas(str(cache_file), persist_directory=atlas_cache_path)
                 # Verify collection exists and has data
                 if hasattr(atlas, '_collection'):
@@ -152,37 +137,104 @@ def process_text(
                         collection = atlas._collection
                         test_results = collection.get(limit=1)
                         if test_results['ids'] and len(test_results['ids']) > 0:
-                            print(f"  ✓ Loaded atlas with {len(atlas.cluster_ids)} paragraphs")
+                            total_count = collection.count() if hasattr(collection, 'count') else len(atlas.cluster_ids)
+                            print(f"  ✓ Loaded atlas from cache with {total_count} paragraphs")
                         else:
-                            print(f"  ⚠ Cached atlas collection is empty, rebuilding...")
                             atlas = None
-                    except Exception:
-                        print(f"  ⚠ Cached atlas collection not accessible, rebuilding...")
+                            raise ValueError("ChromaDB collection is empty")
+                    except ValueError:
+                        raise
+                    except Exception as e:
                         atlas = None
+                        raise ValueError(f"ChromaDB collection not accessible: {e}")
                 else:
-                    print(f"  ⚠ Cached atlas has no collection connection, rebuilding...")
                     atlas = None
+                    raise ValueError("Cached atlas has no collection connection")
+            except ValueError:
+                raise
             except Exception as e:
-                print(f"  ⚠ Failed to load cache: {e}")
+                print(f"  ⚠ Failed to load from cache: {e}")
                 atlas = None
 
+    # If cache load failed, try to connect directly to ChromaDB
     if atlas is None:
-        print("  Building new atlas...")
-        persist_dir = atlas_cache_path if atlas_cache_path else None
-        atlas = build_style_atlas(
-            sample_text,
-            num_clusters=num_clusters,
-            collection_name=collection_name,
-            persist_directory=persist_dir
-        )
-        print(f"  ✓ Built atlas with {len(atlas.cluster_ids)} paragraphs, {atlas.num_clusters} clusters")
+        try:
+            import chromadb
+            from chromadb.config import Settings
 
-        # Save to cache if path provided
-        if atlas_cache_path:
-            cache_file = Path(atlas_cache_path) / "atlas.json"
-            cache_file.parent.mkdir(parents=True, exist_ok=True)
-            save_atlas(atlas, str(cache_file))
-            print(f"  ✓ Saved atlas to cache")
+            print(f"  Connecting directly to ChromaDB...")
+            if atlas_cache_path:
+                client = chromadb.PersistentClient(path=atlas_cache_path)
+            else:
+                client = chromadb.Client(Settings(anonymized_telemetry=False))
+
+            # Check if collection exists
+            try:
+                collection = client.get_collection(name=collection_name)
+            except Exception as e:
+                error_msg = (
+                    f"ChromaDB collection '{collection_name}' does not exist.\n"
+                    f"Persist directory: {atlas_cache_path or '(in-memory)'}\n"
+                    f"Please load author styles first using:\n"
+                    f"  python scripts/load_style.py --style-file <file> --author <name>"
+                )
+                raise ValueError(error_msg) from e
+
+            # Check if collection has data
+            try:
+                test_results = collection.get(limit=1)
+            except Exception as e:
+                error_msg = (
+                    f"Failed to access ChromaDB collection '{collection_name}': {e}\n"
+                    f"Persist directory: {atlas_cache_path or '(in-memory)'}"
+                )
+                raise ValueError(error_msg) from e
+
+            if not test_results.get('ids') or len(test_results['ids']) == 0:
+                error_msg = (
+                    f"ChromaDB collection '{collection_name}' is empty.\n"
+                    f"Persist directory: {atlas_cache_path or '(in-memory)'}\n"
+                    f"Please load author styles first using:\n"
+                    f"  python scripts/load_style.py --style-file <file> --author <name>"
+                )
+                raise ValueError(error_msg)
+
+            # Create a minimal atlas object from existing collection
+            # We'll need cluster_ids, but we can get them from metadata
+            all_results = collection.get(include=["metadatas"])
+            cluster_ids = {}
+            for idx, meta in enumerate(all_results.get('metadatas', [])):
+                para_id = all_results['ids'][idx]
+                cluster_id = meta.get('cluster_id', 0)
+                cluster_ids[para_id] = cluster_id
+
+            # Create StyleAtlas object
+            from src.atlas.builder import StyleAtlas
+            atlas = StyleAtlas(
+                collection_name=collection_name,
+                cluster_ids=cluster_ids,
+                cluster_centers=np.array([]),  # Not needed for retrieval
+                style_vectors=[],  # Not needed for retrieval
+                num_clusters=len(set(cluster_ids.values()))
+            )
+            atlas._client = client
+            atlas._collection = collection
+
+            total_count = collection.count() if hasattr(collection, 'count') else len(cluster_ids)
+            print(f"  ✓ Connected to ChromaDB collection with {total_count} paragraphs")
+
+        except ValueError:
+            # Re-raise ValueError with our helpful message
+            raise
+        except Exception as e:
+            error_msg = (
+                f"ChromaDB collection '{collection_name}' is not accessible.\n"
+                f"Persist directory: {atlas_cache_path or '(in-memory)'}\n"
+                f"Error: {type(e).__name__}: {e}\n"
+                f"Please load author styles first using:\n"
+                f"  python scripts/load_style.py --style-file <file> --author <name>"
+            )
+            raise ValueError(error_msg) from e
 
     # Initialize StyleBlender if in blend mode
     if is_blend_mode:
@@ -204,12 +256,14 @@ def process_text(
     structure_navigator = StructureNavigator(history_limit=3)
     print(f"  ✓ Initialized structure navigator")
 
-    # Extract global vocabulary from sample text
-    print("Phase 1: Extracting global vocabulary...")
-    global_vocab_dict = extract_global_vocabulary(sample_text, top_n=200)
-    print(f"  ✓ Extracted vocabulary: {len(global_vocab_dict.get('positive', []))} positive, "
-          f"{len(global_vocab_dict.get('negative', []))} negative, "
-          f"{len(global_vocab_dict.get('neutral', []))} neutral words")
+    # Global vocabulary extraction
+    # In blend mode, vocabulary is handled by StyleBlender
+    # In single-author mode, we use situation matches for vocabulary, so global vocab is optional
+    global_vocab_dict = {'positive': [], 'negative': [], 'neutral': []}
+    if not is_blend_mode:
+        # For single-author mode, vocabulary comes from situation matches
+        # Global vocabulary injection is optional and can be skipped
+        print("Phase 1: Using situation matches for vocabulary (global vocab injection disabled)")
 
     # Phase 2: Extract meaning from input
     print("Phase 2: Extracting meaning...")
@@ -317,7 +371,7 @@ def process_text(
                     generated_text_so_far.append(content_unit.original_text)
                     continue
 
-                # Determine sentiment and select appropriate vocabulary
+                # Determine vocabulary list
                 if is_blend_mode and style_blender and len(blend_authors) >= 2:
                     # Blend mode: get hybrid vocabulary
                     author_a = blend_authors[0]
@@ -328,10 +382,9 @@ def process_text(
                         ratio=final_blend_ratio
                     )
                 else:
-                    # Single-author mode: use existing vocabulary extraction
-                    sentiment = _detect_sentiment(content_unit.original_text)
-                    sentiment_key = sentiment.lower() if sentiment else 'neutral'
-                    global_vocab_list = global_vocab_dict.get(sentiment_key, global_vocab_dict.get('neutral', []))
+                    # Single-author mode: vocabulary comes from situation matches
+                    # Global vocabulary injection is optional (can be empty)
+                    global_vocab_list = []
 
                 # Calculate adaptive threshold based on structure match quality
                 # If structure match is very different from input, lower the threshold
@@ -474,30 +527,23 @@ def process_text(
 
 def run_pipeline(
     input_file: Optional[str] = None,
-    sample_file: Optional[str] = None,
     input_text: Optional[str] = None,
-    sample_text: Optional[str] = None,
     config_path: str = "config.json",
     output_file: Optional[str] = None,
     max_retries: int = 3,
     atlas_cache_path: Optional[str] = None,
-    clear_db: bool = False,
-    load_style_file: Optional[str] = None,
-    author_name: Optional[str] = None,
     blend_ratio: Optional[float] = None
 ) -> List[str]:
     """Run the Style Atlas pipeline with file I/O.
 
     Args:
         input_file: Path to input text file (optional if input_text provided).
-        sample_file: Path to sample text file (optional if sample_text provided).
         input_text: Input text as string (optional if input_file provided).
-        sample_text: Sample text as string (optional if sample_file provided).
         config_path: Path to configuration file.
         output_file: Optional path to save output.
         max_retries: Maximum number of retries per generation.
-        atlas_cache_path: Optional path to cache Style Atlas.
-        clear_db: Whether to clear ChromaDB collection before building atlas.
+        atlas_cache_path: Optional path to ChromaDB persistence directory (falls back to config.json if None).
+        blend_ratio: Optional blend ratio for style mixing (overrides config.json).
 
     Returns:
         List of generated paragraphs.
@@ -509,64 +555,20 @@ def run_pipeline(
         with open(input_file, 'r', encoding='utf-8') as f:
             input_text = f.read()
 
-    # Handle --load-style and --author flags
-    if load_style_file and author_name:
-        # Load the style file and build atlas with author tag
-        with open(load_style_file, 'r', encoding='utf-8') as f:
-            style_text = f.read()
-
-        # Build atlas with author_id
-        from src.atlas.builder import build_style_atlas
-        atlas_config = {}
+    # Resolve atlas_cache_path from config if not provided
+    if atlas_cache_path is None:
         with open(config_path, 'r') as f:
             config = json.load(f)
-            atlas_config = config.get("atlas", {})
+        atlas_cache_path = config.get("atlas", {}).get("persist_path")
 
-        atlas_cache_path = atlas_cache_path or atlas_config.get("persist_path")
-        num_clusters = atlas_config.get("num_clusters", 5)
-        collection_name = atlas_config.get("collection_name", "style_atlas")
-
-        print(f"Loading style from {load_style_file} with author tag: {author_name}")
-        atlas = build_style_atlas(
-            sample_text=style_text,
-            num_clusters=num_clusters,
-            collection_name=collection_name,
-            persist_directory=atlas_cache_path,
-            author_id=author_name
-        )
-        print(f"✓ Loaded style for author: {author_name}")
-
-        # If we're just loading a style, we might want to exit here
-        # But for now, continue with normal pipeline if input is provided
-        if input_file is None and input_text is None:
-            print("Style loaded successfully. Use with input file to generate text.")
-            return []
-
-    # Load sample text
-    if sample_text is None:
-        if sample_file is None:
-            # Try to load from config
-            with open(config_path, 'r') as f:
-                config = json.load(f)
-            sample_file = config.get('sample', {}).get('file', 'prompts/sample_mao.txt')
-
-        with open(sample_file, 'r', encoding='utf-8') as f:
-            sample_text = f.read()
-
-    # Run pipeline (only if we have input to process)
-    if input_file or input_text:
-        output = process_text(
-            input_text=input_text,
-            sample_text=sample_text,
-            config_path=config_path,
-            max_retries=max_retries,
-            output_file=output_file,
-            atlas_cache_path=atlas_cache_path,
-            clear_db=clear_db,
-            blend_ratio=blend_ratio
-        )
-    else:
-        # Just loaded a style, no input to process
-        output = []
+    # Run pipeline
+    output = process_text(
+        input_text=input_text,
+        config_path=config_path,
+        max_retries=max_retries,
+        output_file=output_file,
+        atlas_cache_path=atlas_cache_path,
+        blend_ratio=blend_ratio
+    )
 
     return output

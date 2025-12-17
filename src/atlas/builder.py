@@ -231,9 +231,8 @@ def build_style_atlas(
         if author_id:
             metadata_entry["author_id"] = author_id
 
-        # Store style vector in metadata for efficient centroid calculation
-        # Convert numpy array to list for JSON serialization
-        metadata_entry["style_vec"] = style_vec.tolist()
+        # Note: We don't store style_vec in metadata because ChromaDB doesn't allow lists
+        # Style vectors will be recomputed from document text when needed (e.g., in StyleBlender)
 
         metadatas.append(metadata_entry)
 

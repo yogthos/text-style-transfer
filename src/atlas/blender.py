@@ -46,10 +46,11 @@ class StyleBlender:
         collection = self.atlas._collection
 
         # Query ChromaDB for all paragraphs with this author_id
+        # Include documents so we can recompute style vectors
         try:
             results = collection.get(
                 where={"author_id": author_id},
-                include=["metadatas"]
+                include=["metadatas", "documents"]
             )
         except Exception as e:
             # Fallback: query all and filter
@@ -67,20 +68,15 @@ class StyleBlender:
         if not results.get('metadatas'):
             raise ValueError(f"Author '{author_id}' not found in collection")
 
-        # Extract style vectors from metadata
+        # Extract style vectors by recomputing from document text
+        # (style_vec is not stored in metadata because ChromaDB doesn't allow lists)
         style_vectors = []
-        for meta in results['metadatas']:
-            style_vec = meta.get('style_vec')
-            if style_vec:
-                # Convert list back to numpy array
-                style_vectors.append(np.array(style_vec))
-            else:
-                # Fallback: recompute from document text
-                doc_idx = results['metadatas'].index(meta)
-                if results.get('documents') and doc_idx < len(results['documents']):
-                    doc_text = results['documents'][doc_idx]
-                    style_vec = get_style_vector(doc_text)
-                    style_vectors.append(style_vec)
+        for idx, meta in enumerate(results['metadatas']):
+            # Recompute style vector from document text
+            if results.get('documents') and idx < len(results['documents']):
+                doc_text = results['documents'][idx]
+                style_vec = get_style_vector(doc_text)
+                style_vectors.append(style_vec)
 
         if not style_vectors:
             raise ValueError(f"No style vectors found for author '{author_id}'")
@@ -150,15 +146,11 @@ class StyleBlender:
         # 4. Find closest style matches
         candidates = []
         for idx, meta in enumerate(results['metadatas']):
-            style_vec = meta.get('style_vec')
-            if style_vec:
-                para_style_vec = np.array(style_vec)
+            # Recompute style vector from document text (not stored in metadata)
+            if results.get('documents') and idx < len(results['documents']):
+                para_style_vec = get_style_vector(results['documents'][idx])
             else:
-                # Recompute from document
-                if results.get('documents') and idx < len(results['documents']):
-                    para_style_vec = get_style_vector(results['documents'][idx])
-                else:
-                    continue
+                continue
 
             # Calculate distance to target vector
             distance = np.linalg.norm(para_style_vec - target_vec)

@@ -144,31 +144,67 @@ The project uses `config.json` for configuration. Here's the complete structure:
 
 ## Usage
 
-### Loading Styles into ChromaDB
+### ChromaDB Management
 
-Before using style blending, you need to load author styles into ChromaDB. Each author's style is stored with an `author_id` tag for later retrieval.
+Before using `restyle.py`, you need to load author styles into ChromaDB. ChromaDB operations are handled by separate scripts in the `scripts/` folder.
 
-**Example: Loading multiple author styles**
+#### Loading Styles
+
+Load author styles into ChromaDB using `scripts/load_style.py`:
 
 ```bash
-# Load Hemingway's style
-python3 restyle.py input/small.md -o output/small.md \
-  --load-style styles/sample_hemingway.txt --author "Hemingway" \
-  --atlas-cache atlas_cache/
+# Load a single author style
+python3 scripts/load_style.py --style-file styles/sample_sagan.txt --author "Sagan"
 
-# Load Lovecraft's style (adds to existing collection)
-python3 restyle.py input/small.md -o output/small.md \
-  --load-style styles/sample_lovecraft.txt --author "Lovecraft" \
-  --atlas-cache atlas_cache/
+# Load multiple author styles in one call
+python3 scripts/load_style.py \
+  --style-file styles/sample_hemingway.txt --author "Hemingway" \
+  --style-file styles/sample_lovecraft.txt --author "Lovecraft"
 
-# Now you can blend them (see Style Blending section below)
+# Specify custom config and cache directory
+python3 scripts/load_style.py \
+  --style-file styles/sample_sagan.txt --author "Sagan" \
+  --config config.json \
+  --atlas-cache atlas_cache/
 ```
 
-**Note**: When using `--load-style`, the input file is still required but won't be processed if you're just loading a style. The style will be added to the ChromaDB collection and can be used in subsequent runs.
+#### Listing Loaded Styles
 
-### Command Line Interface (Recommended)
+List all author styles currently loaded in ChromaDB using `scripts/list_styles.py`:
 
-Use the main CLI entry point:
+```bash
+# List all loaded authors with basic statistics
+python3 scripts/list_styles.py
+
+# Show detailed statistics including cluster IDs
+python3 scripts/list_styles.py --verbose
+
+# Specify custom collection name and cache directory
+python3 scripts/list_styles.py \
+  --collection-name "style_atlas" \
+  --atlas-cache atlas_cache/
+```
+
+#### Clearing ChromaDB
+
+Clear ChromaDB collections using `scripts/clear_chromadb.py`:
+
+```bash
+# Clear entire collection
+python3 scripts/clear_chromadb.py --all
+
+# Clear specific author's data
+python3 scripts/clear_chromadb.py --author "Sagan"
+
+# Specify custom collection name and cache directory
+python3 scripts/clear_chromadb.py --all \
+  --collection-name "style_atlas" \
+  --atlas-cache atlas_cache/
+```
+
+### Text Restyling
+
+Once styles are loaded into ChromaDB, use `restyle.py` to transform text:
 
 ```bash
 source venv/bin/activate
@@ -178,20 +214,14 @@ python3 restyle.py input/small.md -o output/small.md
 With additional options:
 
 ```bash
-# Specify a custom sample file
-python3 restyle.py input/small.md -o output/small.md --sample styles/custom_sample.txt
+# Specify custom config file
+python3 restyle.py input/small.md -o output/small.md --config config.json
 
-# Cache the Style Atlas for faster subsequent runs
-python3 restyle.py input/small.md -o output/small.md --atlas-cache atlas_data/
+# Specify ChromaDB cache directory
+python3 restyle.py input/small.md -o output/small.md --atlas-cache atlas_cache/
 
-# Clear ChromaDB when switching to a different sample text
-python3 restyle.py input/small.md -o output/small.md --clear-db
-
-# Load a style file with an author tag (for style blending)
-python3 restyle.py input/small.md -o output/small.md --load-style styles/sample_hemingway.txt --author "Hemingway"
-
-# Blend two author styles (requires authors to be loaded first)
-python3 restyle.py input/small.md -o output/small.md --blend-ratio 0.3
+# Override blend ratio (for style blending)
+python3 restyle.py input/small.md -o output/small.md --blend-ratio 0.7
 
 # Adjust retry settings
 python3 restyle.py input/small.md -o output/small.md --max-retries 5
@@ -202,16 +232,40 @@ python3 restyle.py input/small.md -o output/small.md -v
 
 ### CLI Options
 
+#### restyle.py
+
 - `input`: Input text file to transform (required)
 - `-o, --output`: Output file path (required)
-- `-s, --sample`: Sample text file defining target style (optional, uses config.json default)
 - `-c, --config`: Configuration file path (default: `config.json`)
 - `--max-retries`: Maximum retry attempts per sentence (default: 3, overrides config.json)
-- `--atlas-cache`: Path to directory for persisting/loading Style Atlas (optional)
-- `--clear-db`: Clear ChromaDB collection before building atlas (use when switching sample texts)
-- `--load-style FILE`: Load a style file and tag it with an author name (requires `--author`)
-- `--author NAME`: Author name to tag the style file with (required with `--load-style`)
+- `--atlas-cache`: Path to ChromaDB persistence directory (overrides config.json)
 - `--blend-ratio FLOAT`: Override blend ratio from config (0.0 to 1.0, CLI overrides config.json)
+- `-v, --verbose`: Enable verbose output
+
+#### scripts/load_style.py
+
+- `--style-file FILE`: Path to style text file (required, can be specified multiple times)
+- `--author NAME`: Author name to tag the style (required, must match number of `--style-file` arguments)
+- `--config PATH`: Path to config.json (default: `config.json`)
+- `--atlas-cache PATH`: Path to ChromaDB persistence directory (overrides config.json)
+- `--num-clusters N`: Number of K-means clusters (overrides config.json)
+- `--collection-name NAME`: Collection name (overrides config.json)
+- `-v, --verbose`: Enable verbose output
+
+#### scripts/list_styles.py
+
+- `--config PATH`: Path to config.json (default: `config.json`)
+- `--atlas-cache PATH`: Path to ChromaDB persistence directory (overrides config.json)
+- `--collection-name NAME`: Collection name to list (overrides config.json)
+- `-v, --verbose`: Enable verbose output with detailed statistics
+
+#### scripts/clear_chromadb.py
+
+- `--collection-name NAME`: Collection name to clear (default: from config.json or "style_atlas")
+- `--author NAME`: Author name to clear (clears only this author's data)
+- `--atlas-cache PATH`: Path to ChromaDB persistence directory (overrides config.json)
+- `--config PATH`: Path to config.json (default: `config.json`)
+- `--all`: Clear entire collection (default if no `--author` specified)
 - `-v, --verbose`: Enable verbose output
 
 ### Python API
@@ -477,10 +531,11 @@ If you see ChromaDB errors:
 - Ensure Python 3.12+ is being used (required for ChromaDB compatibility)
 - Try rebuilding the virtual environment: `python3.12 -m venv venv`
 - Check that `onnxruntime` is installed (required dependency)
-- If switching between different sample texts, use `--clear-db` to clear old embeddings
-- If ChromaDB collection is corrupted, delete the `atlas_cache/` directory and rebuild
+- If ChromaDB collection is corrupted, clear it: `python3 scripts/clear_chromadb.py --all`
+- If collection is empty, load styles first: `python3 scripts/load_style.py --style-file <file> --author <name>`
 - When loading multiple authors, use the same `--atlas-cache` path to ensure they're added to the same collection
 - Author styles are stored with prefixed IDs (e.g., `Hemingway_para_0`) to avoid conflicts
+- If `restyle.py` says collection is empty, you need to load styles first using `scripts/load_style.py`
 
 ### Import Errors
 

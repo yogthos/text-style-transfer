@@ -26,7 +26,7 @@ from src.atlas import (
     StructureNavigator
 )
 from src.generator.llm_interface import generate_sentence
-from src.validator.critic import generate_with_critic
+from src.validator.critic import generate_with_critic, ConvergenceError
 from src.analyzer.style_metrics import get_style_vector
 from src.analyzer.vocabulary import extract_global_vocabulary
 from src.ingestion.semantic import _detect_sentiment
@@ -95,6 +95,13 @@ def process_text(
     num_clusters = atlas_config.get("num_clusters", 5)
     similarity_threshold = atlas_config.get("similarity_threshold", 0.3)
     collection_name = atlas_config.get("collection_name", "style_atlas")
+
+    # Read critic configuration
+    critic_config = config.get("critic", {})
+    critic_min_score = critic_config.get("min_score", 0.75)
+    critic_min_pipeline_score = critic_config.get("min_pipeline_score", 0.6)
+    critic_max_retries = critic_config.get("max_retries", 5)
+    critic_max_pipeline_retries = critic_config.get("max_pipeline_retries", 2)
 
     # Clear ChromaDB if requested
     if clear_db:
@@ -266,42 +273,92 @@ def process_text(
                 sentiment_key = sentiment.lower() if sentiment else 'neutral'
                 global_vocab_list = global_vocab_dict.get(sentiment_key, global_vocab_dict.get('neutral', []))
 
-                # Generate with critic loop
+                # Generate with critic loop and pipeline-level retries
+                generated = None
+                critic_result = None
+                final_score = 0.0
+
                 try:
-                    generated, critic_result = generate_with_critic(
-                        generate_fn=lambda cu, struct_match, sit_match, cfg, hint=None: generate_sentence(
-                            cu, struct_match, sit_match, cfg, hint=hint, global_vocab_list=global_vocab_list
-                        ),
-                        content_unit=content_unit,
-                        structure_match=structure_match,
-                        situation_match=situation_match,
-                        config_path=config_path,
-                        max_retries=max_retries
-                    )
+                    # Pipeline-level retry loop
+                    for pipeline_attempt in range(critic_max_pipeline_retries + 1):
+                        try:
+                            generated, critic_result = generate_with_critic(
+                                generate_fn=lambda cu, struct_match, sit_match, cfg, hint=None: generate_sentence(
+                                    cu, struct_match, sit_match, cfg, hint=hint, global_vocab_list=global_vocab_list
+                                ),
+                                content_unit=content_unit,
+                                structure_match=structure_match,
+                                situation_match=situation_match,
+                                config_path=config_path,
+                                max_retries=critic_max_retries,
+                                min_score=critic_min_score
+                            )
 
-                    score = critic_result.get("score", 0.0)
-                    passed = critic_result.get("pass", False)
+                            score = critic_result.get("score", 0.0)
+                            final_score = score
 
+                            # Log attempt
+                            if pipeline_attempt > 0:
+                                print(f"    Pipeline retry {pipeline_attempt}: Score {score:.3f}")
+
+                            # Check if score is acceptable for pipeline
+                            if score >= critic_min_pipeline_score:
+                                break  # Good enough, proceed
+
+                            # If score too low and we have more retries, continue
+                            if pipeline_attempt < critic_max_pipeline_retries:
+                                print(f"    ⚠ Score {score:.3f} below pipeline threshold {critic_min_pipeline_score}, retrying...")
+                                # Optionally refresh structure/situation matches for next attempt
+                                # (keeping same matches for now, but could refresh)
+                            else:
+                                # Last attempt, accept what we have but warn
+                                print(f"    ⚠ Final score {score:.3f} below pipeline threshold {critic_min_pipeline_score} after all retries")
+
+                        except ConvergenceError as e:
+                            # Critic loop failed to converge
+                            if pipeline_attempt < critic_max_pipeline_retries:
+                                print(f"    ⚠ Critic convergence failed: {e}")
+                                print(f"    Retrying at pipeline level (attempt {pipeline_attempt + 1}/{critic_max_pipeline_retries + 1})...")
+                                continue
+                            else:
+                                # No more retries, raise the error
+                                raise
+
+                    # Log final result
+                    passed = critic_result.get("pass", False) if critic_result else False
                     print(f"    Generated: {generated}")
-                    print(f"    Critic score: {score:.3f} (pass: {passed})")
+                    print(f"    Critic score: {final_score:.3f} (pass: {passed})")
 
                     if not passed:
-                        feedback = critic_result.get("feedback", "")
+                        feedback = critic_result.get("feedback", "") if critic_result else ""
                         if feedback:
                             print(f"    Critic feedback: {feedback[:100]}...")
+
+                    # Warn if score is still low
+                    if final_score < critic_min_pipeline_score:
+                        print(f"    ⚠ WARNING: Final score {final_score:.3f} is below pipeline threshold {critic_min_pipeline_score}")
 
                     para_output.append(generated)
                     generated_text_so_far.append(generated)
 
                     # Print final score summary before moving to next sentence
-                    print(f"    ✓ Final score: {score:.3f} (pass: {passed})")
+                    print(f"    ✓ Final score: {final_score:.3f} (pass: {passed})")
 
                     # Add blank line before next sentence for readability
                     if unit_idx < len(para_units) - 1:
                         print()
 
+                except ConvergenceError as e:
+                    print(f"    ✗ CRITICAL: Failed to converge after all retries: {e}")
+                    # Use original text as fallback
+                    para_output.append(content_unit.original_text)
+                    generated_text_so_far.append(content_unit.original_text)
+                    print(f"    ⚠ Using original text due to convergence failure")
+
                 except Exception as e:
                     print(f"    ⚠ Generation failed: {e}")
+                    import traceback
+                    traceback.print_exc()
                     # Fallback: use original text
                     para_output.append(content_unit.original_text)
                     generated_text_so_far.append(content_unit.original_text)

@@ -5,8 +5,9 @@ a reference style paragraph to detect style mismatches and "AI slop".
 """
 
 import json
+import re
 import requests
-from typing import Dict, Optional, Tuple
+from typing import Dict, List, Optional, Tuple
 
 
 def _load_config(config_path: str = "config.json") -> Dict:
@@ -96,10 +97,10 @@ Determine:
 
 Output your evaluation as JSON with:
 - "pass": boolean (true if style matches well, false if needs improvement)
-- "feedback": string (specific, actionable feedback on what to improve, mentioning which aspect failed)
+- "feedback": string (specific, actionable feedback formatted as numbered action items, e.g., "1. Make sentences shorter to match reference. 2. Use more direct vocabulary. 3. Match the punctuation style.")
 - "score": float (0.0 to 1.0, where 1.0 is perfect style match)
 
-Be strict but fair. Focus on structural and stylistic elements, not just meaning."""
+IMPORTANT: Format your feedback as specific, actionable steps the generator can take. Prioritize the most critical issues first. Be strict but fair. Focus on structural and stylistic elements, not just meaning."""
 
     # Build user prompt
     structure_section = f"""STRUCTURAL REFERENCE (for rhythm/structure):
@@ -197,6 +198,126 @@ If any references or quotations are missing, this is a CRITICAL FAILURE and "pas
         }
 
 
+class ConvergenceError(Exception):
+    """Raised when critic cannot converge to minimum score threshold."""
+    pass
+
+
+def _extract_issues_from_feedback(feedback: str) -> List[str]:
+    """Extract individual issues/action items from feedback text.
+
+    Args:
+        feedback: Feedback string that may contain numbered items or sentences.
+
+    Returns:
+        List of extracted issues/action items.
+    """
+    issues = []
+
+    # Try to extract numbered items (e.g., "1. Make sentences shorter")
+    numbered_pattern = r'\d+[\.\)]\s*([^\.]+(?:\.[^\.]+)*)'
+    matches = re.findall(numbered_pattern, feedback)
+    if matches:
+        issues.extend([m.strip() for m in matches])
+        return issues
+
+    # If no numbered items, try to split by sentences and extract action-oriented ones
+    sentences = re.split(r'[\.!?]\s+', feedback)
+    for sentence in sentences:
+        sentence = sentence.strip()
+        if not sentence:
+            continue
+        # Look for action-oriented sentences (contain verbs like "make", "use", "match", "fix")
+        action_verbs = ['make', 'use', 'match', 'fix', 'change', 'adjust', 'improve', 'reduce', 'increase']
+        if any(verb in sentence.lower() for verb in action_verbs):
+            issues.append(sentence)
+
+    # If still no issues, return the whole feedback as a single issue
+    if not issues and feedback.strip():
+        issues.append(feedback.strip())
+
+    return issues
+
+
+def _group_similar_issues(issues: List[str]) -> Dict[str, List[str]]:
+    """Group similar issues together.
+
+    Args:
+        issues: List of issue strings.
+
+    Returns:
+        Dictionary mapping canonical issue to list of similar variations.
+    """
+    issue_groups: Dict[str, List[str]] = {}
+
+    for issue in issues:
+        issue_lower = issue.lower()
+        matched = False
+
+        # Check if this issue is similar to any existing group
+        for canonical, variations in issue_groups.items():
+            canonical_lower = canonical.lower()
+
+            # Simple similarity check: shared keywords
+            issue_words = set(issue_lower.split())
+            canonical_words = set(canonical_lower.split())
+
+            # If they share significant words, group them
+            common_words = issue_words & canonical_words
+            # Remove common stop words
+            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'to', 'of', 'in', 'on', 'at', 'for', 'with'}
+            common_words -= stop_words
+
+            if len(common_words) >= 2 or (len(common_words) == 1 and len(issue_words) <= 3):
+                issue_groups[canonical].append(issue)
+                matched = True
+                break
+
+        if not matched:
+            # Create new group with this issue as canonical
+            issue_groups[issue] = [issue]
+
+    return issue_groups
+
+
+def _consolidate_feedback(feedback_history: List[str]) -> str:
+    """Consolidate multiple feedback attempts into clear action items.
+
+    Extracts key issues, groups similar ones, and formats as actionable steps.
+
+    Args:
+        feedback_history: List of feedback strings from previous attempts.
+
+    Returns:
+        Consolidated feedback as numbered action items.
+    """
+    if not feedback_history:
+        return ""
+
+    # Extract all issues from all feedback
+    all_issues = []
+    for feedback in feedback_history:
+        issues = _extract_issues_from_feedback(feedback)
+        all_issues.extend(issues)
+
+    if not all_issues:
+        return ""
+
+    # Group similar issues and count frequency
+    issue_groups = _group_similar_issues(all_issues)
+
+    # Sort by frequency (most mentioned first)
+    sorted_issues = sorted(issue_groups.items(), key=lambda x: len(x[1]), reverse=True)
+
+    # Format as action items
+    action_items = []
+    for idx, (canonical_issue, variations) in enumerate(sorted_issues, 1):
+        # Use the canonical issue (first one found)
+        action_items.append(f"{idx}. {canonical_issue}")
+
+    return "ACTION ITEMS TO FIX:\n" + "\n".join(action_items)
+
+
 def generate_with_critic(
     generate_fn,
     content_unit,
@@ -233,10 +354,17 @@ def generate_with_critic(
     best_text = None
     best_score = 0.0
     best_result = None
-    hint = None
+    feedback_history: List[str] = []
 
     for attempt in range(max_retries):
-        # Generate with hint from previous attempt
+        # Build consolidated hint from all previous attempts
+        hint = None
+        if feedback_history:
+            consolidated = _consolidate_feedback(feedback_history)
+            if consolidated:
+                hint = f"CRITICAL FEEDBACK FROM ALL PREVIOUS ATTEMPTS:\n{consolidated}\n\nPlease address ALL of these action items in your rewrite."
+
+        # Generate with hint from previous attempts
         generated = generate_fn(content_unit, structure_match, situation_match, config_path, hint=hint)
 
         # Evaluate with critic
@@ -259,11 +387,19 @@ def generate_with_critic(
         if critic_result.get("pass", False) and score >= min_score:
             return generated, critic_result
 
-        # Build hint for next attempt
+        # Accumulate feedback for next attempt
         feedback = critic_result.get("feedback", "")
         if feedback:
-            hint = f"Previous attempt feedback: {feedback}. Please address these style issues."
+            feedback_history.append(feedback)
 
-    # Return best result even if not perfect
+    # Enforce minimum score - raise exception if not met
+    if best_score < min_score:
+        consolidated_feedback = _consolidate_feedback(feedback_history) if feedback_history else "No specific feedback available"
+        raise ConvergenceError(
+            f"Failed to converge to minimum score {min_score} after {max_retries} attempts. "
+            f"Best score: {best_score:.3f}. Issues: {consolidated_feedback}"
+        )
+
+    # Return best result if it meets threshold
     return best_text or generated, best_result or {"pass": False, "feedback": "Max retries reached", "score": best_score}
 

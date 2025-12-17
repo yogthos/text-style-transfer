@@ -89,6 +89,7 @@ def process_text(
 
     atlas_config = config.get("atlas", {})
     num_clusters = atlas_config.get("num_clusters", 5)
+    similarity_threshold = atlas_config.get("similarity_threshold", 0.3)
 
     # Phase 1: Build or load Style Atlas
     print("Phase 1: Building Style Atlas...")
@@ -189,7 +190,7 @@ def process_text(
                 situation_match = find_situation_match(
                     atlas,
                     content_unit.original_text,
-                    similarity_threshold=0.5
+                    similarity_threshold=similarity_threshold
                 )
 
                 structure_match = find_structure_match(
@@ -202,7 +203,7 @@ def process_text(
                 if situation_match:
                     print(f"    Retrieved situation match (vocabulary): {situation_match[:80]}...")
                 else:
-                    print(f"    ⚠ No situation match found (similarity < 0.5). Using structure match only.")
+                    print(f"    ⚠ No situation match found (similarity < {similarity_threshold}). Using structure match only.")
 
                 if structure_match:
                     print(f"    Retrieved structure match (rhythm): {structure_match[:80]}...")

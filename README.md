@@ -183,6 +183,54 @@ text-style-transfer/
 
 ## How It Works
 
+The following diagram illustrates the complete pipeline flow:
+
+```mermaid
+flowchart TD
+    Start([Start: Input Text + Sample Text]) --> BuildAtlas[Build Style Atlas]
+
+    BuildAtlas --> ChunkText[Chunk Sample Text into Paragraphs]
+    ChunkText --> GenEmbeddings[Generate Dual Embeddings:<br/>Semantic + Style Vectors]
+    GenEmbeddings --> StoreChromaDB[Store in ChromaDB with Metadata]
+    StoreChromaDB --> Cluster[K-means Clustering on Style Vectors]
+    Cluster --> AtlasComplete[Style Atlas Complete]
+
+    Start --> ExtractMeaning[Extract Meaning from Input]
+    ExtractMeaning --> ExtractSVO[Extract SVO Triples, Entities, Content Words]
+    ExtractSVO --> GroupParagraphs[Group into Paragraphs]
+
+    AtlasComplete --> BuildMarkov[Build Cluster Markov Chain]
+    GroupParagraphs --> ProcessPara[Process Each Paragraph]
+
+    BuildMarkov --> ProcessPara
+    ProcessPara --> ProcessSentence[Process Each Sentence]
+
+    ProcessSentence --> PredictCluster[Predict Current Style Cluster]
+    PredictCluster --> DualRAG[Dual RAG Retrieval]
+
+    DualRAG --> SituationMatch[Situation Match:<br/>Semantic Similarity Query]
+    DualRAG --> StructureMatch[Structure Match:<br/>Cluster + Length Filter]
+
+    SituationMatch --> BuildPrompt[Build Constrained Prompt]
+    StructureMatch --> BuildPrompt
+
+    BuildPrompt --> LLMGen[LLM Generation]
+    LLMGen --> CriticEval[Critic Evaluation]
+
+    CriticEval --> PassCheck{Pass Quality<br/>Threshold?}
+    PassCheck -->|No| RetryCount{Retries<br/>&lt; Max?}
+    RetryCount -->|Yes| Feedback[Generate Feedback]
+    Feedback --> BuildPrompt
+    RetryCount -->|No| AcceptBest[Accept Best Result]
+
+    PassCheck -->|Yes| AcceptBest
+    AcceptBest --> MoreSentences{More<br/>Sentences?}
+    MoreSentences -->|Yes| ProcessSentence
+    MoreSentences -->|No| MoreParagraphs{More<br/>Paragraphs?}
+    MoreParagraphs -->|Yes| ProcessPara
+    MoreParagraphs -->|No| End([Output Generated Text])
+```
+
 1. **Style Atlas Construction**:
    - Chunks sample text into paragraphs
    - Generates dual embeddings: semantic (sentence-transformers) and style (deterministic metrics)

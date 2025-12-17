@@ -117,7 +117,7 @@ def predict_next_cluster(
 def find_situation_match(
     atlas: StyleAtlas,
     input_text: str,
-    similarity_threshold: float = 0.5,
+    similarity_threshold: float = 0.3,
     top_k: int = 1
 ) -> Optional[str]:
     """Find a semantically similar paragraph for vocabulary grounding.
@@ -128,7 +128,7 @@ def find_situation_match(
     Args:
         atlas: StyleAtlas containing ChromaDB collection.
         input_text: Input text to find similar paragraphs for.
-        similarity_threshold: Minimum similarity score (0-1, default: 0.5).
+        similarity_threshold: Minimum similarity score (0-1, default: 0.3).
         top_k: Number of results to return (default: 1).
 
     Returns:

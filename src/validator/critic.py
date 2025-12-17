@@ -43,6 +43,7 @@ def critic_evaluate(
     generated_text: str,
     structure_match: str,
     situation_match: Optional[str] = None,
+    original_text: Optional[str] = None,
     config_path: str = "config.json"
 ) -> Dict[str, any]:
     """Evaluate generated text against dual RAG references.
@@ -54,6 +55,7 @@ def critic_evaluate(
         generated_text: The generated text to evaluate.
         structure_match: Reference paragraph for rhythm/structure evaluation.
         situation_match: Optional reference paragraph for vocabulary evaluation.
+        original_text: Original input text (for checking reference/quotation preservation).
         config_path: Path to configuration file.
 
     Returns:
@@ -89,6 +91,8 @@ Determine:
 3. Does it avoid "AI words" (delve, underscore, testament, etc.)?
 4. Does it match the average sentence length?
 5. Does it match the punctuation style and density?
+6. CRITICAL: Are ALL [^number] style citation references from the original text preserved exactly?
+7. CRITICAL: Are ALL direct quotations from the original text preserved exactly?
 
 Output your evaluation as JSON with:
 - "pass": boolean (true if style matches well, false if needs improvement)
@@ -113,9 +117,17 @@ SITUATIONAL REFERENCE (for vocabulary):
 SITUATIONAL REFERENCE: Not provided (no similar topic found in corpus).
 """
 
+    # Build original text section for reference preservation check
+    original_section = ""
+    if original_text:
+        original_section = f"""
+ORIGINAL TEXT (for reference preservation check):
+"{original_text}"
+"""
+
     user_prompt = f"""Compare the generated text against these references:
 
-{structure_section}{situation_section}
+{structure_section}{situation_section}{original_section}
 GENERATED TEXT (to evaluate):
 "{generated_text}"
 
@@ -124,10 +136,21 @@ Evaluate whether the generated text matches:
 - VOCABULARY: Word choice and tone from Situational Reference (if provided)
 - Average sentence length
 - Punctuation style and density
-- Absence of "AI words" (delve, underscore, testament, etc.)
+- Absence of "AI words" (delve, underscore, testament, etc.)"""
+
+    if original_text:
+        user_prompt += """
+- CRITICAL: All [^number] style citation references from Original Text must be preserved exactly
+- CRITICAL: All direct quotations (text in quotes) from Original Text must be preserved exactly"""
+
+    user_prompt += """
 
 Output JSON with "pass", "feedback", and "score" fields.
 If vocabulary doesn't match, mention it. If structure doesn't match, mention it."""
+
+    if original_text:
+        user_prompt += """
+If any references or quotations are missing, this is a CRITICAL FAILURE and "pass" must be false."""
 
     try:
         # Call API
@@ -217,7 +240,13 @@ def generate_with_critic(
         generated = generate_fn(content_unit, structure_match, situation_match, config_path, hint=hint)
 
         # Evaluate with critic
-        critic_result = critic_evaluate(generated, structure_match, situation_match, config_path)
+        critic_result = critic_evaluate(
+            generated,
+            structure_match,
+            situation_match,
+            original_text=content_unit.original_text,
+            config_path=config_path
+        )
         score = critic_result.get("score", 0.0)
 
         # Track best result

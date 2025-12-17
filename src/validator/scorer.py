@@ -206,6 +206,78 @@ def _detect_hallucinations(
     return hallucination_score, new_entities, new_important_words
 
 
+def _verify_references_and_quotations(
+    generated_text: str,
+    original_text: str
+) -> Tuple[float, List[str], List[str]]:
+    """Verify that all citation references and direct quotations are preserved.
+
+    Extracts all [^number] style references and direct quotations from the original text
+    and checks that they are present in the generated text.
+
+    Args:
+        generated_text: The generated text to verify.
+        original_text: The original input text.
+
+    Returns:
+        A tuple of:
+        - Preservation score (0.0 = missing items, 1.0 = all preserved)
+        - List of missing references (e.g., ["[^155]", "[^25]"])
+        - List of missing quotations (exact quoted text that's missing)
+    """
+    import re
+
+    # Extract all [^number] style references from original
+    reference_pattern = r'\[\^\d+\]'
+    original_references = set(re.findall(reference_pattern, original_text))
+
+    # Extract all direct quotations from original (text between quotes)
+    # Match both single and double quotes, handling nested quotes
+    quotation_pattern = r'["\'](?:[^"\']|(?<=\\)["\'])*["\']'
+    original_quotations = []
+    for match in re.finditer(quotation_pattern, original_text):
+        quote_text = match.group(0)
+        # Only consider substantial quotations (more than just punctuation)
+        if len(quote_text.strip('"\'')) > 2:
+            original_quotations.append(quote_text)
+
+    # Check which references are in generated text
+    generated_references = set(re.findall(reference_pattern, generated_text))
+    missing_references = list(original_references - generated_references)
+
+    # Check which quotations are in generated text
+    generated_quotations = []
+    for match in re.finditer(quotation_pattern, generated_text):
+        quote_text = match.group(0)
+        if len(quote_text.strip('"\'')) > 2:
+            generated_quotations.append(quote_text)
+
+    # Check for missing quotations (exact match required)
+    missing_quotations = []
+    for orig_quote in original_quotations:
+        # Normalize quotes for comparison (handle both single and double)
+        orig_normalized = orig_quote.strip('"\'').strip()
+        found = False
+        for gen_quote in generated_quotations:
+            gen_normalized = gen_quote.strip('"\'').strip()
+            if orig_normalized == gen_normalized:
+                found = True
+                break
+        if not found:
+            missing_quotations.append(orig_quote)
+
+    # Calculate preservation score
+    # If there are no references or quotations, score is 1.0 (nothing to preserve)
+    total_items = len(original_references) + len(original_quotations)
+    if total_items == 0:
+        return 1.0, [], []
+
+    missing_items = len(missing_references) + len(missing_quotations)
+    preservation_score = 1.0 - (missing_items / total_items) if total_items > 0 else 1.0
+
+    return preservation_score, missing_references, missing_quotations
+
+
 def _calculate_bertscore(
     generated_text: str,
     original_text: str,
@@ -317,7 +389,14 @@ def score_output(
     # Convert to a "no-hallucination" score (higher is better)
     no_hallucination_score = 1.0 - hallucination_score
 
-    # Metric 5: LLM-based style evaluation (if sample text provided)
+    # Metric 5: Reference and quotation preservation (CRITICAL)
+    preservation_score, missing_references, missing_quotations = _verify_references_and_quotations(
+        generated_text, original_input
+    )
+    # This is a hard requirement - all references and quotations must be preserved
+    preservation_pass = preservation_score >= 1.0  # Must be perfect (1.0)
+
+    # Metric 6: LLM-based style evaluation (if sample text provided)
     llm_meaning_score = None
     llm_style_score = None
     llm_feedback = ""
@@ -341,40 +420,51 @@ def score_output(
             llm_style_score = 0.5  # Neutral score
 
     # Calculate overall score (weighted average)
+    # Note: Preservation is a hard requirement, so if it fails, overall score is penalized heavily
+    preservation_weight = 0.15  # Significant weight for preservation
+
     if llm_style_score is not None:
         # Include LLM style evaluation
         weights = {
-            'meaning': 0.3,
-            'style': 0.15,  # POS-based style
-            'llm_style': 0.25,  # LLM-based style (higher weight)
-            'structure': 0.1,
-            'hallucination': 0.2
+            'meaning': 0.25,
+            'style': 0.12,  # POS-based style
+            'llm_style': 0.20,  # LLM-based style (higher weight)
+            'structure': 0.08,
+            'hallucination': 0.15,
+            'preservation': preservation_weight
         }
         overall_score = (
             weights['meaning'] * meaning_score +
             weights['style'] * style_score +
             weights['llm_style'] * llm_style_score +
             weights['structure'] * structure_score +
-            weights['hallucination'] * no_hallucination_score
+            weights['hallucination'] * no_hallucination_score +
+            weights['preservation'] * preservation_score
         )
     else:
         # Fallback to original weights if no LLM evaluation
         weights = {
-            'meaning': 0.4,
-            'style': 0.2,
-            'structure': 0.15,
-            'hallucination': 0.25
+            'meaning': 0.35,
+            'style': 0.18,
+            'structure': 0.12,
+            'hallucination': 0.20,
+            'preservation': preservation_weight
         }
         overall_score = (
             weights['meaning'] * meaning_score +
             weights['style'] * style_score +
             weights['structure'] * structure_score +
-            weights['hallucination'] * no_hallucination_score
+            weights['hallucination'] * no_hallucination_score +
+            weights['preservation'] * preservation_score
         )
 
-    # All metrics must pass (including hallucination and LLM style check)
+    # Heavy penalty if preservation fails (hard requirement)
+    if not preservation_pass:
+        overall_score = overall_score * 0.3  # Reduce score by 70% if preservation fails
+
+    # All metrics must pass (including hallucination, preservation, and LLM style check)
     all_pass = bool(meaning_pass and style_pass and structure_pass and
-                   hallucination_pass and llm_style_pass)
+                   hallucination_pass and preservation_pass and llm_style_pass)
 
     metrics = {
         'meaning': float(meaning_score),
@@ -382,6 +472,7 @@ def score_output(
         'structure': float(structure_score),
         'hallucination': float(no_hallucination_score),
         'hallucination_score': float(hallucination_score),  # Raw score (lower is better)
+        'preservation': float(preservation_score),  # Reference/quotation preservation
         'kl_divergence': float(kl_div),
         'overall': float(overall_score)
     }
@@ -395,6 +486,9 @@ def score_output(
         'new_entities': new_entities,
         'new_words': new_words,
         'has_hallucinations': len(new_entities) > 0 or len(new_words) > 0,
+        'missing_references': missing_references,
+        'missing_quotations': missing_quotations,
+        'preservation_failed': not preservation_pass,
         'llm_feedback': llm_feedback,
         'llm_style_score': float(llm_style_score) if llm_style_score is not None else None
     }

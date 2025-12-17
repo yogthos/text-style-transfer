@@ -282,6 +282,18 @@ If any citations, quotations, facts, concepts, or details are missing or modifie
             result["feedback"] = "No specific feedback provided."
         if "score" not in result:
             result["score"] = 0.5
+
+        # Normalize pass field if score is high but LLM said false (overly strict critic)
+        if "pass" in result and result.get("pass") == False:
+            # Load good_enough_threshold from config
+            config = _load_config(config_path)
+            critic_config = config.get("critic", {})
+            good_enough_threshold = critic_config.get("good_enough_threshold", 0.8)
+            score = result.get("score", 0.0)
+            if score >= good_enough_threshold:
+                # Score is high enough, override overly strict pass=false
+                result["pass"] = True
+                print(f"    ⚠ Critic said pass=false but score {score:.3f} >= {good_enough_threshold:.2f}. Normalizing to pass=true.")
         if "primary_failure_type" not in result:
             # Infer from feedback if not provided
             feedback_lower = result.get("feedback", "").lower()
@@ -650,6 +662,9 @@ def generate_with_critic(
     if min_score is None:
         min_score = critic_config.get("min_score", 0.75)
 
+    # FIX 3: Add configurable "good enough" threshold
+    good_enough_threshold = critic_config.get("good_enough_threshold", 0.8)
+
     if not structure_match:
         # No structure match, cannot proceed
         generated = content_unit.original_text
@@ -702,7 +717,8 @@ def generate_with_critic(
             current_text = generate_fn(content_unit, current_structure or structure_match, situation_match, config_path, **generate_kwargs)
             is_edited = False
             generation_attempts += 1
-            edit_attempts = 0  # Reset edit attempts when regenerating
+            # FIX 1: Don't reset edit_attempts - track cumulative edits across regenerations
+            # edit_attempts = 0  # REMOVED - preserve counter to prevent infinite edit/regenerate ping-pong
             should_regenerate = False
 
         # Phase 2: Critique
@@ -728,15 +744,55 @@ def generate_with_critic(
             )
             score = critic_result.get("score", 0.0)
 
-        # Track best result
+        # Track the "Global Best" to ensure we never lose ground
         if score > best_score:
-            best_text = current_text
             best_score = score
+            best_text = current_text
             best_result = critic_result
 
+            # FIX 1: IMMEDIATE EXIT "Take the Win"
+            # If we hit the good enough threshold, stop optimizing. It's good enough.
+            # This prevents over-editing and saves tokens.
+            if score >= good_enough_threshold:
+                print(f"    ✓ Score {score:.3f} is strong (>= {good_enough_threshold:.2f}). Accepting immediately.")
+                return current_text, critic_result
+
         # Check if we should accept
-        if critic_result.get("pass", False) and score >= min_score:
+        # FIX 2: Relaxed Threshold - We accept if Critic passes it, OR if score is objectively high (good_enough_threshold+)
+        # (e.g., Score 0.95 matches "Perfect", even if Critic found a tiny nitpick)
+        if (critic_result.get("pass", False) and score >= min_score) or score >= good_enough_threshold:
             return current_text, critic_result
+
+        # FIX 1: The Backtracking Safety Net
+        # If we edited and it got worse, UNDO it immediately.
+        if is_edited and last_score_before_edit is not None:
+            if score < last_score_before_edit:
+                print(f"    ⚠ Edit degraded score ({last_score_before_edit:.3f} -> {score:.3f}).")
+
+                # Check if we have a saved 'best' version to fall back to
+                if best_text and best_score > score:
+                    print(f"    ↺ REVERTING to best known version (Score: {best_score:.3f}).")
+                    current_text = best_text
+                    score = best_score  # Reset score to match the reverted text
+                    # Also update critic_result to match the reverted state
+                    critic_result = best_result if best_result else critic_result
+
+                    # Apply penalty for the failed attempt
+                    edit_attempts = min(edit_attempts + 1, max_edit_attempts)
+
+                    # IMPORTANT: Reset the 'is_edited' flag so we don't loop the reversion check
+                    is_edited = False
+
+                    # Force a different strategy next time (e.g., try a different edit or regenerate)
+                    # Re-evaluate the reverted text to get fresh feedback
+                    continue
+                else:
+                    # No better version to revert to, just apply penalty
+                    print(f"    ⚠ No better version to revert to. Applying penalty.")
+                    edit_attempts = min(edit_attempts + 1, max_edit_attempts)
+            else:
+                # Edit improved or maintained score
+                print(f"    ✓ Edit improved/maintained score ({last_score_before_edit:.3f} -> {score:.3f})")
 
         # Phase 3: Determine next action - Edit or Regenerate
         feedback = critic_result.get("feedback", "")
@@ -752,15 +808,24 @@ def generate_with_critic(
         if is_edited and last_score_before_edit is not None and score > last_score_before_edit:
             edit_improved = True
 
+        # FIX 2: Fatal Error Eject Button
+        # If score is 0.0, the text is likely broken/empty. Don't try to "edit" garbage.
+        if score < 0.1:
+            print("    ⚠ Critical Failure (Score ~0.0). Forcing full regeneration.")
+            # Force loop to skip edit logic and go straight to regeneration
+            edit_attempts = max_edit_attempts
+
         # Edit Mode: If feedback is specific edit and score is decent, apply edit
         # FIX 2: Allow surgical edits even after max generation attempts
+        # FIX 3: Added 'score > 0.1' to prevent editing "Fatal Errors" (Length mismatch)
         # We only stop if edit attempts are exhausted
-        if (is_specific_edit and score > 0.5 and edit_attempts < max_edit_attempts):
+        if (is_specific_edit and score > 0.1 and edit_attempts < max_edit_attempts):
             # If we've already edited and it didn't improve, regenerate instead
             if edit_attempts > 0 and not edit_improved and last_score_before_edit is not None:
                 # Editing didn't help, regenerate
                 should_regenerate = True
-                edit_attempts = 0
+                # FIX 1: Don't reset edit_attempts - preserve counter to track cumulative edits
+                # edit_attempts = 0  # REMOVED
                 last_score_before_edit = None
                 is_edited = False
                 if feedback:
@@ -810,7 +875,8 @@ def generate_with_critic(
                 break
 
             should_regenerate = True
-            edit_attempts = 0  # Reset edit attempts
+            # FIX 1: Don't reset edit_attempts - preserve counter to track cumulative edits
+            # edit_attempts = 0  # REMOVED - prevents infinite edit/regenerate ping-pong
             last_score_before_edit = None
             is_edited = False
             if feedback:

@@ -57,9 +57,10 @@ The project uses `config.json` for configuration. Here's the complete structure:
 {
   "provider": "deepseek",
   "ollama": {
-    "url": "http://localhost:11434/api/generate",
-    "editor_model": "qwen3:32b",
-    "critic_model": "deepseek-r1:8b"
+    "url": "http://localhost:11434/api/chat",
+    "editor_model": "mistral-nemo",
+    "critic_model": "qwen3:8b",
+    "keep_alive": "10m"
   },
   "deepseek": {
     "api_key": "your-api-key-here",
@@ -72,14 +73,30 @@ The project uses `config.json` for configuration. Here's the complete structure:
   },
   "atlas": {
     "persist_path": "atlas_cache/",
+    "collection_name": "style_atlas",
     "num_clusters": 5,
     "similarity_threshold": 0.3
   },
   "critic": {
-    "min_score": 0.75,
+    "min_score": 0.6,
     "min_pipeline_score": 0.6,
     "max_retries": 5,
-    "max_pipeline_retries": 2
+    "max_pipeline_retries": 2,
+    "fallback_pass_threshold": 0.75,
+    "good_enough_threshold": 0.8,
+    "adaptive_threshold_base": 0.6,
+    "adaptive_threshold_moderate": 0.65,
+    "adaptive_threshold_penalty_high": 0.15,
+    "adaptive_threshold_penalty_moderate": 0.1
+  },
+  "scorer": {
+    "meaning_threshold": 0.85,
+    "style_threshold": 1.0,
+    "hallucination_threshold": 0.1,
+    "llm_style_threshold": 0.75
+  },
+  "vocabulary": {
+    "similarity_threshold": 0.6
   },
   "blend": {
     "authors": ["Sagan"],
@@ -103,9 +120,14 @@ The project uses `config.json` for configuration. Here's the complete structure:
 
 #### Ollama Configuration (Alternative Provider)
 
-- **ollama.url**: Ollama API endpoint (default: `"http://localhost:11434/api/generate"`)
-- **ollama.editor_model**: Model name for text generation (e.g., `"qwen3:32b"`)
-- **ollama.critic_model**: Model name for critic evaluation (e.g., `"deepseek-r1:8b"`)
+- **ollama.url**: Ollama API endpoint (default: `"http://localhost:11434/api/chat"`)
+  - The system automatically converts `/api/generate` to `/api/chat` if needed
+- **ollama.editor_model**: Model name for text generation (e.g., `"mistral-nemo"`, `"qwen3:32b"`)
+- **ollama.critic_model**: Model name for critic evaluation (e.g., `"qwen3:8b"`, `"deepseek-r1:8b"`)
+- **ollama.keep_alive**: Duration to keep model loaded in VRAM (e.g., `"10m"`, `"5m"`, `"30s"`)
+  - Reduces latency by keeping models loaded between API calls
+  - Format: number followed by unit (`s` for seconds, `m` for minutes, `h` for hours)
+  - Default: `"10m"` (10 minutes)
 
 #### Sample Text
 
@@ -114,16 +136,25 @@ The project uses `config.json` for configuration. Here's the complete structure:
 #### Style Atlas Settings
 
 - **atlas.persist_path**: Directory to cache/load Style Atlas (optional, speeds up subsequent runs)
+- **atlas.collection_name**: ChromaDB collection name (default: `"style_atlas"`)
+  - Used to organize multiple style atlases in the same database
+  - Can be overridden via CLI flags in management scripts
 - **atlas.num_clusters**: Number of K-means clusters for style grouping (default: `5`, recommended: 3-7)
 - **atlas.similarity_threshold**: Minimum similarity score (0-1) for situation match retrieval (default: `0.3`, lower = more matches)
 
 #### Critic Settings
 
-- **critic.min_score**: Minimum score (0-1) required for critic to accept generated text (default: `0.75`)
+- **critic.min_score**: Minimum score (0-1) required for critic to accept generated text (default: `0.75`, but can be set lower like `0.6` for faster convergence)
+  - Lower values allow more lenient acceptance
 - **critic.min_pipeline_score**: Minimum score (0-1) for pipeline-level acceptance (default: `0.6`, more lenient than min_score)
 - **critic.max_retries**: Maximum retry attempts per sentence within critic loop (default: `5`)
+  - Controls how many times the system will regenerate or edit a sentence before accepting the best result
 - **critic.max_pipeline_retries**: Maximum retry attempts at pipeline level when score is below threshold (default: `2`)
 - **critic.fallback_pass_threshold**: Fallback threshold (0-1) used when critic response doesn't include pass field (default: `0.75`)
+- **critic.good_enough_threshold**: Score threshold (0-1) for immediate acceptance (default: `0.8`)
+  - When a generated text scores >= this threshold, the system immediately accepts it ("Take the Win" logic)
+  - Prevents over-optimization and saves tokens by stopping early when quality is sufficient
+  - Also normalizes `pass: false` to `pass: true` if score >= threshold (handles overly strict critics)
 - **critic.adaptive_threshold_base**: Base threshold (0-1) for adaptive scoring when structure match length is very different (default: `0.6`)
 - **critic.adaptive_threshold_moderate**: Moderate threshold (0-1) for adaptive scoring when structure match length is moderately different (default: `0.65`)
 - **critic.adaptive_threshold_penalty_high**: Penalty amount (0-1) subtracted from min_score when structure match is very different (default: `0.15`)
@@ -138,7 +169,8 @@ The project uses `config.json` for configuration. Here's the complete structure:
 
 #### Vocabulary Settings
 
-- **vocabulary.similarity_threshold**: Minimum cosine similarity (0-1) for word clustering in vocabulary mapping (default: `0.7`)
+- **vocabulary.similarity_threshold**: Minimum cosine similarity (0-1) for word clustering in vocabulary mapping (default: `0.6`)
+  - Lower values allow more word matches (e.g., `0.6` is more lenient than `0.7`)
 
 #### Style Blending Settings
 
@@ -153,10 +185,25 @@ The project uses `config.json` for configuration. Here's the complete structure:
 
 ### Getting an API Key
 
+#### DeepSeek API
+
 1. Sign up at https://platform.deepseek.com
 2. Navigate to API keys section
 3. Create a new API key
-4. Copy the key and paste it into `config.json`
+4. Copy the key and paste it into `config.json` under `deepseek.api_key`
+
+#### Ollama (Local Models)
+
+Ollama allows you to run models locally without an API key:
+1. Install Ollama from https://ollama.ai
+2. Pull the models you want to use:
+   ```bash
+   ollama pull mistral-nemo
+   ollama pull qwen3:8b
+   ```
+3. Start the Ollama server (usually runs automatically)
+4. Configure `config.json` with `"provider": "ollama"` and set your model names
+5. **Optimization**: Set `ollama.keep_alive` to keep models loaded in VRAM (e.g., `"10m"`), reducing latency between API calls
 
 ## Usage
 
@@ -439,6 +486,11 @@ flowchart TD
    - Two-level retry system:
      - **Critic-level retries**: Up to `critic.max_retries` attempts per sentence
      - **Pipeline-level retries**: Up to `critic.max_pipeline_retries` attempts when score is below threshold
+   - **Convergence Optimizations**:
+     - **"Take the Win" Logic**: Immediately accepts text scoring >= `good_enough_threshold` (default: 0.8) to prevent over-optimization
+     - **Backtracking**: Reverts to best-known text if edits degrade the score (prevents getting stuck in local optima)
+     - **Surgical Fixes**: Attempts targeted edits based on specific feedback before full regeneration
+     - **Pass Normalization**: Overrides `pass: false` to `pass: true` when score >= `good_enough_threshold` (handles overly strict critics)
    - Adaptive threshold adjustment when structure matches are poor quality
    - Enforces minimum score thresholds with `ConvergenceError` if not met
 
@@ -566,7 +618,8 @@ Make sure you're running from the project root directory and the virtual environ
 The pipeline includes retry mechanisms, but if output quality is consistently low:
 - Try a longer or more representative sample text
 - Adjust critic thresholds in `config.json`:
-  - Lower `critic.min_score` (default: 0.75) to be more lenient
+  - Lower `critic.min_score` (default: 0.75) to be more lenient (e.g., `0.6` for faster convergence)
+  - Adjust `critic.good_enough_threshold` (default: 0.8) to control when the system stops optimizing
   - Increase `critic.max_retries` (default: 5) for more attempts
 - Lower `atlas.similarity_threshold` (default: 0.3) to get more situation matches
 - Ensure the sample text has sufficient variety in style
@@ -574,6 +627,16 @@ The pipeline includes retry mechanisms, but if output quality is consistently lo
 - Review prompt templates in `prompts/` - they may need adjustment for your use case
 - For style blending: Ensure both authors have sufficient text loaded (at least 10-20 paragraphs each)
 - If bridge texts aren't found, try adjusting `blend.ratio` or ensure authors have overlapping style characteristics
+
+### Convergence Issues
+
+If the system is not converging or getting stuck in loops:
+- **Check debug logs**: The system prints diagnostic information showing feedback classification, scores, and loop state
+- **Backtracking**: The system automatically reverts to the best-known text if edits degrade the score
+- **"Take the Win" Logic**: Scores >= `good_enough_threshold` (default: 0.8) are immediately accepted to prevent over-optimization
+- **Pass Normalization**: If the critic is overly strict (returning `pass: false` for high scores), the system normalizes `pass` to `true` when score >= `good_enough_threshold`
+- **Edit vs Regeneration**: The system distinguishes between specific edit instructions (surgical fixes) and structural rewrites (full regeneration)
+- If stuck in infinite loops, check that `max_retries` and `max_pipeline_retries` are set appropriately
 
 ### Length Expansion Issues
 

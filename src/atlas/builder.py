@@ -144,6 +144,14 @@ def build_style_atlas(
     semantic_embeddings = []
     style_vectors = []
     texts = []
+    metadatas = []
+
+    # Import NLTK for accurate counting
+    try:
+        from nltk.tokenize import word_tokenize, sent_tokenize
+        nltk_available = True
+    except ImportError:
+        nltk_available = False
 
     for idx, paragraph in enumerate(paragraphs):
         para_id = f"para_{idx}"
@@ -158,12 +166,29 @@ def build_style_atlas(
         style_vec = get_style_vector(paragraph)
         style_vectors.append(style_vec)
 
+        # Calculate length metadata
+        if nltk_available:
+            word_count = len(word_tokenize(paragraph))
+            sentence_count = len(sent_tokenize(paragraph))
+        else:
+            # Fallback to simple counting
+            word_count = len(paragraph.split())
+            sentence_count = paragraph.count('.') + paragraph.count('!') + paragraph.count('?')
+            if sentence_count == 0:
+                sentence_count = 1  # At least one sentence
+
+        metadatas.append({
+            "paragraph_idx": idx,
+            "word_count": word_count,
+            "sentence_count": sentence_count
+        })
+
     # Store in ChromaDB
     collection.add(
         ids=paragraph_ids,
         embeddings=semantic_embeddings,
         documents=texts,
-        metadatas=[{"paragraph_idx": idx} for idx in range(len(paragraphs))]
+        metadatas=metadatas
     )
 
     # Run K-means clustering on style vectors
@@ -184,11 +209,16 @@ def build_style_atlas(
     # Create cluster_id mapping
     cluster_ids = {para_id: int(label) for para_id, label in zip(paragraph_ids, cluster_labels)}
 
-    # Update ChromaDB metadata with cluster IDs
+    # Update ChromaDB metadata with cluster IDs (preserve existing metadata)
+    updated_metadatas = []
+    for idx in range(len(paragraphs)):
+        updated_meta = metadatas[idx].copy()
+        updated_meta["cluster_id"] = int(cluster_labels[idx])
+        updated_metadatas.append(updated_meta)
+
     collection.update(
         ids=paragraph_ids,
-        metadatas=[{"paragraph_idx": idx, "cluster_id": int(cluster_labels[idx])}
-                  for idx in range(len(paragraphs))]
+        metadatas=updated_metadatas
     )
 
     # Create StyleAtlas object

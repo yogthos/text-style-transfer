@@ -194,7 +194,9 @@ def process_text(
 
                 structure_match = find_structure_match(
                     atlas,
-                    current_cluster
+                    current_cluster,
+                    input_text=content_unit.original_text,
+                    length_tolerance=0.3
                 )
 
                 if situation_match:

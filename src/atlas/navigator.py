@@ -186,20 +186,24 @@ def find_situation_match(
 def find_structure_match(
     atlas: StyleAtlas,
     target_cluster_id: int,
+    input_text: str,
+    length_tolerance: float = 0.3,
     top_k: int = 1
 ) -> Optional[str]:
     """Find a paragraph matching the target style cluster for rhythm/structure.
 
-    Queries ChromaDB by cluster_id only (ignores semantic similarity).
-    Returns a paragraph from the target cluster.
+    Queries ChromaDB by cluster_id and filters by length ratio to prevent expansion.
+    Returns a paragraph from the target cluster that matches input length.
 
     Args:
         atlas: StyleAtlas containing ChromaDB collection.
         target_cluster_id: Target cluster ID to retrieve from.
+        input_text: Input text to match length against (required for length filtering).
+        length_tolerance: Tolerance for length matching (0.3 = 30%, default: 0.3).
         top_k: Number of results to return (default: 1).
 
     Returns:
-        A paragraph from the target cluster, or None if not found.
+        A paragraph from the target cluster matching input length, or None if not found.
     """
     if not hasattr(atlas, '_collection'):
         try:
@@ -212,14 +216,73 @@ def find_structure_match(
 
     collection = atlas._collection
 
+    # Calculate input length metrics
+    try:
+        from nltk.tokenize import word_tokenize, sent_tokenize
+        nltk_available = True
+    except ImportError:
+        nltk_available = False
+
+    if nltk_available:
+        input_word_count = len(word_tokenize(input_text))
+        input_sent_count = len(sent_tokenize(input_text))
+    else:
+        # Fallback to simple counting
+        input_word_count = len(input_text.split())
+        input_sent_count = input_text.count('.') + input_text.count('!') + input_text.count('?')
+        if input_sent_count == 0:
+            input_sent_count = 1  # At least one sentence
+
     # Get all documents and filter by cluster_id
     all_results = collection.get()
 
     if not all_results['ids']:
         return None
 
-    # Filter by cluster_id
+    # Filter by cluster_id and length
+    candidates = []
+    for idx, para_id in enumerate(all_results['ids']):
+        metadata = all_results['metadatas'][idx] if all_results['metadatas'] else {}
+        cluster_id = metadata.get('cluster_id')
+
+        if cluster_id != target_cluster_id:
+            continue
+
+        doc = all_results['documents'][idx] if all_results['documents'] else None
+        if not doc:
+            continue
+
+        # Get length metadata
+        cand_word_count = metadata.get('word_count', len(doc.split()))
+        cand_sent_count = metadata.get('sentence_count', doc.count('.') + doc.count('!') + doc.count('?') or 1)
+
+        # Calculate length ratios
+        if input_word_count > 0:
+            len_ratio = cand_word_count / input_word_count
+        else:
+            len_ratio = 1.0  # If input is empty, accept any length
+
+        if input_sent_count > 0:
+            sent_ratio = cand_sent_count / input_sent_count
+        else:
+            sent_ratio = 1.0
+
+        # Accept candidates within tolerance (0.7x to 1.5x)
+        min_ratio = 1.0 - length_tolerance
+        max_ratio = 1.0 + length_tolerance
+
+        if min_ratio <= len_ratio <= max_ratio:
+            candidates.append((doc, len_ratio, cand_word_count))
+
+    # If we have length-matched candidates, return the one closest to 1.0 ratio
+    if candidates:
+        best_match = min(candidates, key=lambda x: abs(x[1] - 1.0))
+        return best_match[0]
+
+    # Fallback: If no length match, return the shortest candidate to avoid expansion
+    # Re-filter to get all cluster matches
     matching_paragraphs = []
+    matching_metadata = []
     for idx, para_id in enumerate(all_results['ids']):
         metadata = all_results['metadatas'][idx] if all_results['metadatas'] else {}
         cluster_id = metadata.get('cluster_id')
@@ -227,11 +290,18 @@ def find_structure_match(
             doc = all_results['documents'][idx] if all_results['documents'] else None
             if doc:
                 matching_paragraphs.append(doc)
+                matching_metadata.append(metadata)
 
     if matching_paragraphs:
-        # Return random selection for variety
-        import random
-        return random.choice(matching_paragraphs[:top_k])
+        # Find shortest by word count
+        shortest_idx = 0
+        shortest_word_count = float('inf')
+        for idx, meta in enumerate(matching_metadata):
+            word_count = meta.get('word_count', len(matching_paragraphs[idx].split()))
+            if word_count < shortest_word_count:
+                shortest_word_count = word_count
+                shortest_idx = idx
+        return matching_paragraphs[shortest_idx]
 
     return None
 

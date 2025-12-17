@@ -72,7 +72,22 @@ The project uses `config.json` for configuration. Here's the complete structure:
     "persist_path": "atlas_cache/",
     "collection_name": "style_atlas",
     "num_clusters": 5,
-    "similarity_threshold": 0.3
+    "similarity_threshold": 0.3,
+    "length_tolerance": 0.3,
+    "min_structure_words": 3,
+    "max_length_ratio": 2.0,
+    "min_length_ratio": 0.5
+  },
+  "length_gate": {
+    "default_min_ratio": 0.6,
+    "default_max_ratio": 1.5,
+    "lenient_min_ratio": 0.2,
+    "lenient_max_ratio": 3.0,
+    "very_different_threshold_low": 0.5,
+    "very_different_threshold_high": 2.0,
+    "moderate_different_threshold_low": 0.67,
+    "moderate_different_threshold_high": 1.5,
+    "skip_gate_when_very_different": true
   },
   "critic": {
     "min_score": 0.6,
@@ -93,7 +108,7 @@ The project uses `config.json` for configuration. Here's the complete structure:
     "llm_style_threshold": 0.75
   },
   "blend": {
-    "authors": ["Sagan"],
+    "authors": ["Dawkins", "Lovecraft"],
     "ratio": 0.5
   }
 }
@@ -131,6 +146,24 @@ The project uses `config.json` for configuration. Here's the complete structure:
   - Can be overridden via CLI flags in management scripts
 - **atlas.num_clusters**: Number of K-means clusters for style grouping (default: `5`, recommended: 3-7)
 - **atlas.similarity_threshold**: Minimum similarity score (0-1) for situation match retrieval (default: `0.3`, lower = more matches)
+- **atlas.length_tolerance**: Length tolerance ratio for structure match filtering (default: `0.3`)
+- **atlas.min_structure_words**: Minimum word count for valid structural templates (default: `3`)
+- **atlas.max_length_ratio**: Maximum length ratio for structure match filtering (default: `2.0`)
+- **atlas.min_length_ratio**: Minimum length ratio for structure match filtering (default: `0.5`)
+
+#### Length Gate Settings
+
+Controls deterministic length validation to ensure content preservation:
+
+- **length_gate.default_min_ratio**: Default minimum length ratio (generated vs input) (default: `0.6`)
+- **length_gate.default_max_ratio**: Default maximum length ratio (generated vs input) (default: `1.5`)
+- **length_gate.lenient_min_ratio**: Lenient minimum length ratio when structure is very different (default: `0.2`)
+- **length_gate.lenient_max_ratio**: Lenient maximum length ratio when structure is very different (default: `3.0`)
+- **length_gate.very_different_threshold_low**: Lower threshold for "very different" length ratio (default: `0.5`)
+- **length_gate.very_different_threshold_high**: Upper threshold for "very different" length ratio (default: `2.0`)
+- **length_gate.moderate_different_threshold_low**: Lower threshold for "moderate different" length ratio (default: `0.67`)
+- **length_gate.moderate_different_threshold_high**: Upper threshold for "moderate different" length ratio (default: `1.5`)
+- **length_gate.skip_gate_when_very_different**: Whether to skip length gate entirely when structure is very different (default: `true`)
 
 #### Critic Settings
 
@@ -160,13 +193,20 @@ The project uses `config.json` for configuration. Here's the complete structure:
 #### Style Blending Settings
 
 - **blend.authors**: List of author identifiers to blend (e.g., `["Hemingway", "Lovecraft"]`)
-  - Single author: `["Sagan"]` → single-author mode (backward compatible)
-  - Multiple authors: `["Hemingway", "Lovecraft"]` → blend mode
+  - **Single author**: `["Sagan"]` → single-author mode (backward compatible)
+  - **Two authors**: `["Hemingway", "Lovecraft"]` → blend mode
+  - **Important**: Only the first two authors in the list are used. If more than two authors are specified, only the first two are used and the rest are ignored.
+  - Example: `["Dawkins", "Lovecraft", "Hemingway"]` will only blend Dawkins and Lovecraft, ignoring Hemingway
 - **blend.ratio**: Blend ratio (0.0 to 1.0, default: `0.5`)
   - `0.0` = All Author A (first in list)
   - `1.0` = All Author B (second in list)
   - `0.5` = Balanced blend
+  - `0.3` = Primarily Author A with subtle Author B influences
+  - `0.7` = Primarily Author B with subtle Author A influences
   - Can be overridden via `--blend-ratio` CLI flag
+  - **How it works**: Uses vector interpolation to find "bridge texts" that naturally blend both styles
+    - Structure: `target_vec = (vec_a * (1 - ratio)) + (vec_b * ratio)`
+    - Vocabulary: Samples words proportionally based on ratio
 
 ### Getting an API Key
 
@@ -451,10 +491,12 @@ flowchart TD
    - **Structure Match**: Queries ChromaDB by cluster ID and filters by length ratio (0.7x-1.5x) to find rhythm/structure examples
      - Uses stochastic selection with history tracking to prevent repetition
      - Prefers candidates with better length matches
-   - **Blend Mode**: When multiple authors are configured, uses `StyleBlender` to find "bridge texts" via vector interpolation
-     - Calculates author centroids (average style vectors)
+   - **Blend Mode**: When two authors are configured, uses `StyleBlender` to find "bridge texts" via vector interpolation
+     - **Note**: Only the first two authors in the `blend.authors` list are used
+     - Calculates author centroids (average style vectors) for both authors
      - Interpolates between author styles: `target_vec = (vec_a * (1 - ratio)) + (vec_b * ratio)`
      - Finds paragraphs that naturally blend both styles
+     - Samples vocabulary proportionally from both authors based on ratio
 
 5. **Constrained Generation**: Uses LLM with RAG-based prompts that:
    - Explicitly separate vocabulary guidance (from situation match) and structure guidance (from structure match)
@@ -611,7 +653,8 @@ The pipeline includes retry mechanisms, but if output quality is consistently lo
 - Check that the Style Atlas is being built correctly (check logs with `-v`)
 - Review prompt templates in `prompts/` - they may need adjustment for your use case
 - For style blending: Ensure both authors have sufficient text loaded (at least 10-20 paragraphs each)
-- If bridge texts aren't found, try adjusting `blend.ratio` or ensure authors have overlapping style characteristics
+  - **Important**: Only the first two authors in `blend.authors` are used for blending
+  - If bridge texts aren't found, try adjusting `blend.ratio` or ensure authors have overlapping style characteristics
 
 ### Convergence Issues
 

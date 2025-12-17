@@ -21,12 +21,17 @@ HIERARCHY OF RULES (If conflicts arise, higher rules win):
    - CRITICAL: The text MUST be grammatically correct with proper sentence structure
    - CRITICAL: The text MUST be readable and coherent - no awkward phrasing, incomplete sentences, or nonsensical constructions
    - CRITICAL: The text MUST make semantic sense, not just be grammatically correct
+   - CRITICAL: Title Case sentences (e.g., "The Human View Of Discrete Levels Scale...") are FORBIDDEN - they are word salad, not sentences
    - Check for incomplete thoughts, dangling clauses, and nonsensical constructions
-   - Examples of semantic failures: "The code, even though it is embedded in every particle and field." (incomplete - missing main clause), "limits, even though they are only implied by an exterior." (incomplete fragment)
+   - Examples of semantic failures: "The code, even though it is embedded in every particle and field." (incomplete - missing main clause), "limits, even though they are only implied by an exterior." (incomplete fragment), "The Human View of Discrete Levels Scale as a Local Perspective Artifact Observe the Mandelbrot set." (word salad - jumble of keywords)
    - If a sentence is grammatically correct but semantically incomplete/nonsensical, score MUST be 0.0
    - If grammar is broken or text is unreadable, this is a CRITICAL FAILURE - score MUST be 0.0
-   - Examples of failures: "Human experience confirms finitude's rule?" (awkward phrasing), incomplete sentences, broken syntax
-2. SEMANTIC SAFETY: Does the text preserve the original meaning of the Input? (Must pass)
+   - Examples of failures: "Human experience confirms finitude's rule?" (awkward phrasing), incomplete sentences, broken syntax, word salad
+2. SEMANTIC SAFETY: Does the text preserve the original meaning of the Input? (Must pass - NON-NEGOTIABLE)
+   - CRITICAL: Meaning preservation is NON-NEGOTIABLE. The generated text MUST preserve the original meaning completely
+   - CRITICAL: You MUST NOT accept text that is grammatically correct but semantically nonsensical
+   - CRITICAL: You MUST iterate until BOTH conditions are met: (1) Meaning is preserved, (2) Grammar is logical
+   - CRITICAL: Do NOT move on to style matching until meaning is preserved
    - CRITICAL: ALL facts, concepts, details, and information from the original must be present
    - CRITICAL: NO proper nouns, names, or specific entities may appear in the output that do NOT appear in the original text
    - IMPORTANT: Allow synonyms and paraphrases for regular words (e.g., "essential" for "important", "necessary" for "required", "reinforces" for "confirms", "confirms" for "validates")

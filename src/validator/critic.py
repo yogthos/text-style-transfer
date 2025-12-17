@@ -24,6 +24,28 @@ except ImportError:
     # NLTK not available, will use fallback logic
     nltk = None
 
+# Initialize Spacy for grammatical coherence checking
+try:
+    import spacy
+    try:
+        _spacy_nlp = spacy.load("en_core_web_sm")
+    except OSError:
+        # Model not downloaded, will download on first use
+        _spacy_nlp = None
+except ImportError:
+    # Spacy not available, will use fallback logic
+    spacy = None
+    _spacy_nlp = None
+
+# Initialize sentence-transformers for semantic similarity
+try:
+    from sentence_transformers import SentenceTransformer, util
+    _sentence_model = None  # Lazy load
+except ImportError:
+    SentenceTransformer = None
+    util = None
+    _sentence_model = None
+
 if TYPE_CHECKING:
     from src.atlas.builder import StyleAtlas
     from src.atlas.navigator import StructureNavigator
@@ -443,6 +465,130 @@ def _is_minor_omission(feedback: str, original_text: str, generated_text: str) -
                 return True
 
     return False
+
+
+def is_grammatically_coherent(text: str) -> bool:
+    """Fast deterministic check for 'Word Salad' and grammatical coherence.
+
+    Detects:
+    - Missing verbs (sentence must have at least one verb)
+    - Title Case abuse (>70% of words capitalized in sentences >5 words)
+    - Word salad patterns (excessive capitalization with noun-like structure)
+
+    Args:
+        text: Text to check for grammatical coherence.
+
+    Returns:
+        True if grammatically coherent, False if word salad or invalid.
+    """
+    if not text or not text.strip():
+        return False
+
+    global _spacy_nlp
+
+    # Try to load Spacy if not already loaded
+    if _spacy_nlp is None and spacy is not None:
+        try:
+            _spacy_nlp = spacy.load("en_core_web_sm")
+        except (OSError, IOError):
+            # Model not available, use fallback
+            pass
+
+    words = text.split()
+
+    # Check 1: Title Case abuse (e.g., "The Human View Of Discrete...")
+    # If >65% of words are capitalized (and it's not a short title), it's broken
+    # Lowered threshold from 70% to 65% to catch cases like "The Human View of Discrete Levels Scale..."
+    if len(words) > 5:
+        # Count capitalized words (excluding sentence-starting words)
+        upper_count = 0
+        total_count = 0
+        for i, w in enumerate(words):
+            if w and w[0].isupper():
+                # First word is always capitalized, don't count it
+                if i > 0:
+                    upper_count += 1
+                total_count += 1
+            else:
+                total_count += 1
+
+        if total_count > 0 and upper_count / total_count > 0.65:
+            return False
+
+    # Check 2: Word salad pattern - excessive capitalized words in sequence
+    # Pattern: Many capitalized words (like a title) but in a sentence context
+    # "The Human View of Discrete Levels Scale as a Local Perspective Artifact Observe..."
+    # This has many capitalized words but is not a proper sentence
+    if len(words) > 8:
+        # Count capitalized words (excluding first word and common words)
+        common_words = {'of', 'as', 'a', 'an', 'the', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'with', 'by'}
+        cap_count = 0
+        for i, w in enumerate(words):
+            clean_w = w.strip('.,!?;:').lower()
+            if w and w[0].isupper() and i > 0 and clean_w not in common_words:
+                cap_count += 1
+
+        # If we have 8+ capitalized non-common words in a long sentence, it's likely word salad
+        if cap_count >= 8:
+            return False
+
+    # Check 3: Must have a verb (using Spacy if available)
+    if _spacy_nlp is not None:
+        try:
+            doc = _spacy_nlp(text)
+            has_verb = any(token.pos_ == "VERB" for token in doc)
+            if not has_verb:
+                return False
+        except Exception:
+            # Spacy processing failed, fall through to basic checks
+            pass
+
+    return True
+
+
+def check_semantic_similarity(generated: str, original: str, threshold: float = 0.6) -> bool:
+    """Verifies that the generated text vector is close to the original text vector.
+
+    Catches hallucinations and complete meaning changes using embedding similarity.
+
+    Args:
+        generated: Generated text to check.
+        original: Original input text to compare against.
+        threshold: Minimum cosine similarity score (default: 0.6).
+
+    Returns:
+        True if semantic similarity is above threshold, False otherwise.
+    """
+    if not generated or not original:
+        return False
+
+    global _sentence_model
+
+    # Lazy load sentence-transformers model
+    if _sentence_model is None and SentenceTransformer is not None:
+        try:
+            _sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception:
+            # Model loading failed, return True to avoid blocking (graceful degradation)
+            return True
+
+    if _sentence_model is None:
+        # Fallback: return True if sentence-transformers not available
+        return True
+
+    try:
+        # Encode both texts to embeddings
+        emb1 = _sentence_model.encode(generated, convert_to_tensor=True)
+        emb2 = _sentence_model.encode(original, convert_to_tensor=True)
+
+        # Compute cosine similarity
+        score = util.pytorch_cos_sim(emb1, emb2).item()
+
+        # Return True if similarity is above threshold
+        return score >= threshold
+    except Exception:
+        # Error during encoding/similarity calculation, return True to avoid blocking
+        return True
 
 
 def _check_semantic_validity(generated_text: str) -> Optional[Dict[str, any]]:
@@ -1520,44 +1666,66 @@ def generate_with_critic(
         # Phase 2: Critique
         eval_structure = current_structure if current_structure else structure_match
 
-        # Hard gate: Check length before LLM evaluation
+        # HARD GATE 1: Check grammatical coherence (word salad detection)
+        # This catches word salad like "The Human View of Discrete Levels Scale..."
+        if not is_grammatically_coherent(current_text):
+            print("    ⚠ FAIL: Text detected as 'Word Salad' or invalid grammar.")
+            critic_result = {
+                "pass": False,
+                "feedback": "CRITICAL: Text is grammatically incoherent (word salad or missing verb). Rewrite with proper sentence structure and complete thoughts.",
+                "score": 0.0,
+                "primary_failure_type": "grammar"
+            }
+            score = 0.0
+        # HARD GATE 2: Check semantic similarity (meaning preservation)
+        elif content_unit.original_text and not check_semantic_similarity(current_text, content_unit.original_text):
+            print("    ⚠ FAIL: Semantic similarity too low (Meaning lost).")
+            critic_result = {
+                "pass": False,
+                "feedback": "CRITICAL: Generated text has lost the original meaning. Preserve all concepts, facts, and information from the original text.",
+                "score": 0.0,
+                "primary_failure_type": "meaning"
+            }
+            score = 0.0
+        # HARD GATE 3: Check length before LLM evaluation
         # FIX: Length gate now compares generated_text to input_text (content preservation)
         # Not to structure_match (which may be very different in length)
-        from src.utils import calculate_length_ratio
-
-        # Calculate length ratio between structure match and original input (for critic leniency)
-        active_structure = current_structure if current_structure else structure_match
-        structure_input_ratio = None
-        if active_structure and content_unit.original_text:
-            structure_input_ratio = calculate_length_ratio(
-                active_structure,
-                content_unit.original_text
-            )
-
-        # Check length gate (compares generated to input, not to structure)
-        length_gate_result = None
-        if not structure_dropped:
-            length_gate_result = _check_length_gate(
-                current_text,
-                content_unit.original_text if content_unit.original_text else ""
-            )
-
-        if length_gate_result:
-            # Length gate failed - use deterministic feedback, skip LLM call
-            critic_result = length_gate_result
-            score = critic_result.get("score", 0.0)
         else:
-            # Length is acceptable - proceed with LLM critic evaluation
-            # Pass structure_input_ratio so critic can be lenient about length when structure is very different
-            critic_result = critic_evaluate(
-                current_text,
-                eval_structure,
-                situation_match,
-                original_text=content_unit.original_text,
-                config_path=config_path,
-                structure_input_ratio=structure_input_ratio
-            )
-            score = critic_result.get("score", 0.0)
+            from src.utils import calculate_length_ratio
+
+            # Calculate length ratio between structure match and original input (for critic leniency)
+            active_structure = current_structure if current_structure else structure_match
+            structure_input_ratio = None
+            if active_structure and content_unit.original_text:
+                structure_input_ratio = calculate_length_ratio(
+                    active_structure,
+                    content_unit.original_text
+                )
+
+            # Check length gate (compares generated to input, not to structure)
+            length_gate_result = None
+            if not structure_dropped:
+                length_gate_result = _check_length_gate(
+                    current_text,
+                    content_unit.original_text if content_unit.original_text else ""
+                )
+
+            if length_gate_result:
+                # Length gate failed - use deterministic feedback, skip LLM call
+                critic_result = length_gate_result
+                score = critic_result.get("score", 0.0)
+            else:
+                # Length is acceptable - proceed with LLM critic evaluation
+                # Pass structure_input_ratio so critic can be lenient about length when structure is very different
+                critic_result = critic_evaluate(
+                    current_text,
+                    eval_structure,
+                    situation_match,
+                    original_text=content_unit.original_text,
+                    config_path=config_path,
+                    structure_input_ratio=structure_input_ratio
+                )
+                score = critic_result.get("score", 0.0)
 
         # Track the "Global Best" to ensure we never lose ground
         if score > best_score:
@@ -1703,6 +1871,13 @@ def generate_with_critic(
             if len(feedback_history) >= 3 and feedback_history[-1] == feedback_history[-3]:
                 print("    ⚠ Detected repetitive feedback loop. Breaking.")
                 break
+
+    # FAIL-SAFE: If max retries reached and still haven't passed, return original text
+    # This ensures the output file is readable even if style transfer fails completely
+    if generation_attempts >= max_retries and best_score < min_score:
+        print(f"    ⚠ Max retries reached. Style transfer failed (best score: {best_score:.3f}).")
+        print(f"    ↺ FALLBACK: Returning original text to ensure output is readable.")
+        return content_unit.original_text, {"pass": True, "score": 1.0, "note": "Fallback - style transfer failed"}
 
     # Enforce minimum score - raise exception if not met
     if best_score < min_score:

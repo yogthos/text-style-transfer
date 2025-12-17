@@ -351,8 +351,10 @@ class SemanticWordMapper:
             rows = cursor.fetchall()
             for source_word, target_word, pos, similarity_score in rows:
                 # Only use mappings that meet similarity threshold
-                if similarity_score >= self.similarity_threshold:
-                    mappings[pos][source_word] = target_word
+                # Ensure similarity_score is a valid number
+                if similarity_score is not None and isinstance(similarity_score, (int, float)):
+                    if float(similarity_score) >= self.similarity_threshold:
+                        mappings[pos][source_word] = target_word
         except sqlite3.Error as e:
             print(f"  [SemanticWordMapper] Error loading mappings from DB: {e}")
         finally:
@@ -376,8 +378,10 @@ class SemanticWordMapper:
             if row:
                 target_word, similarity_score = row
                 # Only return if meets similarity threshold
-                if similarity_score >= self.similarity_threshold:
-                    return target_word
+                # Ensure similarity_score is a valid number
+                if similarity_score is not None and isinstance(similarity_score, (int, float)):
+                    if float(similarity_score) >= self.similarity_threshold:
+                        return target_word
         except sqlite3.Error as e:
             print(f"  [SemanticWordMapper] Error getting mapping from DB: {e}")
         finally:

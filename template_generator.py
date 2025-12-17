@@ -24,6 +24,33 @@ from dataclasses import dataclass, field, asdict
 from collections import Counter, defaultdict
 import numpy as np
 
+# Optional import for word-level templates
+try:
+    from semantic_word_mapper import SemanticWordMapper
+    SEMANTIC_WORD_MAPPER_AVAILABLE = True
+except ImportError:
+    SEMANTIC_WORD_MAPPER_AVAILABLE = False
+    SemanticWordMapper = None
+
+try:
+    from semantic_extractor import SemanticContent
+    SEMANTIC_CONTENT_AVAILABLE = True
+except ImportError:
+    SEMANTIC_CONTENT_AVAILABLE = False
+    SemanticContent = None
+
+
+@dataclass
+class WordSlot:
+    """A single word position in a sentence template."""
+    position: int  # Position in sentence (0-indexed)
+    pos_tag: str  # Required POS (NOUN, VERB, ADJ, DET, etc.)
+    prepopulated_word: Optional[str] = None  # Pre-filled from mappings
+    semantic_hint: Optional[str] = None  # Hint from semantic content (entity, concept)
+    is_semantic_slot: bool = False  # Must be filled from semantic content
+    is_required: bool = True  # Must be filled vs optional
+    slot_type: str = 'content'  # 'content', 'function', 'connector'
+
 
 @dataclass
 class SentenceTemplate:
@@ -35,6 +62,8 @@ class SentenceTemplate:
     has_subordinate_clause: bool
     clause_count: int  # Number of clauses (1 = simple, 2+ = complex)
     length_category: str  # 'short' (<=10), 'medium' (11-25), 'long' (26+)
+    word_slots: List[WordSlot] = field(default_factory=list)  # NEW: word-level slots
+    has_word_slots: bool = False  # Flag to indicate word-level mode
 
     def to_template_string(self) -> str:
         """Convert to a human-readable template string."""
@@ -62,11 +91,30 @@ class SentenceTemplate:
         complexity = f'{self.clause_count} clause(s)' if self.clause_count > 1 else 'simple'
         subordinate = ' + subordinate clause' if self.has_subordinate_clause else ''
 
-        # Create POS pattern summary
-        pos_summary = self._summarize_pos()
+        # If word-level slots are available, show them
+        if self.has_word_slots and self.word_slots:
+            parts = []
+            for slot in self.word_slots:
+                if slot.prepopulated_word:
+                    # Show pre-populated word
+                    parts.append(f"[{slot.prepopulated_word}]")
+                elif slot.is_semantic_slot:
+                    # Show semantic slot with hint
+                    hint = f":{slot.semantic_hint}" if slot.semantic_hint else ""
+                    parts.append(f"[{slot.pos_tag}{hint}]")
+                else:
+                    # Show POS tag for empty slot
+                    parts.append(f"[{slot.pos_tag}]")
 
-        return (f"~{self.word_count} words | {complexity}{subordinate} | "
-                f"opener: {opener} | pattern: {pos_summary}")
+            word_template = " ".join(parts)
+            return (f"~{self.word_count} words | {complexity}{subordinate} | "
+                    f"opener: {opener}\n"
+                    f"Word-level template: {word_template}")
+        else:
+            # Fallback to POS pattern summary
+            pos_summary = self._summarize_pos()
+            return (f"~{self.word_count} words | {complexity}{subordinate} | "
+                    f"opener: {opener} | pattern: {pos_summary}")
 
     def _summarize_pos(self) -> str:
         """Create a readable POS pattern summary."""
@@ -117,10 +165,37 @@ class ParagraphTemplate:
             f"### Sentence Structure (follow this pattern):",
         ]
 
+        # Check if any sentence has word-level slots
+        has_word_level = any(sent.has_word_slots for sent in self.sentences)
+
+        if has_word_level:
+            lines.append("")
+            lines.append("### Word-Level Templates (CRITICAL - follow exactly):")
+            lines.append("")
+            lines.append("**Format:**")
+            lines.append("- `[word]` = Pre-populated word (use exactly as shown)")
+            lines.append("- `[POS]` = Fill with word matching this part of speech")
+            lines.append("- `[POS:hint]` = Fill with semantic content matching the hint")
+            lines.append("")
+            lines.append("**Rules:**")
+            lines.append("1. Use pre-populated words exactly as shown")
+            lines.append("2. Fill semantic slots with content from the semantic content section")
+            lines.append("3. Fill other slots with appropriate words matching the POS tag")
+            lines.append("4. Maintain the exact word order and structure")
+            lines.append("")
+
         for i, sent in enumerate(self.sentences, 1):
             role = self._sentence_role(i, self.sentence_count)
             lines.append(f"")
             lines.append(f"**S{i}** [{role}]: {sent.to_constraint_string()}")
+
+            # Add semantic slot guidance if present
+            if sent.has_word_slots and sent.word_slots:
+                semantic_slots = [s for s in sent.word_slots if s.is_semantic_slot]
+                if semantic_slots:
+                    hints = [s.semantic_hint for s in semantic_slots if s.semantic_hint]
+                    if hints:
+                        lines.append(f"  → Fill semantic slots with: {', '.join(set(hints[:3]))}")
 
         # Add length distribution guidance (using dynamic thresholds)
         lines.append("")
@@ -191,7 +266,8 @@ class TemplateGenerator:
 
     DB_PATH = Path(__file__).parent / "template_cache.db"
 
-    def __init__(self, sample_path: str = None, sample_length_distribution: Optional[Dict[str, float]] = None, config: Optional[Dict[str, Any]] = None):
+    def __init__(self, sample_path: str = None, sample_length_distribution: Optional[Dict[str, float]] = None,
+                 config: Optional[Dict[str, Any]] = None, word_mapper: Optional[Any] = None):
         """Initialize the template generator.
 
         Args:
@@ -199,7 +275,10 @@ class TemplateGenerator:
             sample_length_distribution: Target length distribution from style analyzer
                                       {'short': 0.2, 'medium': 0.5, 'long': 0.3}
             config: Configuration dictionary (optional, for reading sample path)
+            word_mapper: Optional SemanticWordMapper instance for word-level templates
         """
+        self.config = config or {}
+        self.word_mapper = word_mapper
         try:
             self.nlp = spacy.load("en_core_web_sm")
         except OSError:
@@ -674,7 +753,7 @@ class TemplateGenerator:
         else:
             length_category = 'long'
 
-        return SentenceTemplate(
+        template = SentenceTemplate(
             word_count=word_count,
             pos_sequence=pos_sequence,
             punctuation=punctuation,
@@ -683,6 +762,264 @@ class TemplateGenerator:
             clause_count=clause_count,
             length_category=length_category
         )
+
+        # Extract word-level slots if enabled
+        use_word_level = self.config.get('template_generation', {}).get('use_word_level_templates', False)
+        if use_word_level and self.word_mapper:
+            word_slots = self._extract_word_level_template(sent, self.word_mapper)
+            if word_slots:
+                template.word_slots = word_slots
+                template.has_word_slots = True
+                # Pre-populate common words
+                prepopulate = self.config.get('template_generation', {}).get('prepopulate_common_words', True)
+                if prepopulate:
+                    template = self.prepopulate_common_words(template, self.word_mapper, config=self.config)
+
+        # Extract word-level slots if enabled
+        use_word_level = self.config.get('template_generation', {}).get('use_word_level_templates', False)
+        if use_word_level and self.word_mapper:
+            word_slots = self._extract_word_level_template(sent, self.word_mapper)
+            if word_slots:
+                template.word_slots = word_slots
+                template.has_word_slots = True
+                # Pre-populate common words
+                prepopulate = self.config.get('template_generation', {}).get('prepopulate_common_words', True)
+                if prepopulate:
+                    template = self.prepopulate_common_words(template, self.word_mapper, config=self.config)
+
+        return template
+
+    def _extract_word_level_template(self, sent, word_mapper: Optional[Any] = None) -> List[WordSlot]:
+        """
+        Extract word-level template from a sentence.
+
+        Args:
+            sent: spaCy sentence object
+            word_mapper: Optional SemanticWordMapper instance for pre-population
+
+        Returns:
+            List of WordSlot objects representing each word position
+        """
+        if word_mapper is None:
+            return []
+
+        # Filter to actual words (not punctuation, spaces)
+        tokens = [t for t in sent if not t.is_space and not t.is_punct]
+        all_tokens = list(sent)
+
+        if len(tokens) < 5:
+            return []
+
+        word_slots = []
+        position = 0
+
+        for token in all_tokens:
+            if token.is_space:
+                continue
+
+            if token.is_punct:
+                # Add punctuation as a slot
+                pos_tag = 'PUNCT'
+                slot_type = 'function'
+            else:
+                # Simplify POS tags
+                pos = token.pos_
+                if pos in ('PROPN', 'NOUN'):
+                    pos_tag = 'NOUN'
+                    slot_type = 'content'
+                elif pos in ('AUX', 'VERB'):
+                    pos_tag = 'VERB'
+                    slot_type = 'content'
+                elif pos in ('ADJ', 'ADV'):
+                    pos_tag = 'MOD'
+                    slot_type = 'content'
+                elif pos in ('DET', 'PREP', 'CCONJ', 'SCONJ', 'PRON'):
+                    pos_tag = pos
+                    slot_type = 'function'
+                else:
+                    pos_tag = pos
+                    slot_type = 'function'
+
+            # Determine if this word can be pre-populated
+            prepopulated_word = None
+            if word_mapper and slot_type == 'function':
+                # Try to map common function words
+                word_lower = token.lemma_.lower()
+                mapped = word_mapper.map_word(word_lower, token.pos_)
+                if mapped:
+                    prepopulated_word = mapped
+            elif word_mapper and slot_type == 'content':
+                # Check if it's a common word that can be mapped
+                word_lower = token.lemma_.lower()
+                mapped = word_mapper.map_word(word_lower, token.pos_)
+                if mapped:
+                    # Only pre-populate if it's a very common word
+                    prepopulated_word = mapped
+
+            # Determine if this should be a semantic slot (content words that aren't common)
+            is_semantic_slot = False
+            if slot_type == 'content' and not prepopulated_word:
+                # Check if it's likely an entity or key concept
+                if pos_tag == 'NOUN' and token.ent_type_:
+                    is_semantic_slot = True
+                elif pos_tag == 'NOUN' and token.text[0].isupper():
+                    is_semantic_slot = True
+
+            slot = WordSlot(
+                position=position,
+                pos_tag=pos_tag,
+                prepopulated_word=prepopulated_word,
+                is_semantic_slot=is_semantic_slot,
+                is_required=True,
+                slot_type=slot_type
+            )
+
+            word_slots.append(slot)
+            if not token.is_punct:
+                position += 1
+
+        return word_slots
+
+    def prepopulate_common_words(self, template: SentenceTemplate, word_mapper: Optional[Any] = None,
+                                  context: Optional[str] = None, config: Optional[Dict[str, Any]] = None) -> SentenceTemplate:
+        """
+        Pre-populate common words in a sentence template using semantic word mappings.
+
+        Args:
+            template: SentenceTemplate to pre-populate
+            word_mapper: SemanticWordMapper instance
+            context: Optional preceding output for context-aware selection
+            config: Configuration dict with pre-population settings
+
+        Returns:
+            Updated SentenceTemplate with pre-populated words
+        """
+        if word_mapper is None or not template.word_slots:
+            return template
+
+        # Get config settings
+        if config:
+            max_prepopulated_ratio = config.get('template_generation', {}).get('max_prepopulated_words', 0.4)
+            min_prepopulated = config.get('template_generation', {}).get('min_prepopulated_words', 2)
+        else:
+            max_prepopulated_ratio = 0.4
+            min_prepopulated = 2
+
+        max_prepopulated = int(len(template.word_slots) * max_prepopulated_ratio)
+        prepopulated_count = sum(1 for slot in template.word_slots if slot.prepopulated_word)
+
+        # Pre-populate slots that don't have words yet
+        updated_slots = []
+        for slot in template.word_slots:
+            if slot.prepopulated_word:
+                # Already pre-populated
+                updated_slots.append(slot)
+                continue
+
+            # Skip if we've reached max pre-populated ratio
+            if prepopulated_count >= max_prepopulated:
+                updated_slots.append(slot)
+                continue
+
+            # Try to pre-populate function words first (DET, PREP, CONJ, etc.)
+            if slot.slot_type == 'function' and slot.pos_tag in ('DET', 'PREP', 'CCONJ', 'SCONJ', 'PRON'):
+                # For function words, try to get a common mapping
+                # Use a generic common word for this POS
+                common_words_by_pos = {
+                    'DET': ['the', 'a', 'an'],
+                    'PREP': ['of', 'in', 'on', 'at', 'to', 'for'],
+                    'CCONJ': ['and', 'or', 'but'],
+                    'SCONJ': ['that', 'which', 'who'],
+                    'PRON': ['it', 'this', 'that', 'they', 'we']
+                }
+
+                if slot.pos_tag in common_words_by_pos:
+                    for common_word in common_words_by_pos[slot.pos_tag]:
+                        mapped = word_mapper.map_word(common_word, slot.pos_tag)
+                        if mapped:
+                            slot.prepopulated_word = mapped
+                            prepopulated_count += 1
+                            break
+
+            # For content words, only pre-populate if it's a very common word
+            elif slot.slot_type == 'content' and prepopulated_count < min_prepopulated:
+                # Try common content words
+                common_content = {
+                    'NOUN': ['way', 'method', 'approach', 'thing', 'aspect'],
+                    'VERB': ['show', 'indicate', 'demonstrate', 'reveal'],
+                    'MOD': ['important', 'significant', 'large', 'small']
+                }
+
+                if slot.pos_tag in common_content:
+                    for common_word in common_content[slot.pos_tag]:
+                        mapped = word_mapper.map_word(common_word, slot.pos_tag)
+                        if mapped:
+                            slot.prepopulated_word = mapped
+                            prepopulated_count += 1
+                            break
+
+            updated_slots.append(slot)
+
+        # Create updated template
+        template.word_slots = updated_slots
+        template.has_word_slots = True
+        return template
+
+    def _mark_semantic_slots(self, template: SentenceTemplate, semantic_content: Optional[Any] = None) -> SentenceTemplate:
+        """
+        Mark slots that should be filled from semantic content.
+
+        Args:
+            template: SentenceTemplate to mark
+            semantic_content: SemanticContent with entities, claims, etc.
+
+        Returns:
+            Updated SentenceTemplate with semantic slots marked
+        """
+        if semantic_content is None or not template.word_slots:
+            return template
+
+        # Extract entities and key concepts from semantic content
+        entities = []
+        key_concepts = []
+
+        if hasattr(semantic_content, 'entities'):
+            entities = [e.text.lower() for e in semantic_content.entities]
+
+        if hasattr(semantic_content, 'claims'):
+            # Extract key nouns from claims
+            for claim in semantic_content.claims:
+                if claim.subject:
+                    key_concepts.append(claim.subject.lower())
+                for obj in claim.objects:
+                    key_concepts.append(obj.lower())
+
+        # Mark slots that should contain semantic content
+        updated_slots = []
+        for slot in template.word_slots:
+            # Skip if already pre-populated (don't override)
+            if slot.prepopulated_word:
+                updated_slots.append(slot)
+                continue
+
+            # Mark NOUN slots as semantic if they're likely to contain entities/concepts
+            if slot.pos_tag == 'NOUN' and not slot.is_semantic_slot:
+                # Check if this position typically contains entities
+                # First few NOUN slots are more likely to be entities
+                if slot.position < 5:
+                    slot.is_semantic_slot = True
+                    slot.semantic_hint = "entity or key concept"
+
+            # Mark VERB slots that might need semantic content
+            elif slot.pos_tag == 'VERB' and slot.position < 3:
+                # Early verbs might be predicates from claims
+                slot.is_semantic_slot = True
+                slot.semantic_hint = "predicate from semantic content"
+
+            updated_slots.append(slot)
+
+        template.word_slots = updated_slots
+        return template
 
     def _classify_opener(self, tokens) -> str:
         """Classify how a sentence opens."""

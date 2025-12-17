@@ -207,7 +207,7 @@ class SemanticExtractor:
 
     def _analyze_sentence_claim(self, sent, citations: List[str]) -> Optional[Claim]:
         """Analyze a sentence to extract its core claim."""
-        # Find the root verb
+        # Find the root token
         root = None
         for token in sent:
             if token.dep_ == 'ROOT':
@@ -217,23 +217,114 @@ class SemanticExtractor:
         if not root:
             return None
 
-        # Extract subject
+        # Find the main verb - ROOT might not be a verb
+        main_verb = None
+        if root.pos_ in ('VERB', 'AUX'):
+            # ROOT is a verb, use it
+            main_verb = root
+        else:
+            # ROOT is not a verb (could be noun, adj, etc.)
+            # Find the main verb by looking for:
+            # 1. Verbs that are children of ROOT
+            # 2. Verbs with 'conj' dependency (conjoined verbs)
+            # 3. First verb in the sentence
+            for token in sent:
+                if token.pos_ in ('VERB', 'AUX'):
+                    # Prefer verbs that are direct children of ROOT
+                    if token.head == root:
+                        main_verb = token
+                        break
+                    # Or verbs with conj dependency
+                    elif token.dep_ == 'conj' and token.head.pos_ in ('VERB', 'AUX'):
+                        main_verb = token.head  # Use the head verb
+                        break
+                    # Or just the first verb we find
+                    elif main_verb is None:
+                        main_verb = token
+
+            # If still no verb found, check if ROOT has a verb child
+            if main_verb is None:
+                for child in root.children:
+                    if child.pos_ in ('VERB', 'AUX'):
+                        main_verb = child
+                        break
+
+        # If no verb found at all, skip this sentence
+        if main_verb is None:
+            return None
+
+        # Extract subject - try multiple strategies
         subject = ''
-        for child in root.children:
+
+        # Strategy 1: Look for nominal subject of the main verb
+        for child in main_verb.children:
             if child.dep_ in ('nsubj', 'nsubjpass'):
-                # Get the full subject phrase
                 subject = self._get_subtree_text(child)
                 break
 
+        # Strategy 2: If no subject found, check for copula constructions (X is Y)
+        if not subject and root.pos_ in ('NOUN', 'ADJ', 'PROPN'):
+            # In copula constructions, the subject might be before the copula
+            # Look for nsubj of the copula verb
+            for token in sent:
+                if token.lemma_.lower() in ('be', 'become', 'seem', 'appear'):
+                    for child in token.children:
+                        if child.dep_ in ('nsubj', 'nsubjpass'):
+                            subject = self._get_subtree_text(child)
+                            break
+                    if subject:
+                        break
+
+        # Strategy 3: If still no subject, try to find noun phrase before the verb
+        if not subject:
+            # Find the main verb position
+            verb_pos = main_verb.i
+            # Look for noun phrases before the verb
+            for token in sent:
+                if token.i < verb_pos and token.pos_ in ('NOUN', 'PROPN'):
+                    # Check if this is part of a noun phrase
+                    if token.dep_ in ('nsubj', 'nsubjpass', 'attr', 'nmod'):
+                        subject = self._get_subtree_text(token)
+                        break
+                    # Or if it's the head of a noun phrase
+                    elif token.dep_ in ('compound', 'amod', 'det'):
+                        # Get the full noun phrase
+                        head = token.head
+                        if head.i < verb_pos:
+                            subject = self._get_subtree_text(head)
+                            break
+
+        # Strategy 4: Last resort - use noun phrase before verb as fallback
+        if not subject:
+            # Get all tokens before the main verb
+            before_verb = [t for t in sent if t.i < main_verb.i and not t.is_punct]
+            if before_verb:
+                # Try to find a noun phrase
+                noun_phrase_tokens = []
+                for token in reversed(before_verb):
+                    if token.pos_ in ('NOUN', 'PROPN', 'DET', 'ADJ'):
+                        noun_phrase_tokens.insert(0, token)
+                    elif token.pos_ == 'VERB':
+                        break
+                if noun_phrase_tokens:
+                    # Get the head noun
+                    head_noun = None
+                    for token in noun_phrase_tokens:
+                        if token.pos_ in ('NOUN', 'PROPN'):
+                            head_noun = token
+                            break
+                    if head_noun:
+                        subject = self._get_subtree_text(head_noun)
+
         # Extract objects
         objects = []
-        for child in root.children:
+        for child in main_verb.children:
             if child.dep_ in ('dobj', 'pobj', 'attr', 'acomp'):
                 objects.append(self._get_subtree_text(child))
 
         # Extract modifiers (adverbs, prepositional phrases)
         modifiers = []
-        for child in root.children:
+        for child in main_verb.children:
             if child.dep_ in ('advmod', 'prep', 'advcl'):
                 modifiers.append(self._get_subtree_text(child))
 
@@ -246,7 +337,7 @@ class SemanticExtractor:
         return Claim(
             text=sent.text.strip(),
             subject=subject,
-            predicate=root.lemma_,
+            predicate=main_verb.lemma_,
             objects=objects,
             modifiers=modifiers,
             citations=sent_citations,

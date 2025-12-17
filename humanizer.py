@@ -29,6 +29,7 @@ from cadence_analyzer import CadenceAnalyzer, CadenceProfile
 from semantic_regrouper import SemanticRegrouper, SemanticChunk
 from phrase_distribution_analyzer import PhraseDistributionAnalyzer
 from sentence_validator import SentenceValidator
+from requirement_tracker import RequirementTracker, RequirementCategory, RequirementStatus
 
 
 @dataclass
@@ -341,7 +342,8 @@ class StyleTransferPipeline:
                         self.cadence_analyzer,
                         min_chunk_claims=cadence_config.get("min_chunk_claims", 1),
                         max_chunk_claims=cadence_config.get("max_chunk_claims", 5),
-                        semantic_similarity_threshold=cadence_config.get("semantic_similarity_threshold", 0.6)
+                        semantic_similarity_threshold=cadence_config.get("semantic_similarity_threshold", 0.6),
+                        force_one_claim_per_chunk=cadence_config.get("force_one_claim_per_chunk", False)
                     )
                     semantic_chunks = regrouper.regroup_to_cadence()
 
@@ -890,9 +892,13 @@ class StyleTransferPipeline:
         convergence_achieved = False
         last_opener_type = None
         last_opener_phrase = None
+        previous_semantic_coverage = 0.0  # Track semantic coverage across iterations
 
         # Store position for use in verification
         self._current_position = position_in_document
+
+        # Initialize requirement tracker for progressive feeding
+        requirement_tracker = RequirementTracker()
 
         # Use fewer iterations per chunk
         max_chunk_iterations = min(self.max_iterations_per_paragraph, self.max_retries)
@@ -922,6 +928,27 @@ class StyleTransferPipeline:
         for iteration in range(max_chunk_iterations):
             if verbose and iteration > 0:
                 print(f"    Iteration {iteration + 1}/{max_chunk_iterations}")
+
+            # Get active requirements for this iteration (progressive feeding)
+            # On first iteration, this will return empty list, requirements will be added after verification
+            active_requirements = requirement_tracker.get_active_requirements(max_count=2, current_iteration=iteration)
+
+            # Convert active requirements to transformation hints
+            from structural_analyzer import TransformationHint
+            transformation_hints = []
+            for req in active_requirements:
+                transformation_hints.append(TransformationHint(
+                    sentence_index=-1,
+                    current_text=best_output[:100] if best_output else "",
+                    structural_role="document",
+                    expected_patterns=[],
+                    issue=req.issue,
+                    suggestion=req.suggestion,
+                    priority=req.priority
+                ))
+
+            if verbose and active_requirements:
+                print(f"    [Focus] Working on {len(active_requirements)} requirement(s): {', '.join([r.description for r in active_requirements])}")
 
             # Generate template
             template = self.synthesizer.template_generator.generate_template_from_context(
@@ -965,6 +992,25 @@ class StyleTransferPipeline:
             if verbose and semantic_coverage < 0.95:
                 print(f"    [Semantic] Coverage: {semantic_coverage:.0%}")
 
+            # Get missing claims for explicit feedback (with debugging if verbose)
+            semantic_result = self.verifier._verify_semantics("", synthesis_result.output_text, chunk_semantics, debug=verbose)
+            missing_claims = semantic_result.missing_claims if hasattr(semantic_result, 'missing_claims') else []
+
+            # Add semantic requirement to tracker (always check, will be marked met later if satisfied)
+            if semantic_coverage < 0.95 and missing_claims:
+                missing_list = "\n".join([f"  - Claim {i+1}: {claim[:100]}" for i, claim in enumerate(missing_claims[:5])])
+                total_claims = len(chunk_semantics.claims)
+                missing_count = len(missing_claims)
+
+                requirement_tracker.add_requirement(
+                    req_id="semantic_coverage",
+                    category=RequirementCategory.SEMANTIC,
+                    description="Express all claims",
+                    issue=f"Missing {missing_count}/{total_claims} claims. Semantic coverage only {semantic_coverage:.0%}",
+                    suggestion=f"EXPRESS THESE MISSING CLAIMS:\n{missing_list}\n\nEach claim must be clearly expressed. Do not combine or omit them.",
+                    priority=1
+                )
+
             # Validate sentences against template
             sentence_hints = []
             paragraph_template = synthesis_result.paragraph_template
@@ -975,6 +1021,58 @@ class StyleTransferPipeline:
                     self.sentence_validator
                 )
 
+                # Add structural requirements to tracker
+                if sentence_hints:
+                    # Check sentence count mismatch
+                    doc = self.synthesizer.semantic_extractor.nlp(synthesis_result.output_text)
+                    actual_sent_count = len(list(doc.sents))
+                    expected_sent_count = paragraph_template.sentence_count
+
+                    if actual_sent_count != expected_sent_count:
+                        requirement_tracker.add_requirement(
+                            req_id="sentence_count",
+                            category=RequirementCategory.STRUCTURAL,
+                            description="Match sentence count",
+                            issue=f"Output has {actual_sent_count} sentences, but template requires {expected_sent_count}",
+                            suggestion=f"Generate exactly {expected_sent_count} sentence(s). Current: {actual_sent_count}",
+                            priority=1
+                        )
+                    else:
+                        requirement_tracker.mark_met("sentence_count")
+
+                    # Add word count and opener requirements
+                    for i, hint in enumerate(sentence_hints[:3]):  # Limit to first 3 sentences
+                        if "word count" in hint.issue.lower():
+                            req_id = f"sentence_{i+1}_word_count"
+                            requirement_tracker.add_requirement(
+                                req_id=req_id,
+                                category=RequirementCategory.STRUCTURAL,
+                                description=f"Sentence {i+1} word count",
+                                issue=hint.issue,
+                                suggestion=hint.suggestion,
+                                priority=2
+                            )
+                        elif "opener" in hint.issue.lower():
+                            req_id = f"sentence_{i+1}_opener"
+                            requirement_tracker.add_requirement(
+                                req_id=req_id,
+                                category=RequirementCategory.STRUCTURAL,
+                                description=f"Sentence {i+1} opener type",
+                                issue=hint.issue,
+                                suggestion=hint.suggestion,
+                                priority=2
+                            )
+                        elif "Word-level template" in hint.issue:
+                            req_id = f"sentence_{i+1}_template"
+                            requirement_tracker.add_requirement(
+                                req_id=req_id,
+                                category=RequirementCategory.TEMPLATE,
+                                description=f"Sentence {i+1} template matching",
+                                issue=hint.issue,
+                                suggestion=hint.suggestion,
+                                priority=2
+                            )
+
             # If CRITICAL sentence hints exist, check semantic coverage before rejecting
             critical_sentence_hints = [h for h in sentence_hints if h.priority == 1]
 
@@ -983,9 +1081,15 @@ class StyleTransferPipeline:
             reject_on_semantic_loss = semantic_config.get("reject_on_semantic_loss", True)
             min_claim_coverage = semantic_config.get("min_claim_coverage", 0.95)
 
+            # RELAXED REJECTION CRITERIA: Early iterations (1-3) don't reject on template mismatch
+            # if semantic coverage is improving
+            is_early_iteration = iteration < 3
+            semantic_improving = semantic_coverage > previous_semantic_coverage
+            semantic_coverage_acceptable = semantic_coverage >= min_claim_coverage
+
             if critical_sentence_hints:
                 # Only reject if BOTH sentence validation fails AND semantics are lost
-                if semantic_coverage >= min_claim_coverage:
+                if semantic_coverage_acceptable:
                     # Semantic coverage is good - add hints but don't reject
                     if transformation_hints:
                         transformation_hints.extend(critical_sentence_hints)
@@ -994,6 +1098,16 @@ class StyleTransferPipeline:
 
                     if verbose:
                         print(f"    [Semantic Preserved] {len(critical_sentence_hints)} sentence issues, but {semantic_coverage:.0%} semantic coverage - continuing")
+                elif is_early_iteration and semantic_improving:
+                    # Early iteration AND semantic improving - don't reject, just add hints
+                    # This allows LLM to focus on semantic first, structure later
+                    if transformation_hints:
+                        transformation_hints.extend(critical_sentence_hints)
+                    else:
+                        transformation_hints = critical_sentence_hints
+
+                    if verbose:
+                        print(f"    [Early Iteration] {len(critical_sentence_hints)} template issues, but semantic improving ({previous_semantic_coverage:.0%} → {semantic_coverage:.0%}) - continuing")
                 elif reject_on_semantic_loss and semantic_coverage < min_claim_coverage:
                     # Both sentence validation fails AND semantics are lost - reject
                     if transformation_hints:
@@ -1005,7 +1119,7 @@ class StyleTransferPipeline:
                         print(f"    REJECTED: {len(critical_sentence_hints)} sentences don't match templates AND semantic coverage {semantic_coverage:.0%} < {min_claim_coverage:.0%}")
                     continue  # Skip verification, regenerate
                 else:
-                    # Reject on sentence validation failure
+                    # Reject on sentence validation failure (only if not early iteration or not improving)
                     if transformation_hints:
                         transformation_hints.extend(critical_sentence_hints)
                     else:
@@ -1014,6 +1128,9 @@ class StyleTransferPipeline:
                     if verbose:
                         print(f"    REJECTED: {len(critical_sentence_hints)} sentences don't match templates")
                     continue  # Skip verification, regenerate
+
+            # Update previous semantic coverage for next iteration
+            previous_semantic_coverage = semantic_coverage
 
             # Verify (create dummy input text from claims for verification)
             dummy_input_text = " ".join([claim.text for claim in chunk_semantics.claims[:3]])
@@ -1025,8 +1142,54 @@ class StyleTransferPipeline:
                 iteration=iteration,
                 position_in_document=position_in_document,
                 paragraph_template=paragraph_template,  # For sentence validation
-                sentence_validator=self.sentence_validator  # For sentence validation
+                sentence_validator=self.sentence_validator,  # For sentence validation
+                debug=verbose  # Enable debugging if verbose mode
             )
+
+            # Mark requirements as met based on verification results
+            if verification.semantic.claim_coverage >= 0.95:
+                requirement_tracker.mark_met("semantic_coverage")
+            else:
+                requirement_tracker.mark_failed("semantic_coverage")
+
+            # Check sentence count match
+            if paragraph_template:
+                doc = self.synthesizer.semantic_extractor.nlp(synthesis_result.output_text)
+                actual_sent_count = len(list(doc.sents))
+                if actual_sent_count == paragraph_template.sentence_count:
+                    requirement_tracker.mark_met("sentence_count")
+                else:
+                    requirement_tracker.mark_failed("sentence_count")
+
+            # Add style requirements from verification hints (only in later iterations)
+            for hint in verification.transformation_hints:
+                if "AI fingerprint" in hint.issue or "REMOVE" in hint.issue:
+                    requirement_tracker.add_requirement(
+                        req_id=f"ai_pattern_{hint.issue[:30]}",
+                        category=RequirementCategory.STYLE,
+                        description="Remove AI patterns",
+                        issue=hint.issue,
+                        suggestion=hint.suggestion,
+                        priority=hint.priority
+                    )
+                elif "overused" in hint.issue.lower() or "repetition" in hint.issue.lower():
+                    requirement_tracker.add_requirement(
+                        req_id=f"style_repetition_{hint.issue[:30]}",
+                        category=RequirementCategory.STYLE,
+                        description="Avoid repetition",
+                        issue=hint.issue,
+                        suggestion=hint.suggestion,
+                        priority=hint.priority
+                    )
+                elif "Rewrite" in hint.issue or "style mismatch" in hint.issue.lower():
+                    requirement_tracker.add_requirement(
+                        req_id=f"style_rewrite_{hint.issue[:30]}",
+                        category=RequirementCategory.STYLE,
+                        description="Match style patterns",
+                        issue=hint.issue,
+                        suggestion=hint.suggestion,
+                        priority=hint.priority
+                    )
 
             score = self._calculate_score(verification)
             improvement_history.append(score)

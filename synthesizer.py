@@ -236,7 +236,8 @@ class Synthesizer:
             length_distribution = style_profile.sentences.length_distribution if style_profile else None
             self.template_generator = TemplateGenerator(
                 sample_length_distribution=length_distribution,
-                config=self.config
+                config=self.config,
+                word_mapper=self.semantic_word_mapper  # Pass word mapper for word-level templates
             )
 
     def get_style_profile(self) -> StyleProfile:
@@ -348,6 +349,14 @@ class Synthesizer:
                 used_phrases=used_phrases,
                 paragraph_index=para_idx
             )
+
+            # Mark semantic slots if enabled
+            if paragraph_template and semantic_content:
+                mark_semantic = self.config.get('template_generation', {}).get('mark_semantic_slots', True)
+                if mark_semantic:
+                    for sent_template in paragraph_template.sentences:
+                        if sent_template.has_word_slots:
+                            self.template_generator._mark_semantic_slots(sent_template, semantic_content)
             template_opener_phrase = None
             if paragraph_template and paragraph_template.sentences:
                 template_opener_type = paragraph_template.sentences[0].opener_type
@@ -363,11 +372,13 @@ class Synthesizer:
             role_patterns=role_patterns,
             transformation_hints=transformation_hints,
             iteration=iteration,
-            structural_template=structural_template
+            structural_template=structural_template,
+            paragraph_template=paragraph_template
         )
 
-        # Adjust temperature based on iteration (more deterministic as we refine)
-        temperature = max(0.3, 0.7 - (iteration * 0.1))
+        # Adjust temperature based on iteration (more aggressive decrease for convergence)
+        # Start at 0.5, decrease faster: 0.5 -> 0.4 -> 0.3 -> 0.2 -> 0.1 (min)
+        temperature = max(0.1, 0.5 - (iteration * 0.1))
 
         # Calculate max_tokens based on input length
         # Style transfer should produce similar or slightly longer text
@@ -479,6 +490,15 @@ class Synthesizer:
                 used_openers=used_openers,
                 used_phrases=used_phrases,
             )
+
+            # Mark semantic slots if enabled
+            if paragraph_template and semantic_chunk:
+                mark_semantic = self.config.get('template_generation', {}).get('mark_semantic_slots', True)
+                if mark_semantic:
+                    for sent_template in paragraph_template.sentences:
+                        if sent_template.has_word_slots:
+                            self.template_generator._mark_semantic_slots(sent_template, semantic_chunk)
+
             if paragraph_template:
                 structural_template = paragraph_template.to_constraint_string(used_phrases=used_phrases)
 
@@ -513,11 +533,13 @@ class Synthesizer:
             role_patterns=role_patterns,
             transformation_hints=transformation_hints,
             iteration=iteration,
-            structural_template=structural_template
+            structural_template=structural_template,
+            paragraph_template=paragraph_template
         )
 
-        # Adjust temperature based on iteration (more deterministic as we refine)
-        temperature = max(0.3, 0.7 - (iteration * 0.1))
+        # Adjust temperature based on iteration (more aggressive decrease for convergence)
+        # Start at 0.5, decrease faster: 0.5 -> 0.4 -> 0.3 -> 0.2 -> 0.1 (min)
+        temperature = max(0.1, 0.5 - (iteration * 0.1))
 
         # Calculate max_tokens based on target length
         max_tokens = min(8192, max(4096, int(target_length * 1.5) if target_length > 0 else 4096))
@@ -567,33 +589,50 @@ CRITICAL: You must FULLY TRANSFORM the text, not just make minor edits. The outp
 
 """
 
-        prompt += """## CORE TASK
+        prompt += """## CRITICAL PRIORITY ORDER
+
+**MOST IMPORTANT**: Your output must be COHERENT and MAKE SENSE. Write clear, grammatical sentences that express the claims.
+
+**Priority Order**:
+1. **COHERENCE FIRST** - Write sentences that make grammatical and semantic sense. Never sacrifice coherence for anything.
+2. **EXPRESS ALL CLAIMS** - Every claim must be clearly expressed with subject + predicate/verb. Use simple, clear language.
+3. **Natural flow** - Sentences should flow naturally and be easy to understand.
+4. **Style matching** - Only match style characteristics if they don't interfere with coherence. Do NOT force specific phrases or patterns.
+
+**How to Express a Claim**:
+- Include the SUBJECT (what the claim is about)
+- Include the PREDICATE/VERB (the action or relationship - can be paraphrased)
+- Include OBJECTS if present (what is acted upon)
+
+**Important**: You can paraphrase predicates (e.g., "defines" can become "establishes", "determines", "characterizes"). The meaning must be preserved, but exact wording can vary.
+
+## CORE TASK
 - Take the semantic content (facts, claims, relationships)
-- Express it using the patterns, phrases, and constructions of the target style
+- Express it in COHERENT, GRAMMATICAL sentences that make sense
+- Use vocabulary and patterns from the target style, but only when they fit naturally
 - Vary your sentence structures - do NOT overuse any single pattern
 
-## 🔒 STRUCTURAL CONTRACT (MANDATORY)
-If a STRUCTURAL CONTRACT is provided in the prompt, you MUST:
-1. Follow the EXACT number of sentences specified
-2. Match the target word counts for each sentence (±5 words)
-3. Use the specified opener type for each sentence (noun/adverb/pronoun/etc.)
-4. Follow the POS pattern as closely as possible
-5. Include subordinate clauses where indicated
+## 🔒 STRUCTURAL CONTRACT (GUIDELINES, NOT RIGID RULES)
+If a STRUCTURAL CONTRACT is provided in the prompt, use it as a GUIDE:
+1. Aim for the specified number of sentences
+2. Aim for the target word counts for each sentence (±10 words is acceptable)
+3. Try to use the specified opener type for each sentence, but only if it makes sense
+4. Follow the general sentence structure, but prioritize making coherent sentences
 
-The structural contract is derived from the target style - following it ensures your output matches the style's sentence architecture.
+**CRITICAL**: If following the template exactly would create nonsense or ungrammatical text, prioritize coherence. It's better to have a coherent sentence that slightly deviates from the template than a nonsensical sentence that matches it exactly.
 
 ## WHAT YOU MUST PRESERVE
-1. All facts and claims (meaning)
+1. All facts and claims (meaning) - EXPRESS ALL CLAIMS CLEARLY
 2. ONLY citations that exist in the original - DO NOT ADD NEW CITATIONS
 3. Technical terms and proper nouns
-4. Logical flow
+4. Logical flow and coherence
 
 ## WHAT YOU MUST CHANGE
-1. Sentence structure - follow the STRUCTURAL CONTRACT if provided
-2. Sentence openers - use the opener type specified in the contract
-3. Sentence length - match the word counts in the contract
+1. Sentence structure - aim for target style patterns, but prioritize coherence
+2. Sentence openers - try to match the opener type, but only if it makes sense
+3. Sentence length - aim for target word counts, but coherence is more important
 4. Discourse markers - Use sparingly: "therefore", "hence", "consequently" should NOT appear in every paragraph
-5. Word choice - Match target vocabulary
+5. Word choice - Use target vocabulary when it fits naturally, don't force it
 
 ## CRITICAL: AVOID REPETITION
 - Do NOT use the same discourse marker (therefore/hence/consequently) more than twice per page
@@ -655,7 +694,8 @@ Return ONLY the rewritten text. No commentary, no explanations, no added citatio
                            role_patterns: Optional[Dict[str, List[StructuralPattern]]] = None,
                            transformation_hints: Optional[List[TransformationHint]] = None,
                            iteration: int = 0,
-                           structural_template: Optional[str] = None) -> str:
+                           structural_template: Optional[str] = None,
+                           paragraph_template: Optional[ParagraphTemplate] = None) -> str:
         """Build user prompt with semantic content, structural roles, examples, hints, and template."""
         parts = []
 
@@ -664,52 +704,72 @@ Return ONLY the rewritten text. No commentary, no explanations, no added citatio
             parts.append(structural_template)
             parts.append("")
 
-        # Add transformation hints if this is a refinement iteration
+        # Add transformation hints if this is a refinement iteration (PROGRESSIVE FEEDING)
         if transformation_hints and iteration > 0:
-            parts.append("## ⚠️ TRANSFORMATION HINTS (MUST ADDRESS)")
-            parts.append("Your previous output had these issues. FIX THEM:")
-            for hint in transformation_hints[:10]:  # Top 10 hints
-                priority_marker = "🔴 CRITICAL" if hint.priority == 1 else "🟡 IMPORTANT" if hint.priority == 2 else "🟢 MINOR"
-                parts.append(f"\n{priority_marker}: {hint.issue}")
-                parts.append(f"   → FIX: {hint.suggestion}")
+            parts.append("## ⚠️ FOCUS REQUIREMENTS (PROGRESSIVE APPROACH)")
+            parts.append("You are working on a PROGRESSIVE refinement process. Focus ONLY on these requirements:")
+            parts.append("Once these are met, we will address additional requirements in subsequent iterations.")
             parts.append("")
 
-        # Add example passages from sample text (contextually selected)
-        parts.append("## STYLE EXAMPLES (your output MUST look like these)")
-        examples = self._get_contextual_examples(input_text)
-        for i, excerpt in enumerate(examples, 1):
-            parts.append(f"\n### Example {i}:")
-            parts.append(excerpt)
+            # Show only the active requirements (already filtered by RequirementTracker)
+            # These are the 1-2 most critical requirements for this iteration
+            for i, hint in enumerate(transformation_hints, 1):
+                priority_marker = "🔴 CRITICAL" if hint.priority == 1 else "🟡 IMPORTANT" if hint.priority == 2 else "🟢 MINOR"
+                parts.append(f"### Requirement {i}: {priority_marker}")
+                parts.append(f"**Issue**: {hint.issue}")
+                parts.append(f"**Fix**: {hint.suggestion}")
 
-        # Add pattern templates to apply
-        parts.append(self._format_pattern_guidance(style_profile))
+                # Add before/after example if available
+                if hint.current_text and hint.expected_patterns:
+                    parts.append(f"**Current**: \"{hint.current_text[:80]}...\"")
+                    if hint.expected_patterns:
+                        parts.append(f"**Expected pattern**: {hint.expected_patterns[0]}")
+                parts.append("")
 
-        # Add structural role guidance
-        if input_structure and role_patterns:
-            parts.append(self._format_structural_guidance(input_structure, role_patterns))
+            parts.append("**IMPORTANT**: Focus ONLY on fixing these requirements. Do not worry about other issues yet.")
+            parts.append("")
 
-        # Add document context if processing a chunk
-        if document_context:
-            parts.append("\n\n## FULL DOCUMENT CONTEXT")
-            parts.append("This paragraph is part of a larger document. Here is the full document for context:")
-            parts.append(f"\n{document_context}")
-            parts.append("\n(Use this context to understand references, maintain terminology consistency, and preserve cross-paragraph connections.)")
+        # TEMPORARILY DISABLED: Style examples are causing gibberish by forcing pattern mimicry
+        # The LLM is creating nonsensical variations of sample phrases
+        # Focus on coherence first, style will follow naturally from the simplified guidance below
 
-        # Add preceding transformed output for consistency
+        # Add minimal style guidance (statistical only, no examples)
+        parts.append("## STYLE GUIDANCE (GENERAL CHARACTERISTICS ONLY)")
+        parts.append("**IMPORTANT**: These are general characteristics, NOT exact phrases to copy.")
+        parts.append("Do NOT force specific phrases from the sample. Write naturally and coherently.")
+        parts.append("")
+        if style_profile:
+            formality = style_profile.vocabulary.formality_score if style_profile.vocabulary else 0.5
+            avg_length = style_profile.sentences.avg_length if style_profile.sentences else 20
+            parts.append(f"- Formality level: {formality:.2f}")
+            parts.append(f"- Average sentence length: ~{avg_length:.0f} words")
+            parts.append("- Use varied sentence lengths (mix of short, medium, long)")
+            parts.append("- Avoid repetitive sentence structures")
+        parts.append("")
+        parts.append("**CRITICAL**: If trying to match a style pattern would create nonsense, DON'T use it.")
+        parts.append("Coherent, clear sentences are more important than style matching.")
+
+        # TEMPORARILY DISABLED: Structural role guidance is too prescriptive and causing gibberish
+        # The LLM is forcing patterns that don't fit the semantic content
+        # Focus on expressing claims clearly first
+
+        # Add document context if processing a chunk (SIMPLIFIED - only if needed for references)
+        # Removed full document context to reduce prompt complexity and improve convergence
+        # Preceding paragraph provides sufficient context for consistency
+
+        # Add preceding transformed output for consistency (LIMITED to last paragraph only)
         if preceding_output:
-            parts.append("\n\n## ALREADY TRANSFORMED PARAGRAPHS")
-            parts.append("These paragraphs have already been transformed. Continue in the same voice and maintain consistency:")
-            parts.append(f"\n{preceding_output}")
+            # Only include the last paragraph to reduce context size
+            preceding_paras = preceding_output.split('\n\n')
+            last_para = preceding_paras[-1] if preceding_paras else preceding_output
+            parts.append("\n\n## PRECEDING PARAGRAPH (for consistency)")
+            parts.append("The immediately preceding paragraph (match the voice and tone):")
+            parts.append(f"\n{last_para}")
             parts.append("\n(Match the vocabulary choices and tone established above.)")
 
-        # Add semantic content summary (MANDATORY - ALL CLAIMS MUST BE INCLUDED)
-        parts.append("\n\n## 🔒 SEMANTIC CONTENT TO EXPRESS (MANDATORY - ALL MUST BE INCLUDED)")
-        parts.append("**CRITICAL**: You MUST express ALL of the following claims. Do not omit, condense, or combine them.")
-        parts.append("Every claim below must appear in your output. Count them and verify all are present.")
-        parts.append("")
+        # Add semantic content summary (FOCUSED - only chunk claims)
+        parts.append("\n\n## 🔒 SEMANTIC CONTENT TO EXPRESS")
         parts.append(self._format_semantic_content(semantic_content))
-        parts.append("")
-        parts.append("**VERIFICATION**: After generating, count the claims in your output and ensure all claims above are expressed.")
 
         # Add preserved elements
         parts.append("\n\n## MUST PRESERVE EXACTLY")
@@ -733,6 +793,17 @@ Return ONLY the rewritten text. No commentary, no explanations, no added citatio
         # Use semantic extractor's nlp for sentence counting
         doc = self.semantic_extractor.nlp(input_text)
         input_sentence_count = len(list(doc.sents))
+
+        # Add simplified self-verification step
+        parts.append("\n\n## ✅ CHECK BEFORE SUBMITTING")
+        total_claims = len(semantic_content.claims)
+        parts.append(f"Before submitting, verify:")
+        parts.append(f"1. All {total_claims} claim(s) are expressed (subject + verb + objects)")
+        if paragraph_template:
+            parts.append(f"2. You generated {paragraph_template.sentence_count} sentence(s)")
+        parts.append("3. Output matches the target style")
+        parts.append("")
+
         parts.append("\n\n## LENGTH REQUIREMENT (CRITICAL)")
         parts.append(f"**Your output MUST be approximately the same length as the input:**")
         parts.append(f"- Input: ~{input_word_count} words, ~{input_sentence_count} sentences")
@@ -740,12 +811,12 @@ Return ONLY the rewritten text. No commentary, no explanations, no added citatio
         parts.append(f"**DO NOT shorten or condense the content. Express all claims with full detail.**")
         parts.append(f"If the input is long and detailed, your output must also be long and detailed.")
 
-        # Final instruction
+        # Final instruction - simplified
         parts.append("\n\n## YOUR OUTPUT")
         if preceding_output:
-            parts.append(f"Rewrite ONLY the paragraph above in the target style. Use the syntactic constructions and phrases provided. Maintain consistency with the already-transformed paragraphs. Express all the same meaning using the vocabulary, sentence patterns, and tone established. **Your output must be approximately {input_word_count} words** to match the input length. Output only the rewritten paragraph, nothing else.")
+            parts.append(f"Rewrite the paragraph above in the target style. Express ALL claims clearly. Match the style of the example. Output approximately {input_word_count} words. Output only the rewritten paragraph.")
         else:
-            parts.append(f"Rewrite the original text in the target style. ACTIVELY USE the syntactic constructions and characteristic phrases provided. Express all the same meaning using the vocabulary, sentence patterns, and tone of the style examples. **Your output must be approximately {input_word_count} words** to match the input length. Output only the rewritten text.")
+            parts.append(f"Rewrite the original text in the target style. Express ALL claims clearly. Match the style of the example. Output approximately {input_word_count} words. Output only the rewritten text.")
 
         return '\n'.join(parts)
 
@@ -827,16 +898,88 @@ Return ONLY the rewritten text. No commentary, no explanations, no added citatio
         """Format semantic content for the prompt."""
         parts = []
 
-        # Key claims - list ALL claims explicitly
+        # Key claims - list ALL claims explicitly with clear numbering
         total_claims = len(content.claims)
-        parts.append(f"### Key Claims (ALL {total_claims} must be expressed - do not omit any):")
-        for i, claim in enumerate(content.claims, 1):  # Show ALL claims, not just first 15
+        parts.append(f"## CLAIMS TO EXPRESS (EXACT COUNT: {total_claims})")
+        parts.append(f"**CRITICAL**: You must express EXACTLY {total_claims} claim(s). Each claim must be clearly and separately expressed.")
+        parts.append("")
+        parts.append("**HOW TO EXPRESS A CLAIM:**")
+        parts.append("- Include the SUBJECT (what the claim is about)")
+        parts.append("- Include the PREDICATE/VERB (the action or relationship)")
+        parts.append("- Include OBJECTS if present (what is acted upon)")
+        parts.append("- You can paraphrase, but the core meaning must be present")
+        parts.append("")
+
+        # Add explicit examples of good and bad claim expression
+        parts.append("**EXAMPLES OF CLAIM EXPRESSION:**")
+        parts.append("")
+        parts.append("✅ GOOD EXAMPLE:")
+        parts.append("  Input Claim: Subject='U.S. strategy', Predicate='signals', Objects=['transition']")
+        parts.append("  Good Output: 'The U.S. strategy signals a transition toward...'")
+        parts.append("  ✓ Subject present: 'U.S. strategy'")
+        parts.append("  ✓ Predicate present: 'signals' (or semantically similar: 'indicates', 'shows')")
+        parts.append("  ✓ Object present: 'transition'")
+        parts.append("")
+        parts.append("❌ BAD EXAMPLE (Missing Predicate):")
+        parts.append("  Input Claim: Subject='U.S. strategy', Predicate='signals', Objects=['transition']")
+        parts.append("  Bad Output: 'The U.S. strategy involves a transition...'")
+        parts.append("  ✗ Subject present: 'U.S. strategy' ✓")
+        parts.append("  ✗ Predicate MISSING: 'signals' not expressed (only 'involves' which is different)")
+        parts.append("  ✗ Object present: 'transition' ✓")
+        parts.append("  Result: CLAIM NOT FULLY EXPRESSED")
+        parts.append("")
+        parts.append("✅ GOOD EXAMPLE (Paraphrased):")
+        parts.append("  Input Claim: Subject='U.S. strategy', Predicate='signals', Objects=['transition']")
+        parts.append("  Good Output: 'The American approach indicates a transition toward...'")
+        parts.append("  ✓ Subject paraphrased but present: 'American approach' ≈ 'U.S. strategy'")
+        parts.append("  ✓ Predicate semantically similar: 'indicates' ≈ 'signals'")
+        parts.append("  ✓ Object present: 'transition'")
+        parts.append("")
+        parts.append("")
+
+        for i, claim in enumerate(content.claims, 1):
             confidence_str = "certain" if claim.confidence > 0.8 else "likely" if claim.confidence > 0.5 else "possible"
             citations_str = f" {' '.join(claim.citations)}" if claim.citations else ""
-            parts.append(f"{i}. [{confidence_str}] {claim.text}{citations_str}")
+
+            # Break down claim components for clarity
+            claim_parts = []
+            if claim.subject:
+                claim_parts.append(f"Subject: {claim.subject}")
+            if claim.predicate:
+                claim_parts.append(f"Predicate: {claim.predicate}")
+            if claim.objects:
+                claim_parts.append(f"Objects: {', '.join(claim.objects)}")
+
+            parts.append(f"**Claim {i}/{total_claims}** [{confidence_str}]:")
+            parts.append(f"  Full text: {claim.text}{citations_str}")
+            if claim_parts:
+                parts.append(f"  Components: {' | '.join(claim_parts)}")
+            parts.append("")  # Blank line between claims for clarity
 
         if total_claims > 0:
-            parts.append(f"\n**Total: {total_claims} claims. You must express ALL {total_claims} claims in your output.**")
+            parts.append(f"**SELF-VERIFICATION CHECKLIST (VERIFY BEFORE SUBMITTING):**")
+            parts.append("")
+            parts.append("Before you submit your output, verify each of the following:")
+            parts.append("")
+            for i, claim in enumerate(content.claims, 1):
+                parts.append(f"Claim {i}: '{claim.text[:60]}{'...' if len(claim.text) > 60 else ''}'")
+                parts.append(f"  □ Subject '{claim.subject}' is present (or clearly paraphrased)")
+                if claim.predicate:
+                    parts.append(f"  □ Predicate '{claim.predicate}' is present (or semantically similar verb)")
+                if claim.objects:
+                    parts.append(f"  □ At least one object from {claim.objects} is present")
+                parts.append("")
+            parts.append(f"**FINAL CHECK:**")
+            parts.append(f"  □ All {total_claims} claim(s) are present and fully expressed")
+            parts.append(f"  □ Each claim has subject AND predicate/verb (or subject AND object)")
+            parts.append("")
+            parts.append(f"**CRITICAL REMINDER**:")
+            parts.append(f"- ALL {total_claims} claim(s) must appear in your output")
+            parts.append(f"- Each claim must have its subject and predicate/verb clearly expressed")
+            parts.append(f"- You can paraphrase predicates (e.g., 'signals' → 'indicates', 'shows', 'demonstrates')")
+            parts.append(f"- Do NOT combine claims into one sentence")
+            parts.append(f"- Do NOT omit any claims")
+            parts.append(f"- Do NOT condense claims - express each one fully")
 
         # Key relationships
         if content.relationships:

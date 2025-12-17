@@ -254,7 +254,8 @@ class Verifier:
                position_in_document: Optional[Tuple[int, int]] = None,
                used_phrases: Optional[List[str]] = None,
                paragraph_template: Optional[ParagraphTemplate] = None,
-               sentence_validator: Optional[SentenceValidator] = None) -> VerificationResult:
+               sentence_validator: Optional[SentenceValidator] = None,
+               debug: bool = False) -> VerificationResult:
         """
         Verify synthesis output against input and target style.
 
@@ -277,7 +278,7 @@ class Verifier:
             input_semantics = self.semantic_extractor.extract(input_text)
 
         # Run verification passes
-        semantic_result = self._verify_semantics(input_text, output_text, input_semantics)
+        semantic_result = self._verify_semantics(input_text, output_text, input_semantics, debug=debug)
 
         # Use accumulated context for statistical style checks if available
         style_result = self._verify_style(
@@ -288,18 +289,25 @@ class Verifier:
         )
         preservation_result = self._verify_preservation(input_semantics, output_text)
 
-        # Determine overall pass/fail (phrase repetition is a critical failure)
+        # Check coherence (reject obviously gibberish output)
+        is_coherent = self._check_coherence(output_text)
+
+        # Determine overall pass/fail (phrase repetition and incoherence are critical failures)
         overall_passed = (
+            is_coherent and  # CRITICAL: Must be coherent
             semantic_result.passed and
             style_result.passed and
             preservation_result.passed and
             not style_result.phrase_repetition_detected  # CRITICAL: Fail if phrase repetition detected
         )
 
-        # Generate recommendations
+        # Add coherence issue to recommendations if incoherent
         recommendations = self._generate_recommendations(
             semantic_result, style_result, preservation_result
         )
+
+        if not is_coherent:
+            recommendations.insert(0, "CRITICAL: Output is incoherent or gibberish. Rewrite to make coherent, grammatical sentences that express the claims clearly.")
 
         # Generate transformation hints based on structural analysis
         # Pass accumulated context for document-aware hints
@@ -529,9 +537,27 @@ class Verifier:
                     "CRITICAL" in issue.description or
                     ("mismatch" in issue.description.lower() and "minor" not in issue.description.lower()) or
                     "complexity too low" in issue.description.lower() or
-                    "Missing subordinate clause" in issue.description
+                    "Missing subordinate clause" in issue.description or
+                    "Word-level template" in issue.description  # Word-level issues are critical
                 )
                 priority = 1 if is_critical else 2
+
+                # Make suggestion more specific with exact corrections
+                suggestion = issue.fix_guidance
+
+                # Add specific examples for common issues
+                if "word count" in issue.description.lower():
+                    expected_words = sentence_template.word_count
+                    actual_words = len([t for t in output_sent if not t.is_space and not t.is_punct])
+                    suggestion = f"Generate exactly {expected_words} words (current: {actual_words}). {'Add more detail' if actual_words < expected_words else 'Condense slightly'}."
+                elif "opener" in issue.description.lower():
+                    opener_example = self._get_opener_example_for_template(sentence_template)
+                    suggestion = f"Start with: {opener_example}. Current: '{sentence_text[:50]}...'"
+                elif "semantic" in issue.description.lower() and "coverage" in issue.description.lower():
+                    suggestion = f"Express ALL claims from the semantic content section. Current output is missing key information."
+                elif "Word-level template" in issue.description:
+                    # For word-level template issues, provide exact word correction
+                    suggestion = issue.fix_guidance + " Use the exact words from the template where specified."
 
                 hints.append(TransformationHint(
                     sentence_index=i,
@@ -539,11 +565,24 @@ class Verifier:
                     structural_role=paragraph_template.structural_role,
                     expected_patterns=[sentence_template.to_template_string()],
                     issue=f"S{i+1}: {issue.description}",
-                    suggestion=f"S{i+1}: {issue.fix_guidance}",
+                    suggestion=f"S{i+1}: {suggestion}",
                     priority=priority
                 ))
 
         return hints
+
+    def _get_opener_example_for_template(self, template) -> str:
+        """Get a specific opener example for a template."""
+        opener_examples = {
+            'noun': 'a noun/subject (e.g., "The principle...", "Marxism...")',
+            'det_noun': '"The [noun]..." (e.g., "The theory...", "A concept...")',
+            'adverb': 'an adverb (e.g., "Therefore...", "Hence...", "Thus...")',
+            'conjunction': 'a conjunction (e.g., "But...", "And...", "However...")',
+            'prep_phrase': 'a prepositional phrase (e.g., "In this...", "Contrary to...")',
+            'pronoun': 'a pronoun (e.g., "It...", "This...", "They...")',
+            'verb_ing': 'a gerund (e.g., "Understanding...", "Examining...")',
+        }
+        return opener_examples.get(template.opener_type, f'"{template.opener_type} opener"')
 
     def _extract_opener_phrase(self, text: str) -> str:
         """Extract the actual opener phrase (first 2-3 words) from text.
@@ -575,6 +614,115 @@ class Verifier:
         # Normalize whitespace
         phrase = ' '.join(phrase.split())
         return phrase
+
+    def _check_coherence(self, text: str) -> bool:
+        """
+        Check if text is coherent (not gibberish).
+
+        Uses simple heuristics:
+        - Check for common grammatical errors
+        - Check for nonsensical word combinations
+        - Check if sentences make basic sense
+
+        Returns:
+            True if text appears coherent, False if it's obviously gibberish
+        """
+        if not text or len(text.strip()) < 10:
+            return False
+
+        try:
+            doc = self.semantic_extractor.nlp(text)
+            sentences = list(doc.sents)
+
+            if not sentences:
+                return False
+
+            # Check 1: Too many obvious grammatical errors
+            # Count subject-verb mismatches, missing articles in wrong places, etc.
+            error_count = 0
+            for sent in sentences[:5]:  # Check first 5 sentences
+                tokens = [t for t in sent if not t.is_punct and not t.is_space]
+
+                # Check for common gibberish patterns:
+                # - Verb without subject (in declarative sentences)
+                # - Multiple consecutive prepositions
+                # - Nonsensical word sequences
+
+                has_verb = any(t.pos_ in ('VERB', 'AUX') for t in tokens)
+                has_subject = any(t.dep_ in ('nsubj', 'nsubjpass') for t in tokens)
+
+                # If sentence has a verb but no clear subject, might be problematic
+                if has_verb and not has_subject and len(tokens) > 5:
+                    # Check if it's imperative or other valid structure
+                    root = next((t for t in sent if t.dep_ == 'ROOT'), None)
+                    if root and root.pos_ not in ('VERB', 'AUX'):
+                        error_count += 1
+
+                # Check for consecutive prepositions (often indicates gibberish)
+                prep_count = 0
+                for i, token in enumerate(tokens):
+                    if token.pos_ == 'ADP':  # Preposition
+                        prep_count += 1
+                        if prep_count > 2:
+                            error_count += 1
+                            break
+                    else:
+                        prep_count = 0
+
+            # If more than 2 sentences have errors, likely gibberish
+            if error_count > 2:
+                return False
+
+            # Check 2: Nonsensical word combinations and forced style patterns
+            # Look for patterns like "exist its certain", "Motive to", etc.
+            import re
+            nonsensical_patterns = [
+                r'\b\w+\s+its\s+\w+\s+\w+\s+',  # "verb its adj adj" without noun
+                r'\b\w+\s+to\s+the\s+\w+\s+of\s+the\s+\w+\s+of\s+the\s+',  # Too many nested "of the"
+                r'\bmotive\s+to\s+',  # Nonsensical "Motive to" pattern (should be "Contrary to" or similar)
+                r'\b\w+\s+to\s+(?:the|a|an)\s+\w+\s+context\s+of\s+',  # "X to the Y context of" (often gibberish)
+                r'\b\w+\s+to\s+(?:the|a|an)\s+\w+\s+circumstance\s+',  # Similar pattern
+            ]
+
+            text_lower = text.lower()
+            for pattern in nonsensical_patterns:
+                matches = len(re.findall(pattern, text_lower))
+                if matches > 1:  # More than 1 occurrence is suspicious
+                    return False
+
+            # Check 3: Repeated nonsensical phrases (like "Motive to" appearing multiple times)
+            # If a phrase that doesn't make sense appears repeatedly, it's likely gibberish
+            suspicious_phrases = [
+                'motive to',
+                'accord from this',
+                'wholly bring that',
+                'wholly oppose',
+                'wholly ensure',
+            ]
+            for phrase in suspicious_phrases:
+                if text_lower.count(phrase) > 2:
+                    return False
+
+            # Check 4: Too many repeated phrases that don't make sense
+            # If same nonsensical phrase appears multiple times, likely gibberish
+            words = text_lower.split()
+            if len(words) > 20:
+                # Check for repeated 3-word phrases
+                phrases = {}
+                for i in range(len(words) - 2):
+                    phrase = ' '.join(words[i:i+3])
+                    phrases[phrase] = phrases.get(phrase, 0) + 1
+
+                # If a phrase appears more than 3 times in a short text, might be gibberish
+                max_repeats = max(phrases.values()) if phrases else 0
+                if max_repeats > 3 and len(text) < 500:
+                    return False
+
+            return True
+
+        except Exception:
+            # If coherence check fails, assume coherent (don't reject on check failure)
+            return True
 
     def _detect_ai_patterns(self, text: str) -> List[str]:
         """Detect AI-typical patterns that should be removed."""
@@ -644,7 +792,8 @@ class Verifier:
     def _verify_semantics(self,
                           input_text: str,
                           output_text: str,
-                          input_semantics: SemanticContent) -> SemanticVerification:
+                          input_semantics: SemanticContent,
+                          debug: bool = False) -> SemanticVerification:
         """Verify semantic content is preserved."""
         # Extract semantics from output
         output_semantics = self.semantic_extractor.extract(output_text)
@@ -660,19 +809,30 @@ class Verifier:
         semantic_config = self.config.get("semantic_preservation", {})
         require_full_expression = semantic_config.get("require_full_expression", True)
 
-        for claim in input_claims:
+        if debug:
+            print(f"  [Semantic Verification] Checking {len(input_claims)} claim(s) in output:")
+            print(f"    Output text: {output_text[:100]}...")
+
+        for i, claim in enumerate(input_claims, 1):
             # Check if claim is fully expressed (not just mentioned)
             if require_full_expression:
-                claim_preserved = self._claim_fully_expressed(claim, output_text_lower)
+                claim_preserved = self._claim_fully_expressed(claim, output_text_lower, debug=debug)
             else:
                 claim_preserved = self._claim_appears_in_output(claim, output_text_lower)
 
             if claim_preserved:
                 preserved_claims.append(claim.text)
+                if debug:
+                    print(f"    Claim {i}/{len(input_claims)}: ✓ PRESERVED")
             else:
                 missing_claims.append(claim.text)
+                if debug:
+                    print(f"    Claim {i}/{len(input_claims)}: ✗ MISSING - '{claim.text[:60]}...'")
 
         claim_coverage = len(preserved_claims) / max(1, len(input_claims))
+
+        if debug:
+            print(f"  [Semantic Coverage] {len(preserved_claims)}/{len(input_claims)} = {claim_coverage:.0%}")
 
         # Check citations
         input_citations = input_semantics.preserved_elements.get('citations', [])
@@ -754,33 +914,194 @@ class Verifier:
         found = sum(1 for w in key_words if w in output_lower)
         return found >= len(key_words) * 0.6  # 60% of key words found
 
-    def _claim_fully_expressed(self, claim: Claim, output_lower: str) -> bool:
+    def _claim_fully_expressed(self, claim: Claim, output_lower: str, debug: bool = False) -> bool:
         """Check if claim is fully expressed, not just mentioned.
 
         Requires subject + predicate, or subject + at least one object.
-        """
-        # Check for subject (key concepts)
-        subject_words = [w.lower() for w in claim.subject.split()
-                        if len(w) > 3 and w.lower() not in ('the', 'this', 'that', 'these', 'those', 'a', 'an')]
-        subject_present = any(word in output_lower for word in subject_words) if subject_words else False
+        Uses semantic similarity for predicate matching to allow paraphrasing.
+        Falls back to full-text matching if claim extraction is malformed.
 
-        # Check for predicate (action/relationship)
-        predicate_lower = claim.predicate.lower()
-        predicate_present = predicate_lower in output_lower
+        Args:
+            claim: The claim to check
+            output_lower: The output text in lowercase
+            debug: If True, print debugging information
+
+        Returns:
+            True if claim is fully expressed
+        """
+        # FALLBACK: If claim extraction is clearly broken (empty subject AND predicate is not a verb),
+        # use full-text matching instead of component matching
+        claim_text_lower = claim.text.lower()
+        is_malformed = (not claim.subject or len(claim.subject.strip()) == 0) and claim.predicate
+
+        if is_malformed:
+            # Check if predicate is likely a verb by checking if it's in common verb list
+            # or if it appears as a verb in the claim text
+            try:
+                nlp = self.semantic_extractor.nlp
+                claim_doc = nlp(claim.text)
+                predicate_is_verb = False
+                for token in claim_doc:
+                    if token.lemma_.lower() == claim.predicate.lower() and token.pos_ in ('VERB', 'AUX'):
+                        predicate_is_verb = True
+                        break
+
+                # If predicate is not a verb, use full-text matching
+                if not predicate_is_verb:
+                    if debug:
+                        print(f"    [Claim Debug] '{claim.text[:60]}...'")
+                        print(f"      Using FALLBACK (malformed claim): full-text matching")
+                    # Use full-text matching: check if key words from claim text appear in output
+                    # Extract key content words (nouns, verbs, adjectives) from claim
+                    key_words = []
+                    for token in claim_doc:
+                        if token.pos_ in ('NOUN', 'PROPN', 'VERB', 'ADJ') and len(token.text) > 3:
+                            key_words.append(token.lemma_.lower())
+
+                    if key_words:
+                        # Check if majority of key words appear in output
+                        found_words = sum(1 for word in key_words if word in output_lower)
+                        result = found_words >= len(key_words) * 0.6  # 60% of key words must be present
+                        if debug:
+                            print(f"      Key words: {key_words[:5]}, Found: {found_words}/{len(key_words)}, Result: {'✓' if result else '✗'}")
+                        return result
+                    else:
+                        # Last resort: check if claim text (simplified) appears in output
+                        # Remove common words and check for phrase match
+                        simple_claim = ' '.join([w for w in claim_text_lower.split() if len(w) > 3])[:100]
+                        result = simple_claim in output_lower or any(word in output_lower for word in simple_claim.split()[:5])
+                        if debug:
+                            print(f"      Full-text fallback result: {'✓' if result else '✗'}")
+                        return result
+            except Exception:
+                # If NLP processing fails, fall through to normal matching
+                pass
+
+        # Normal component-based matching
+        # Check for subject (key concepts)
+        # Handle pronouns and short words - don't filter them out if they're the main subject
+        subject_lower = claim.subject.lower().strip()
+
+        # If subject is a pronoun or very short, check for it directly
+        pronouns = {'i', 'you', 'he', 'she', 'it', 'we', 'they', 'this', 'that', 'these', 'those'}
+        if subject_lower in pronouns or len(subject_lower) <= 3:
+            # Check if pronoun/short word appears in output
+            subject_present = subject_lower in output_lower
+        else:
+            # For longer subjects, extract key words (filter common words but keep important short words)
+            subject_words = [w.lower() for w in claim.subject.split()
+                            if len(w) > 2 and w.lower() not in ('the', 'a', 'an', 'is', 'are', 'was', 'were')]
+            subject_present = any(word in output_lower for word in subject_words) if subject_words else False
+
+        if debug:
+            print(f"    [Claim Debug] '{claim.text[:60]}...'")
+            if subject_lower in pronouns or len(subject_lower) <= 3:
+                print(f"      Subject: '{claim.subject}' -> {'✓' if subject_present else '✗'} (pronoun/short word: '{subject_lower}')")
+            else:
+                subject_words = [w.lower() for w in claim.subject.split()
+                                if len(w) > 2 and w.lower() not in ('the', 'a', 'an', 'is', 'are', 'was', 'were')]
+                print(f"      Subject: '{claim.subject}' -> {'✓' if subject_present else '✗'} (looking for: {subject_words[:3]})")
+
+        # Check for predicate using semantic similarity (allows paraphrasing and handles lemmas)
+        predicate_present = self._predicate_semantically_present(claim.predicate, output_lower)
+
+        if debug:
+            print(f"      Predicate: '{claim.predicate}' (lemma) -> {'✓' if predicate_present else '✗'}")
 
         # Check for objects (targets/entities)
         objects_present = False
+        matched_objects = []
         if claim.objects:
             for obj in claim.objects:
                 obj_words = [w.lower() for w in obj.split()
                             if len(w) > 3 and w.lower() not in ('the', 'this', 'that', 'a', 'an')]
                 if obj_words and any(word in output_lower for word in obj_words):
                     objects_present = True
+                    matched_objects.append(obj)
                     break
+
+        if debug:
+            if claim.objects:
+                print(f"      Objects: {claim.objects} -> {'✓' if objects_present else '✗'} (matched: {matched_objects})")
 
         # Require at least subject + predicate, or subject + one object
         # This ensures the claim is fully expressed, not just mentioned in passing
-        return (subject_present and predicate_present) or (subject_present and objects_present)
+        result = (subject_present and predicate_present) or (subject_present and objects_present)
+
+        if debug:
+            print(f"      Result: {'✓ EXPRESSED' if result else '✗ MISSING'} (subject={subject_present}, predicate={predicate_present}, objects={objects_present})")
+
+        return result
+
+    def _predicate_semantically_present(self, predicate: str, output_lower: str) -> bool:
+        """
+        Check if predicate is semantically present in output using word embeddings.
+
+        Handles lemmas vs inflected forms (e.g., "signal" lemma matches "signals", "signaled").
+        First tries literal match, then lemma matching, then semantic similarity.
+
+        Args:
+            predicate: The predicate verb/phrase from the claim (stored as lemma)
+            output_lower: The output text in lowercase
+
+        Returns:
+            True if predicate is semantically present (literal match, lemma match, or similarity >= 0.7)
+        """
+        predicate_lower = predicate.lower()
+
+        # First try literal match (fast and exact)
+        if predicate_lower in output_lower:
+            return True
+
+        # Second: Check for inflected forms by comparing lemmas
+        # Since predicate is stored as lemma, check if any verb in output has same lemma
+        try:
+            nlp = self.semantic_extractor.nlp
+            output_doc = nlp(output_lower)
+
+            # Get predicate lemma (predicate is already a lemma, but normalize it)
+            predicate_lemma_token = nlp(predicate_lower)
+            predicate_lemma = predicate_lemma_token[0].lemma_ if len(predicate_lemma_token) > 0 else predicate_lower
+
+            # Check all verbs/auxiliaries in output for matching lemma
+            for token in output_doc:
+                if token.pos_ in ('VERB', 'AUX') and len(token.text) > 2:
+                    token_lemma = token.lemma_.lower()
+                    # Direct lemma match
+                    if token_lemma == predicate_lemma:
+                        return True
+                    # Also check if predicate lemma is substring of token or vice versa
+                    # (handles cases like "signal" vs "signaling")
+                    if predicate_lemma in token_lemma or token_lemma in predicate_lemma:
+                        return True
+
+            # Third: Try semantic similarity (if vectors available)
+            predicate_token = nlp(predicate_lower)
+            if predicate_token.has_vector:
+                similarity_threshold = 0.7
+
+                for token in output_doc:
+                    if token.has_vector and len(token.text) > 2:
+                        similarity = predicate_token.similarity(token)
+                        if similarity >= similarity_threshold:
+                            return True
+
+                        # Check similarity with token's lemma
+                        if token.pos_ in ('VERB', 'AUX'):
+                            lemma_token = nlp(token.lemma_)
+                            if lemma_token.has_vector:
+                                similarity = predicate_token.similarity(lemma_token)
+                                if similarity >= similarity_threshold:
+                                    return True
+
+            # Fallback: substring check for common verb forms
+            predicate_words = [w for w in predicate_lower.split() if len(w) > 2]
+            return any(word in output_lower for word in predicate_words)
+
+        except Exception as e:
+            # If matching fails, fall back to literal substring check
+            predicate_words = [w for w in predicate_lower.split() if len(w) > 2]
+            return any(word in output_lower for word in predicate_words)
 
     def _verify_style(self,
                       output_text: str,

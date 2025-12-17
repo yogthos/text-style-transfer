@@ -47,7 +47,8 @@ class SemanticRegrouper:
                  cadence_analyzer: CadenceAnalyzer,
                  min_chunk_claims: int = 1,
                  max_chunk_claims: int = 5,
-                 semantic_similarity_threshold: float = 0.6):
+                 semantic_similarity_threshold: float = 0.6,
+                 force_one_claim_per_chunk: bool = False):
         """
         Initialize semantic regrouper.
 
@@ -58,12 +59,20 @@ class SemanticRegrouper:
             min_chunk_claims: Minimum claims per chunk
             max_chunk_claims: Maximum claims per chunk
             semantic_similarity_threshold: Threshold for topic clustering
+            force_one_claim_per_chunk: If True, override max_chunk_claims to 1
         """
         self.semantic_content = semantic_content
         self.cadence_profile = cadence_profile
         self.cadence_analyzer = cadence_analyzer
-        self.min_chunk_claims = min_chunk_claims
-        self.max_chunk_claims = max_chunk_claims
+
+        # Override if forcing one claim per chunk
+        if force_one_claim_per_chunk:
+            self.min_chunk_claims = 1
+            self.max_chunk_claims = 1
+        else:
+            self.min_chunk_claims = min_chunk_claims
+            self.max_chunk_claims = max_chunk_claims
+
         self.semantic_similarity_threshold = semantic_similarity_threshold
 
         try:

@@ -81,7 +81,8 @@ def generate_sentence(
     situation_match: Optional[str] = None,
     config_path: str = "config.json",
     hint: Optional[str] = None,
-    target_author_name: str = "Target Author"
+    target_author_name: str = "Target Author",
+    global_vocab_list: Optional[List[str]] = None
 ) -> str:
     """Generate a sentence using LLM with dual RAG references.
 
@@ -97,6 +98,7 @@ def generate_sentence(
         config_path: Path to configuration file.
         hint: Optional hint/feedback from previous attempt to improve generation.
         target_author_name: Name of target author for persona (default: "Target Author").
+        global_vocab_list: Optional list of global vocabulary words to inject for variety.
 
     Returns:
         Generated sentence string.
@@ -143,7 +145,8 @@ def generate_sentence(
         input_text=content_unit.original_text,
         situation_match=situation_match,
         structure_match=structure_match,
-        style_metrics=style_metrics
+        style_metrics=style_metrics,
+        global_vocab_list=global_vocab_list
     )
 
     # Add entity preservation if needed

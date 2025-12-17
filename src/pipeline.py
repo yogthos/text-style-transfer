@@ -22,11 +22,14 @@ from src.atlas import (
     build_cluster_markov,
     predict_next_cluster,
     find_situation_match,
-    find_structure_match
+    find_structure_match,
+    StructureNavigator
 )
 from src.generator.llm_interface import generate_sentence
 from src.validator.critic import generate_with_critic
 from src.analyzer.style_metrics import get_style_vector
+from src.analyzer.vocabulary import extract_global_vocabulary
+from src.ingestion.semantic import _detect_sentiment
 
 
 def _determine_current_cluster(
@@ -110,13 +113,29 @@ def process_text(
     print("Phase 1: Building Style Atlas...")
     atlas = None
 
-    if atlas_cache_path:
+    # If we cleared the DB, we must rebuild (don't load from cache)
+    if not clear_db and atlas_cache_path:
         cache_file = Path(atlas_cache_path) / "atlas.json"
         if cache_file.exists():
             try:
                 print(f"  Loading atlas from cache: {cache_file}")
                 atlas = load_atlas(str(cache_file), persist_directory=atlas_cache_path)
-                print(f"  ✓ Loaded atlas with {len(atlas.cluster_ids)} paragraphs")
+                # Verify collection exists and has data
+                if hasattr(atlas, '_collection'):
+                    try:
+                        collection = atlas._collection
+                        test_results = collection.get(limit=1)
+                        if test_results['ids'] and len(test_results['ids']) > 0:
+                            print(f"  ✓ Loaded atlas with {len(atlas.cluster_ids)} paragraphs")
+                        else:
+                            print(f"  ⚠ Cached atlas collection is empty, rebuilding...")
+                            atlas = None
+                    except Exception:
+                        print(f"  ⚠ Cached atlas collection not accessible, rebuilding...")
+                        atlas = None
+                else:
+                    print(f"  ⚠ Cached atlas has no collection connection, rebuilding...")
+                    atlas = None
             except Exception as e:
                 print(f"  ⚠ Failed to load cache: {e}")
                 atlas = None
@@ -143,6 +162,18 @@ def process_text(
     print("Phase 1: Building cluster Markov chain...")
     cluster_markov = build_cluster_markov(atlas)
     print(f"  ✓ Built Markov chain with {len(cluster_markov[1])} clusters")
+
+    # Initialize StructureNavigator for stochastic selection
+    print("Phase 1: Initializing structure navigator...")
+    structure_navigator = StructureNavigator(history_limit=3)
+    print(f"  ✓ Initialized structure navigator")
+
+    # Extract global vocabulary from sample text
+    print("Phase 1: Extracting global vocabulary...")
+    global_vocab_dict = extract_global_vocabulary(sample_text, top_n=200)
+    print(f"  ✓ Extracted vocabulary: {len(global_vocab_dict.get('positive', []))} positive, "
+          f"{len(global_vocab_dict.get('negative', []))} negative, "
+          f"{len(global_vocab_dict.get('neutral', []))} neutral words")
 
     # Phase 2: Extract meaning from input
     print("Phase 2: Extracting meaning...")
@@ -213,7 +244,8 @@ def process_text(
                     atlas,
                     current_cluster,
                     input_text=content_unit.original_text,
-                    length_tolerance=0.3
+                    length_tolerance=0.3,
+                    navigator=structure_navigator
                 )
 
                 if situation_match:
@@ -229,11 +261,16 @@ def process_text(
                     generated_text_so_far.append(content_unit.original_text)
                     continue
 
+                # Determine sentiment and select appropriate vocabulary
+                sentiment = _detect_sentiment(content_unit.original_text)
+                sentiment_key = sentiment.lower() if sentiment else 'neutral'
+                global_vocab_list = global_vocab_dict.get(sentiment_key, global_vocab_dict.get('neutral', []))
+
                 # Generate with critic loop
                 try:
                     generated, critic_result = generate_with_critic(
                         generate_fn=lambda cu, struct_match, sit_match, cfg, hint=None: generate_sentence(
-                            cu, struct_match, sit_match, cfg, hint=hint
+                            cu, struct_match, sit_match, cfg, hint=hint, global_vocab_list=global_vocab_list
                         ),
                         content_unit=content_unit,
                         structure_match=structure_match,

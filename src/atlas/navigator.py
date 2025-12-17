@@ -4,13 +4,100 @@ This module provides functions to:
 1. Build Markov chain from style clusters
 2. Predict next style cluster
 3. Retrieve style reference paragraphs from ChromaDB
+4. Stochastic selection with history tracking to prevent repetition
 """
 
+import random
 import numpy as np
-from typing import Dict, Optional, Tuple
+from typing import Dict, Optional, Tuple, List
 from collections import defaultdict
 
 from src.atlas.builder import StyleAtlas
+
+
+class StructureNavigator:
+    """Manages structure template selection with history tracking and weighted sampling.
+
+    Prevents repetitive selection by tracking recently used templates and using
+    weighted random selection from top candidates to create natural variety.
+    """
+
+    def __init__(self, history_limit: int = 3):
+        """Initialize the structure navigator.
+
+        Args:
+            history_limit: Number of recent templates to track (default: 3).
+        """
+        self.history_buffer: List[str] = []
+        self.history_limit = history_limit
+
+    def select_template(
+        self,
+        candidates: List[Dict],
+        input_length: int
+    ) -> Optional[Dict]:
+        """Select a structural template using weighted random sampling + history filtering.
+
+        Args:
+            candidates: List of candidate dicts with keys: 'id', 'text', 'word_count'
+            input_length: Target word count for the input text.
+
+        Returns:
+            Selected candidate dict, or None if no candidates available.
+        """
+        if not candidates:
+            return None
+
+        # 1. Filter by History (Anti-Repetition)
+        available_candidates = [
+            c for c in candidates
+            if c.get('id') not in self.history_buffer
+        ]
+
+        # Fallback: If we filtered everything (rare), clear buffer
+        if not available_candidates:
+            available_candidates = candidates
+            self.history_buffer = []
+
+        # 2. Score Candidates (Distance from ideal length)
+        # We prefer candidates closer to input_length, but allow variance
+        scored_candidates = []
+        for cand in available_candidates:
+            word_count = cand.get('word_count', len(cand.get('text', '').split()))
+            len_diff = abs(word_count - input_length)
+            # Inverse score: lower diff = higher score
+            score = 1.0 / (len_diff + 1.0)
+            scored_candidates.append((cand, score))
+
+        # 3. Weighted Random Selection (The "Temperature")
+        # Sort by score descending
+        scored_candidates.sort(key=lambda x: x[1], reverse=True)
+
+        # Take top 5
+        top_n = scored_candidates[:5]
+
+        if not top_n:
+            return None
+
+        # Create probabilities (favor top matches, but allow others)
+        total_score = sum(x[1] for x in top_n)
+        if total_score > 0:
+            probs = [x[1] / total_score for x in top_n]
+        else:
+            # Uniform if all scores are zero
+            probs = [1.0 / len(top_n)] * len(top_n)
+
+        selected_tuple = random.choices(top_n, weights=probs, k=1)[0]
+        selected_template = selected_tuple[0]
+
+        # 4. Update History
+        template_id = selected_template.get('id')
+        if template_id:
+            self.history_buffer.append(template_id)
+            if len(self.history_buffer) > self.history_limit:
+                self.history_buffer.pop(0)
+
+        return selected_template
 
 
 def build_cluster_markov(atlas: StyleAtlas) -> Tuple[np.ndarray, Dict[int, int]]:
@@ -188,19 +275,22 @@ def find_structure_match(
     target_cluster_id: int,
     input_text: str,
     length_tolerance: float = 0.3,
-    top_k: int = 1
+    top_k: int = 1,
+    navigator: Optional[StructureNavigator] = None
 ) -> Optional[str]:
     """Find a paragraph matching the target style cluster for rhythm/structure.
 
     Queries ChromaDB by cluster_id and filters by length ratio to prevent expansion.
     Returns a paragraph from the target cluster that matches input length.
+    If navigator is provided, uses weighted random selection from top candidates.
 
     Args:
         atlas: StyleAtlas containing ChromaDB collection.
         target_cluster_id: Target cluster ID to retrieve from.
         input_text: Input text to match length against (required for length filtering).
         length_tolerance: Tolerance for length matching (0.3 = 30%, default: 0.3).
-        top_k: Number of results to return (default: 1).
+        top_k: Number of candidates to retrieve (default: 1, but will use top 10 if navigator provided).
+        navigator: Optional StructureNavigator for stochastic selection (default: None).
 
     Returns:
         A paragraph from the target cluster matching input length, or None if not found.
@@ -234,13 +324,18 @@ def find_structure_match(
             input_sent_count = 1  # At least one sentence
 
     # Get all documents and filter by cluster_id
-    all_results = collection.get()
+    try:
+        all_results = collection.get()
+    except Exception as e:
+        # Collection might not exist or be empty
+        return None
 
-    if not all_results['ids']:
+    if not all_results['ids'] or len(all_results['ids']) == 0:
         return None
 
     # Filter by cluster_id and length
     candidates = []
+    candidate_dicts = []
     for idx, para_id in enumerate(all_results['ids']):
         metadata = all_results['metadatas'][idx] if all_results['metadatas'] else {}
         cluster_id = metadata.get('cluster_id')
@@ -273,8 +368,52 @@ def find_structure_match(
 
         if min_ratio <= len_ratio <= max_ratio:
             candidates.append((doc, len_ratio, cand_word_count))
+            # Create candidate dict for navigator
+            candidate_dicts.append({
+                'id': para_id,
+                'text': doc,
+                'word_count': cand_word_count,
+                'len_ratio': len_ratio
+            })
 
-    # If we have length-matched candidates, return the one closest to 1.0 ratio
+    # If navigator is provided, use stochastic selection
+    if navigator:
+        # If we have length-matched candidates, use those (preferred)
+        if candidate_dicts:
+            # Sort by how close len_ratio is to 1.0
+            candidate_dicts.sort(key=lambda x: abs(x.get('len_ratio', 1.0) - 1.0))
+            top_candidates = candidate_dicts[:10]
+        else:
+            # No length-matched candidates, but we still want to use navigator
+            # Get all candidates from the cluster (without length filtering)
+            all_cluster_candidates = []
+            for idx, para_id in enumerate(all_results['ids']):
+                metadata = all_results['metadatas'][idx] if all_results['metadatas'] else {}
+                cluster_id = metadata.get('cluster_id')
+                if cluster_id == target_cluster_id:
+                    doc = all_results['documents'][idx] if all_results['documents'] else None
+                    if doc:
+                        cand_word_count = metadata.get('word_count', len(doc.split()))
+                        all_cluster_candidates.append({
+                            'id': para_id,
+                            'text': doc,
+                            'word_count': cand_word_count,
+                            'len_ratio': cand_word_count / input_word_count if input_word_count > 0 else 1.0
+                        })
+
+            # Sort by length similarity to input
+            all_cluster_candidates.sort(key=lambda x: abs(x.get('word_count', 0) - input_word_count))
+            top_candidates = all_cluster_candidates[:10]
+
+        if top_candidates:
+            selected = navigator.select_template(top_candidates, input_word_count)
+            if selected:
+                return selected.get('text')
+            # Fallback if navigator returns None
+            if top_candidates:
+                return top_candidates[0].get('text')
+
+    # If we have length-matched candidates (and no navigator or navigator failed), return the one closest to 1.0 ratio
     if candidates:
         best_match = min(candidates, key=lambda x: abs(x[1] - 1.0))
         return best_match[0]

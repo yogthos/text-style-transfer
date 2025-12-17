@@ -124,3 +124,93 @@ def build_vocab_map(sample_text: str, similarity_threshold: float = 0.7) -> Dict
 
     return vocab_map
 
+
+def extract_global_vocabulary(sample_text: str, top_n: int = 200) -> Dict[str, List[str]]:
+    """Extract global vocabulary from sample text, clustered by sentiment.
+
+    Extracts top adjectives and verbs from the sample text and organizes them
+    by sentiment (Positive, Negative, Neutral) for vocabulary injection.
+
+    Args:
+        sample_text: The sample text to analyze.
+        top_n: Maximum number of words to extract per sentiment (default: 200).
+
+    Returns:
+        Dictionary with keys 'positive', 'negative', 'neutral', each containing
+        a list of words sorted by frequency.
+    """
+    from nltk.corpus import stopwords
+    from nltk.tokenize import word_tokenize
+    from nltk.tag import pos_tag
+    from collections import Counter
+
+    try:
+        from nltk.sentiment import SentimentIntensityAnalyzer
+        sia = SentimentIntensityAnalyzer()
+        use_vader = True
+    except (LookupError, ImportError):
+        use_vader = False
+
+    stop_words = set(stopwords.words('english'))
+    tokens = word_tokenize(sample_text.lower())
+    pos_tags = pos_tag(tokens)
+
+    # Extract adjectives and verbs
+    content_words = []
+    word_counts = Counter()
+
+    for word, pos in pos_tags:
+        # Filter for adjectives and verbs
+        is_content = (
+            pos.startswith('JJ') or  # Adjectives
+            pos.startswith('VB')    # Verbs
+        )
+
+        if (is_content and
+            word not in stop_words and
+            word.isalpha() and
+            len(word) > 2):
+            content_words.append(word)
+            word_counts[word] += 1
+
+    # Cluster by sentiment
+    positive_words = []
+    negative_words = []
+    neutral_words = []
+
+    # Get unique words sorted by frequency
+    unique_words = sorted(word_counts.keys(), key=lambda w: word_counts[w], reverse=True)
+
+    for word in unique_words[:top_n * 3]:  # Get more than needed, then filter
+        if use_vader:
+            # Use VADER sentiment analyzer
+            scores = sia.polarity_scores(word)
+            compound = scores['compound']
+
+            if compound >= 0.05:
+                positive_words.append(word)
+            elif compound <= -0.05:
+                negative_words.append(word)
+            else:
+                neutral_words.append(word)
+        else:
+            # Fallback: keyword-based sentiment
+            positive_keywords = ['good', 'great', 'excellent', 'wonderful', 'happy', 'love', 'like',
+                               'beautiful', 'amazing', 'brilliant', 'perfect', 'fantastic']
+            negative_keywords = ['bad', 'terrible', 'awful', 'hate', 'sad', 'angry', 'dislike',
+                               'horrible', 'worst', 'ugly', 'disgusting', 'hateful']
+
+            if word in positive_keywords:
+                positive_words.append(word)
+            elif word in negative_keywords:
+                negative_words.append(word)
+            else:
+                neutral_words.append(word)
+
+    # Limit to top_n per category
+    return {
+        'positive': positive_words[:top_n],
+        'negative': negative_words[:top_n],
+        'neutral': neutral_words[:top_n]
+    }
+

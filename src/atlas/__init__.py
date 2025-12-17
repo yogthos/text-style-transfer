@@ -5,7 +5,8 @@ from src.atlas.navigator import (
     build_cluster_markov,
     predict_next_cluster,
     find_situation_match,
-    find_structure_match
+    find_structure_match,
+    StructureNavigator
 )
 
 __all__ = [
@@ -18,5 +19,6 @@ __all__ = [
     'predict_next_cluster',
     'find_situation_match',
     'find_structure_match',
+    'StructureNavigator',
 ]
 

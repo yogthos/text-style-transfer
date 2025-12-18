@@ -132,7 +132,8 @@ Note: Author styles must be loaded into ChromaDB first using:
             output_file=args.output,
             max_retries=args.max_retries,
             atlas_cache_path=atlas_cache_path,
-            blend_ratio=args.blend_ratio
+            blend_ratio=args.blend_ratio,
+            verbose=args.verbose
         )
 
         if args.verbose:

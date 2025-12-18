@@ -1,658 +1,557 @@
-"""Main pipeline for Style Atlas-based text style transfer.
+"""Pipeline: Extract-Translate-Refine architecture.
 
-This module implements the Style Atlas pipeline:
-1. Build/load Style Atlas from sample text
-2. Extract meaning from input
-3. Navigate style clusters
-4. Retrieve style references
-5. Generate with adversarial critic loop
+This module implements the pipeline that:
+1. Extracts semantic blueprints from input
+2. Classifies rhetorical mode
+3. Retrieves few-shot examples
+4. Translates using StyleTranslator
+5. Validates using SemanticCritic
 """
 
 import json
+import re
 from pathlib import Path
-from typing import List, Optional
-
-from src.models import ContentUnit
-from src.ingestion.semantic import extract_meaning
-from src.atlas import (
-    StyleAtlas,
-    build_style_atlas,
-    save_atlas,
-    load_atlas,
-    build_cluster_markov,
-    predict_next_cluster,
-    find_situation_match,
-    find_structure_match,
-    retrieve_window_match,
-    StructureNavigator,
-    StyleBlender
-)
-from src.generator.llm_interface import generate_sentence
-from src.validator.critic import generate_with_critic, ConvergenceError
-from src.analyzer.style_metrics import get_style_vector
-from src.ingestion.semantic import _detect_sentiment
+from typing import List, Optional, Callable
+from src.ingestion.blueprint import SemanticBlueprint, BlueprintExtractor
+from src.atlas.rhetoric import RhetoricalType, RhetoricalClassifier
+from src.generator.translator import StyleTranslator
+from src.validator.semantic_critic import SemanticCritic
+from src.atlas.builder import StyleAtlas, load_atlas
+from src.atlas.style_registry import StyleRegistry
+from src.analyzer.style_extractor import StyleExtractor
+from src.analysis.semantic_analyzer import PropositionExtractor
 
 
-def _determine_current_cluster(
-    generated_text_so_far: List[str],
-    atlas: StyleAtlas
-) -> Optional[int]:
-    """Determine the current style cluster from generated text.
+def _split_into_paragraphs(text: str) -> List[str]:
+    """Split text into paragraphs.
 
     Args:
-        generated_text_so_far: List of previously generated sentences/paragraphs.
-        atlas: StyleAtlas with cluster information.
+        text: Input text.
 
     Returns:
-        Current cluster ID, or None if cannot determine.
+        List of paragraph strings (non-empty).
     """
-    if not generated_text_so_far:
-        return None
+    # Try double newlines first
+    paragraphs = [p.strip() for p in text.split('\n\n') if p.strip()]
 
-    # Get style vector of most recent generated text
-    recent_text = " ".join(generated_text_so_far[-3:])  # Last 3 sentences
-    current_style_vec = get_style_vector(recent_text)
+    # If no double newlines, try single newlines
+    if len(paragraphs) == 1 and '\n' in text:
+        paragraphs = [p.strip() for p in text.split('\n') if p.strip()]
 
-    # Find closest cluster center
-    if len(atlas.cluster_centers) == 0:
-        return None
+    # If still only one, treat entire text as one paragraph
+    if not paragraphs:
+        paragraphs = [text.strip()] if text.strip() else []
 
-    distances = []
-    for center in atlas.cluster_centers:
-        dist = ((current_style_vec - center) ** 2).sum()
-        distances.append(dist)
+    return paragraphs
 
-    closest_cluster_idx = min(range(len(distances)), key=lambda i: distances[i])
-    return closest_cluster_idx
+
+def _split_into_sentences_safe(paragraph: str) -> List[str]:
+    """Split paragraph into sentences, preserving citations.
+
+    This function avoids splitting on periods that are part of citations
+    like [^155] or within quoted text.
+
+    Args:
+        paragraph: Input paragraph text.
+
+    Returns:
+        List of sentence strings (non-empty).
+    """
+    if not paragraph or not paragraph.strip():
+        return []
+
+    # First, identify citation positions to protect them
+    citation_pattern = r'\[\^\d+\]'
+    citation_positions = []
+    for match in re.finditer(citation_pattern, paragraph):
+        citation_positions.append((match.start(), match.end()))
+
+    # Find sentence boundaries (periods, exclamation, question marks)
+    # But avoid splitting if the period is within a citation bracket
+    sentences = []
+    current_start = 0
+    i = 0
+
+    while i < len(paragraph):
+        # Check if we're at a sentence-ending punctuation
+        if paragraph[i] in '.!?':
+            # Check if this punctuation is part of a citation
+            is_in_citation = False
+            for cit_start, cit_end in citation_positions:
+                if cit_start <= i < cit_end:
+                    is_in_citation = True
+                    break
+
+            if not is_in_citation:
+                # Check if there's whitespace after (sentence boundary)
+                # Look ahead for whitespace or end of string
+                if i + 1 >= len(paragraph) or paragraph[i + 1].isspace():
+                    # Found sentence boundary
+                    sentence = paragraph[current_start:i + 1].strip()
+                    if sentence:
+                        sentences.append(sentence)
+                    # Skip the punctuation and any following whitespace
+                    i += 1
+                    while i < len(paragraph) and paragraph[i].isspace():
+                        i += 1
+                    current_start = i
+                    continue
+
+        i += 1
+
+    # Add remaining text as final sentence
+    if current_start < len(paragraph):
+        remaining = paragraph[current_start:].strip()
+        if remaining:
+            sentences.append(remaining)
+
+    # Fallback: if no sentences found, use original splitting method
+    if not sentences:
+        sentences = re.split(r'[.!?]+\s+', paragraph)
+        sentences = [s.strip() for s in sentences if s.strip()]
+
+    return sentences
 
 
 def process_text(
     input_text: str,
+    atlas: StyleAtlas,
+    author_name: str,
+    style_dna: str,
     config_path: str = "config.json",
     max_retries: int = 3,
-    output_file: Optional[str] = None,
-    atlas_cache_path: Optional[str] = None,
-    blend_ratio: Optional[float] = None
+    verbose: bool = False,
+    write_callback: Optional[Callable[[Optional[str], bool, bool], None]] = None
 ) -> List[str]:
-    """Process input text through Style Atlas pipeline.
+    """Process text through the pipeline.
 
     Args:
-        input_text: The input text to transform.
-        config_path: Path to configuration file.
-        max_retries: Maximum number of retries per generation (default: 3).
-        output_file: Optional path to write output incrementally.
-        atlas_cache_path: Optional path to ChromaDB persistence directory.
+        input_text: Input text to transform.
+        atlas: StyleAtlas with rhetorical indexing.
+        author_name: Target author name.
+        style_dna: Style DNA description.
+        config_path: Path to config file.
+        max_retries: Maximum retry attempts per sentence.
+        verbose: Enable verbose logging.
+        write_callback: Optional callback function(sentence, is_new_paragraph) to write sentences incrementally.
 
     Returns:
-        List of generated paragraphs.
+        List of generated paragraphs (each paragraph is a space-joined string of sentences).
     """
-    # Load config
-    with open(config_path, 'r') as f:
-        config = json.load(f)
+    extractor = BlueprintExtractor()
+    classifier = RhetoricalClassifier()
+    translator = StyleTranslator(config_path=config_path)
+    critic = SemanticCritic(config_path=config_path)
+    style_extractor = StyleExtractor(config_path=config_path)
+    proposition_extractor = PropositionExtractor(config_path=config_path)
 
-    atlas_config = config.get("atlas", {})
-    num_clusters = atlas_config.get("num_clusters", 5)
-    similarity_threshold = atlas_config.get("similarity_threshold", 0.3)
-    collection_name = atlas_config.get("collection_name", "style_atlas")
+    # Split into paragraphs first
+    paragraphs = _split_into_paragraphs(input_text)
 
-    # Read critic configuration
-    critic_config = config.get("critic", {})
-    critic_min_score = critic_config.get("min_score", 0.75)
-    critic_min_pipeline_score = critic_config.get("min_pipeline_score", 0.6)
-    critic_max_retries = critic_config.get("max_retries", 5)
-    critic_max_pipeline_retries = critic_config.get("max_pipeline_retries", 2)
+    if not paragraphs:
+        return []
 
-    # Detect blend mode from config
-    blend_config = config.get("blend", {})
-    blend_authors = blend_config.get("authors", [])
-    blend_ratio_config = blend_config.get("ratio", 0.5)
-    max_paragraphs_to_check = blend_config.get("max_paragraphs_to_check", 100)
-    # CLI blend_ratio overrides config
-    final_blend_ratio = blend_ratio if blend_ratio is not None else blend_ratio_config
+    generated_paragraphs = []
+    current_paragraph_sentences = []  # Track sentences for current paragraph
+    is_first_paragraph = True
 
-    # Determine if we're in blend mode (multiple authors) or single-author mode
-    is_blend_mode = len(blend_authors) > 1
-    style_blender = None
+    # Track used examples to prevent repetition
+    used_examples = set()
 
-    if is_blend_mode:
-        print(f"Phase 1: Blend mode detected with authors: {blend_authors}")
-        print(f"  Blend ratio: {final_blend_ratio} (0.0 = All {blend_authors[0]}, 1.0 = All {blend_authors[1]})")
-    else:
-        print(f"Phase 1: Single-author mode")
+    # Context tracking for contextual anchoring
+    previous_generated_text = ""
+    previous_paragraph_id = -1
 
-    # Phase 1: Load existing Style Atlas from ChromaDB
-    print("Phase 1: Loading Style Atlas from ChromaDB...")
-    print(f"  Collection: {collection_name}")
-    print(f"  Persist directory: {atlas_cache_path or '(in-memory)'}")
-    atlas = None
+    for para_idx, paragraph in enumerate(paragraphs):
+        if verbose:
+            print(f"\n{'='*60}")
+            print(f"Processing Paragraph {para_idx + 1}/{len(paragraphs)}")
+            print(f"{'='*60}")
+            print(f"Input: {paragraph[:100]}{'...' if len(paragraph) > 100 else ''}")
 
-    # Try to load existing atlas from ChromaDB
-    if atlas_cache_path:
-        cache_file = Path(atlas_cache_path) / "atlas.json"
-        if cache_file.exists():
+        # Split paragraph into sentences (preserving citations)
+        sentences = _split_into_sentences_safe(paragraph)
+
+        if not sentences:
+            continue
+
+        if verbose:
+            print(f"Sentences in paragraph: {len(sentences)}")
+
+        # Reset context if crossing paragraph boundary
+        if para_idx != previous_paragraph_id:
+            previous_generated_text = ""
+            previous_paragraph_id = para_idx
+            if verbose:
+                print(f"  Context reset (new paragraph)")
+
+        # Check if this is a multi-sentence paragraph (use paragraph fusion)
+        is_multi_sentence = len(sentences) > 1
+        min_sentences_for_fusion = 2
+        try:
+            with open(config_path, 'r') as f:
+                config = json.load(f)
+            paragraph_fusion_config = config.get("paragraph_fusion", {})
+            if paragraph_fusion_config.get("enabled", True):
+                min_sentences_for_fusion = paragraph_fusion_config.get("min_sentences_for_fusion", 2)
+        except Exception:
+            pass
+
+        # Use paragraph fusion if enabled and paragraph has multiple sentences
+        if is_multi_sentence and len(sentences) >= min_sentences_for_fusion:
+            if verbose:
+                print(f"  Using paragraph fusion mode ({len(sentences)} sentences)")
+
+            # Extract style DNA from examples
+            style_dna_dict = None
             try:
-                print(f"  Attempting to load from cache: {cache_file}")
-                atlas = load_atlas(str(cache_file), persist_directory=atlas_cache_path)
-                # Verify collection exists and has data
-                if hasattr(atlas, '_collection'):
-                    try:
-                        collection = atlas._collection
-                        test_results = collection.get(limit=1)
-                        if test_results['ids'] and len(test_results['ids']) > 0:
-                            total_count = collection.count() if hasattr(collection, 'count') else len(atlas.cluster_ids)
-                            print(f"  ✓ Loaded atlas from cache with {total_count} paragraphs")
-                        else:
-                            atlas = None
-                            raise ValueError("ChromaDB collection is empty")
-                    except ValueError:
-                        raise
-                    except Exception as e:
-                        atlas = None
-                        raise ValueError(f"ChromaDB collection not accessible: {e}")
+                # Get examples for style extraction
+                examples = atlas.get_examples_by_rhetoric(
+                    RhetoricalType.OBSERVATION,
+                    top_k=5,
+                    author_name=author_name,
+                    query_text=paragraph
+                )
+                if examples:
+                    style_dna_dict = style_extractor.extract_style_dna(examples)
+            except Exception:
+                pass
+
+            # Translate paragraph holistically
+            try:
+                generated_paragraph = translator.translate_paragraph(
+                    paragraph,
+                    atlas,
+                    author_name,
+                    style_dna=style_dna_dict,
+                    verbose=verbose
+                )
+
+                # Evaluate with paragraph mode
+                propositions = proposition_extractor.extract_atomic_propositions(paragraph)
+                critic_result = critic.evaluate(
+                    generated_paragraph,
+                    extractor.extract(paragraph),
+                    propositions=propositions,
+                    is_paragraph=True,
+                    author_style_vector=None  # TODO: Get from atlas if available
+                )
+
+                if verbose:
+                    print(f"  Paragraph fusion result: pass={critic_result.get('pass', False)}, "
+                          f"score={critic_result.get('score', 0.0):.2f}, "
+                          f"proposition_recall={critic_result.get('proposition_recall', 0.0):.2f}")
+
+                # Use generated paragraph if it passes, otherwise fall back to sentence-by-sentence
+                if critic_result.get('pass', False):
+                    generated_paragraphs.append(generated_paragraph)
+                    if write_callback:
+                        # Each paragraph is a new paragraph (except we track is_first_paragraph separately)
+                        is_new_paragraph = True
+                        write_callback(generated_paragraph, is_new_paragraph, is_first_paragraph)
+                        if is_first_paragraph:
+                            is_first_paragraph = False
+                    previous_generated_text = generated_paragraph  # Update context
+                    continue  # Skip sentence-by-sentence processing
                 else:
-                    atlas = None
-                    raise ValueError("Cached atlas has no collection connection")
-            except ValueError:
-                raise
+                    if verbose:
+                        print(f"  Paragraph fusion failed, falling back to sentence-by-sentence")
+                    # Fall through to sentence-by-sentence processing
             except Exception as e:
-                print(f"  ⚠ Failed to load from cache: {e}")
-                atlas = None
+                if verbose:
+                    print(f"  Paragraph fusion error: {e}, falling back to sentence-by-sentence")
+                # Fall through to sentence-by-sentence processing
 
-    # If cache load failed, try to connect directly to ChromaDB
-    if atlas is None:
-        try:
-            import chromadb
-            from chromadb.config import Settings
+        generated_sentences = []
 
-            print(f"  Connecting directly to ChromaDB...")
-            if atlas_cache_path:
-                client = chromadb.PersistentClient(path=atlas_cache_path)
+        for sent_idx, sentence in enumerate(sentences):
+            # Determine position in paragraph
+            if len(sentences) == 1:
+                position = "SINGLETON"
+            elif sent_idx == 0:
+                position = "OPENER"
+            elif sent_idx == len(sentences) - 1:
+                position = "CLOSER"
             else:
-                client = chromadb.Client(Settings(anonymized_telemetry=False))
+                position = "BODY"
 
-            # Check if collection exists
+            if verbose:
+                print(f"  Position: {position}")
+                if previous_generated_text:
+                    print(f"  Previous context: {previous_generated_text[:50]}...")
+            # DEBUG: Verify sentence is unique
+            sentence_hash = hash(sentence)
+            if verbose:
+                print(f"\n  [{sent_idx + 1}/{len(sentences)}] Sentence: {sentence[:50]}{'...' if len(sentence) > 50 else ''}")
+                print(f"  DEBUG: Sentence hash: {sentence_hash}")
+
+            # Check for duplicate input sentences (shouldn't happen, but verify)
+            if sent_idx > 0:
+                prev_sentences = [s for i, s in enumerate(sentences) if i < sent_idx]
+                if sentence in prev_sentences:
+                    print(f"  ⚠ WARNING: Duplicate input sentence detected at index {sent_idx}!")
+                    if verbose:
+                        print(f"    This sentence appeared at indices: {[i for i, s in enumerate(sentences) if s == sentence]}")
+
+            # Step 1: Extract blueprint with positional metadata
             try:
-                collection = client.get_collection(name=collection_name)
-            except Exception as e:
-                error_msg = (
-                    f"ChromaDB collection '{collection_name}' does not exist.\n"
-                    f"Persist directory: {atlas_cache_path or '(in-memory)'}\n"
-                    f"Please load author styles first using:\n"
-                    f"  python scripts/load_style.py --style-file <file> --author <name>"
+                blueprint = extractor.extract(
+                    sentence,
+                    paragraph_id=para_idx,
+                    position=position,
+                    previous_context=previous_generated_text
                 )
-                raise ValueError(error_msg) from e
+                # DEBUG: Verify blueprint is unique
+                blueprint_hash = hash(str(blueprint.svo_triples) + str(blueprint.core_keywords))
+                if verbose:
+                    print(f"  Blueprint:")
+                    print(f"    Subjects: {blueprint.get_subjects()}")
+                    print(f"    Verbs: {blueprint.get_verbs()}")
+                    print(f"    Objects: {blueprint.get_objects()}")
+                    keywords_list = sorted(list(blueprint.core_keywords))
+                    print(f"    Keywords: {keywords_list[:10]}{'...' if len(keywords_list) > 10 else ''}")
+                    print(f"  DEBUG: Blueprint hash: {blueprint_hash}")
+            except Exception as e:
+                print(f"Warning: Failed to extract blueprint from '{sentence}': {e}")
+                # Fallback: use original sentence
+                # Check for duplicate before appending
+                if sentence in generated_sentences:
+                    print(f"  ⚠ WARNING: Duplicate generated sentence detected (fallback)!")
+                generated_sentences.append(sentence)
+                continue
 
-            # Check if collection has data
+            # Step 2: Classify rhetoric
+            rhetorical_type = classifier.classify_heuristic(sentence)
+            if verbose:
+                print(f"  Rhetorical Type: {rhetorical_type.value}")
+
+            # Step 3: Retrieve examples (exclude previously used ones)
+            # Pass sentence as query_text for length window filtering
+            # Fetch 15 examples to provide wide net for filtering
+            examples = atlas.get_examples_by_rhetoric(
+                rhetorical_type,
+                top_k=15,
+                author_name=author_name,
+                exclude=list(used_examples),
+                query_text=sentence
+            )
+            if not examples:
+                # Fallback to any examples from same author
+                examples = atlas.get_examples_by_rhetoric(
+                    RhetoricalType.OBSERVATION,
+                    top_k=15,
+                    author_name=author_name,
+                    exclude=list(used_examples),
+                    query_text=sentence
+                )
+                if not examples:
+                    # Ultimate fallback: empty examples (translator will handle it)
+                    examples = []
+
+            # Track used examples
+            used_examples.update(examples)
+
+            if verbose:
+                print(f"  Examples retrieved: {len(examples)}")
+                for i, ex in enumerate(examples[:2]):
+                    print(f"    Example {i+1}: {ex[:80]}{'...' if len(ex) > 80 else ''}")
+
+            # Step 3.5: Extract style DNA from examples (RAG-driven)
+            style_dna_dict = None
+            style_lexicon = None
+            if examples:
+                try:
+                    style_dna_dict = style_extractor.extract_style_dna(examples)
+                    style_lexicon = style_dna_dict.get("lexicon", [])
+                    if verbose:
+                        print(f"  Style DNA extracted:")
+                        print(f"    Lexicon: {', '.join(style_lexicon[:5])}{'...' if len(style_lexicon) > 5 else ''}")
+                        print(f"    Tone: {style_dna_dict.get('tone', 'N/A')}")
+                        print(f"    Structure: {style_dna_dict.get('structure', 'N/A')[:60]}...")
+                except Exception as e:
+                    if verbose:
+                        print(f"  ⚠ Style DNA extraction failed: {e}")
+                    style_dna_dict = None
+                    style_lexicon = None
+
+            # Step 4: Generate initial draft
+            result = None
+            generated = None
+
             try:
-                test_results = collection.get(limit=1)
-            except Exception as e:
-                error_msg = (
-                    f"Failed to access ChromaDB collection '{collection_name}': {e}\n"
-                    f"Persist directory: {atlas_cache_path or '(in-memory)'}"
+                # Generate initial draft (examples already retrieved above)
+
+                # Generate initial draft
+                generated = translator.translate(
+                    blueprint=blueprint,
+                    author_name=author_name,
+                    style_dna=style_dna,
+                    rhetorical_type=rhetorical_type,
+                    examples=examples,
+                    verbose=verbose
                 )
-                raise ValueError(error_msg) from e
 
-            if not test_results.get('ids') or len(test_results['ids']) == 0:
-                error_msg = (
-                    f"ChromaDB collection '{collection_name}' is empty.\n"
-                    f"Persist directory: {atlas_cache_path or '(in-memory)'}\n"
-                    f"Please load author styles first using:\n"
-                    f"  python scripts/load_style.py --style-file <file> --author <name>"
-                )
-                raise ValueError(error_msg)
+                if verbose:
+                    print(f"  Generated (initial draft): {generated}")
 
-            # Create a minimal atlas object from existing collection
-            # We'll need cluster_ids, but we can get them from metadata
-            all_results = collection.get(include=["metadatas"])
-            cluster_ids = {}
-            for idx, meta in enumerate(all_results.get('metadatas', [])):
-                para_id = all_results['ids'][idx]
-                cluster_id = meta.get('cluster_id', 0)
-                cluster_ids[para_id] = cluster_id
+                # Step 5: Validate initial draft (with style whitelist)
+                result = critic.evaluate(generated, blueprint, allowed_style_words=style_lexicon)
 
-            # Create StyleAtlas object
-            from src.atlas.builder import StyleAtlas
-            atlas = StyleAtlas(
-                collection_name=collection_name,
-                cluster_ids=cluster_ids,
-                cluster_centers=np.array([]),  # Not needed for retrieval
-                style_vectors=[],  # Not needed for retrieval
-                num_clusters=len(set(cluster_ids.values()))
-            )
-            atlas._client = client
-            atlas._collection = collection
+                if verbose:
+                    print(f"  Critic Result: pass={result['pass']}, score={result['score']:.2f}")
+                    print(f"    Recall: {result['recall_score']:.2f}, Precision: {result['precision_score']:.2f}")
+                    if not result['pass']:
+                        print(f"    Feedback: {result['feedback']}")
 
-            total_count = collection.count() if hasattr(collection, 'count') else len(cluster_ids)
-            print(f"  ✓ Connected to ChromaDB collection with {total_count} paragraphs")
-
-        except ValueError:
-            # Re-raise ValueError with our helpful message
-            raise
-        except Exception as e:
-            error_msg = (
-                f"ChromaDB collection '{collection_name}' is not accessible.\n"
-                f"Persist directory: {atlas_cache_path or '(in-memory)'}\n"
-                f"Error: {type(e).__name__}: {e}\n"
-                f"Please load author styles first using:\n"
-                f"  python scripts/load_style.py --style-file <file> --author <name>"
-            )
-            raise ValueError(error_msg) from e
-
-    # Initialize StyleBlender if in blend mode
-    if is_blend_mode:
-        try:
-            style_blender = StyleBlender(atlas)
-            print(f"  ✓ Initialized StyleBlender for blend mode")
-        except Exception as e:
-            print(f"  ⚠ Failed to initialize StyleBlender: {e}")
-            print(f"  Falling back to single-author mode")
-            is_blend_mode = False
-
-    # Extract Style DNA for authors
-    style_dna_dict = {}
-    if atlas and atlas.author_style_dna:
-        style_dna_dict = atlas.author_style_dna.copy()
-        if style_dna_dict:
-            print(f"  ✓ Loaded Style DNA for {len(style_dna_dict)} author(s)")
-            for author, dna in style_dna_dict.items():
-                print(f"    - {author}: {dna[:60]}..." if len(dna) > 60 else f"    - {author}: {dna}")
-
-    # Build cluster Markov chain
-    print("Phase 1: Building cluster Markov chain...")
-    cluster_markov = build_cluster_markov(atlas)
-    print(f"  ✓ Built Markov chain with {len(cluster_markov[1])} clusters")
-
-    # Initialize StructureNavigator for stochastic selection
-    print("Phase 1: Initializing structure navigator...")
-    structure_navigator = StructureNavigator(history_limit=3)
-    print(f"  ✓ Initialized structure navigator")
-
-    # Global vocabulary extraction
-    # In blend mode, vocabulary is handled by StyleBlender
-    # In single-author mode, we use situation matches for vocabulary, so global vocab is optional
-    global_vocab_dict = {'positive': [], 'negative': [], 'neutral': []}
-    if not is_blend_mode:
-        # For single-author mode, vocabulary comes from situation matches
-        # Global vocabulary injection is optional and can be skipped
-        print("Phase 1: Using situation matches for vocabulary (global vocab injection disabled)")
-
-    # Phase 2: Extract meaning from input
-    print("Phase 2: Extracting meaning...")
-    content_units = extract_meaning(input_text)
-    print(f"  Extracted {len(content_units)} content units")
-
-    # Group content units by paragraph
-    paragraphs_content = []
-    current_para = []
-    current_para_idx = -1
-
-    for unit in content_units:
-        if unit.paragraph_idx != current_para_idx:
-            if current_para:
-                paragraphs_content.append(current_para)
-            current_para = [unit]
-            current_para_idx = unit.paragraph_idx
-        else:
-            current_para.append(unit)
-
-    if current_para:
-        paragraphs_content.append(current_para)
-
-    print(f"  Grouped into {len(paragraphs_content)} paragraphs")
-
-    # Phase 3-5: Process each paragraph
-    final_output = []
-    generated_text_so_far = []
-    current_cluster = None
-
-    # Open output file for incremental writing if provided
-    output_handle = None
-    if output_file:
-        output_path = Path(output_file)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_handle = open(output_file, 'w', encoding='utf-8')
-        print(f"Writing output incrementally to: {output_file}")
-
-    try:
-        for para_idx, para_units in enumerate(paragraphs_content):
-            print(f"\nProcessing paragraph {para_idx + 1}/{len(paragraphs_content)}")
-
-            # Determine current cluster
-            if current_cluster is None:
-                # First paragraph - use first cluster or predict from start
-                current_cluster = 0 if atlas.num_clusters > 0 else None
-            else:
-                # Predict next cluster
-                current_cluster = predict_next_cluster(current_cluster, cluster_markov)
-
-            print(f"  Current style cluster: {current_cluster}")
-
-            # Process sentences in chunks of 3 (sliding window approach)
-            para_output = []
-            window_size = 3
-
-            # Process in chunks
-            for chunk_start in range(0, len(para_units), window_size):
-                chunk_units = para_units[chunk_start:chunk_start + window_size]
-                chunk_sentences = [unit.original_text for unit in chunk_units]
-
-                print(f"  Processing chunk {chunk_start // window_size + 1} ({len(chunk_sentences)} sentences)")
-
-                # Retrieve window match (The "Zipper" method)
-                window_matches = None
-                if not is_blend_mode:
-                    # Single-author mode: use window retrieval
-                    window_matches = retrieve_window_match(
-                        atlas,
-                        chunk_sentences,
-                        target_cluster_id=current_cluster,
-                        similarity_threshold=similarity_threshold
-                    )
-                    if window_matches:
-                        print(f"    Retrieved window match with {len(window_matches)} skeletons")
-
-                # Process each sentence in the chunk
-                for unit_idx_in_chunk, content_unit in enumerate(chunk_units):
-                    unit_idx = chunk_start + unit_idx_in_chunk
-                    print(f"  Processing sentence {unit_idx + 1}/{len(para_units)}")
-                    print(f"    Original: {content_unit.original_text}")
-
-                    # Initialize structure_match and situation_match
-                    structure_match = None
-                    situation_match = None
-
-                    # Retrieve dual RAG references (blend mode vs single-author mode)
-                    if is_blend_mode and style_blender and len(blend_authors) >= 2:
-                        # Blend mode: use StyleBlender to find bridge texts
-                        author_a = blend_authors[0]
-                        author_b = blend_authors[1]
-
-                        # Get blended structure match (bridge text)
-                        structure_match = style_blender.retrieve_blended_template(
-                            author_a=author_a,
-                            author_b=author_b,
-                            blend_ratio=final_blend_ratio,
-                            max_paragraphs_to_check=max_paragraphs_to_check
-                        )
-
-                        # For situation match, still use semantic similarity (could be enhanced later)
-                        situation_match = find_situation_match(
-                            atlas,
-                            content_unit.original_text,
-                            similarity_threshold=similarity_threshold
-                        )
-                    else:
-                        # Single-author mode: use window retrieval if available
-                        if window_matches and unit_idx_in_chunk < len(window_matches):
-                            # Use skeleton from window match (The "Zipper")
-                            _, structure_match = window_matches[unit_idx_in_chunk]
-
-                            # SAFETY CHECK: Verify length before committing
-                            # This catches edge cases where a 3-word skeleton might still be garbage
-                            if len(structure_match.split()) < 3:
-                                print(f"    ⚠ Window match '{structure_match[:50]}...' is too short. Fallback triggered.")
-                                structure_match = None  # Triggers the fallback block below
-
-                            if structure_match:
-                                print(f"    Retrieved structure match from window (rhythm): {structure_match[:80]}...")
-
-                        # Fallback: Use find_structure_match if window match failed or was invalid
-                        if not structure_match:
-                            # Get length tolerance from config
-                            length_tolerance = atlas_config.get("length_tolerance", 0.3)
-                            structure_match = find_structure_match(
-                                atlas,
-                                current_cluster,
-                                input_text=content_unit.original_text,
-                                length_tolerance=length_tolerance,
-                                navigator=structure_navigator
-                            )
-
-                        # Situation match for vocabulary
-                        situation_match = find_situation_match(
-                            atlas,
-                            content_unit.original_text,
-                            similarity_threshold=similarity_threshold
-                        )
-
-                    if situation_match:
-                        print(f"    Retrieved situation match (vocabulary): {situation_match[:80]}...")
-                    else:
-                        print(f"    ⚠ No situation match found (similarity < {similarity_threshold}). Using structure match only.")
-
-                    if structure_match:
-                        print(f"    Retrieved structure match (rhythm): {structure_match[:80]}...")
-                    else:
-                        # Fallback: Generate synthetic template instruction
-                        # If no template exists within acceptable length range, create a synthetic one
-                        input_word_count = len(content_unit.original_text.split())
-                        cluster_style_desc = f"cluster {current_cluster} style" if current_cluster is not None else "target style"
-                        structure_match = f"Create a sentence of approximately {input_word_count} words using {cluster_style_desc} syntax."
-                        print(f"    ⚠ No structure match found for cluster {current_cluster}. Using synthetic template: {structure_match}")
-
-                    # Determine vocabulary list
-                    if is_blend_mode and style_blender and len(blend_authors) >= 2:
-                        # Blend mode: get hybrid vocabulary
-                        author_a = blend_authors[0]
-                        author_b = blend_authors[1]
-                        global_vocab_list = style_blender.get_hybrid_vocab(
-                            author_a=author_a,
-                            author_b=author_b,
-                            ratio=final_blend_ratio
-                        )
-                    else:
-                        # Single-author mode: vocabulary comes from situation matches
-                        # ALSO: Extract global vocabulary from atlas if available
-                        global_vocab_list = []
-                        if atlas and hasattr(atlas, 'top_vocab') and atlas.top_vocab:
-                            # Get author name from config or blend_authors
-                            author_name = blend_authors[0] if blend_authors else None
-                            if author_name and author_name in atlas.top_vocab:
-                                global_vocab_list = atlas.top_vocab[author_name]
-
-                    # Calculate adaptive threshold based on structure match quality
-                    # If structure match is very different from input, lower the threshold
-                    from src.utils import calculate_length_ratio, is_very_different_length, is_moderate_different_length
-
-                    length_ratio = calculate_length_ratio(
-                        structure_match if structure_match else "",
-                        content_unit.original_text if content_unit.original_text else ""
-                    )
-
-                    # Get thresholds from config
-                    adaptive_threshold_base = critic_config.get("adaptive_threshold_base", 0.6)
-                    adaptive_threshold_moderate = critic_config.get("adaptive_threshold_moderate", 0.65)
-                    adaptive_threshold_penalty_high = critic_config.get("adaptive_threshold_penalty_high", 0.15)
-                    adaptive_threshold_penalty_moderate = critic_config.get("adaptive_threshold_penalty_moderate", 0.1)
-
-                    adaptive_min_score = critic_min_score
-                    if is_very_different_length(length_ratio, config_path=config_path):
-                        # Structure match is very different, be more lenient
-                        adaptive_min_score = max(adaptive_threshold_base, critic_min_score - adaptive_threshold_penalty_high)
-                        print(f"    ⚠ Structure match length ratio {length_ratio:.2f} is very different, lowering threshold to {adaptive_min_score:.2f}")
-                    elif is_moderate_different_length(length_ratio, config_path=config_path):
-                        # Structure match is moderately different, slightly lower threshold
-                        adaptive_min_score = max(adaptive_threshold_moderate, critic_min_score - adaptive_threshold_penalty_moderate)
-                        print(f"    ⚠ Structure match length ratio {length_ratio:.2f} is different, adjusting threshold to {adaptive_min_score:.2f}")
-
-                    # Generate with critic loop and pipeline-level retries
-                    generated = None
-                    critic_result = None
-                    final_score = 0.0
+                # If initial draft fails, evolve it using hill climbing
+                if not result["pass"]:
+                    if verbose:
+                        print(f"  ↻ Initial draft failed, evolving with hill climbing...")
 
                     try:
-                        # Pipeline-level retry loop
-                        for pipeline_attempt in range(critic_max_pipeline_retries + 1):
-                            try:
-                                # Determine author names for prompt (for blend mode)
-                                author_names = None
-                                if is_blend_mode and len(blend_authors) >= 2:
-                                    author_names = blend_authors
+                        generated, final_score = translator._evolve_text(
+                            initial_draft=generated,
+                            blueprint=blueprint,
+                            author_name=author_name,
+                            style_dna=style_dna,
+                            rhetorical_type=rhetorical_type,
+                            initial_score=result["score"],
+                            initial_feedback=result["feedback"],
+                            critic=critic,
+                            verbose=verbose,
+                            style_dna_dict=style_dna_dict,
+                            examples=examples
+                        )
 
-                                generated, critic_result = generate_with_critic(
-                                    generate_fn=lambda cu, struct_match, sit_match, cfg, **kwargs: generate_sentence(
-                                        cu, struct_match, sit_match, cfg,
-                                        global_vocab_list=global_vocab_list,
-                                        author_names=author_names,
-                                        blend_ratio=final_blend_ratio if is_blend_mode else None,
-                                        style_dna_dict=style_dna_dict,
-                                        **kwargs
-                                    ),
-                                    content_unit=content_unit,
-                                    structure_match=structure_match,
-                                    situation_match=situation_match,
-                                    config_path=config_path,
-                                    max_retries=critic_max_retries,
-                                    min_score=adaptive_min_score,  # Use adaptive threshold
-                                    atlas=atlas,
-                                    target_cluster_id=current_cluster,
-                                    structure_navigator=structure_navigator,
-                                    similarity_threshold=similarity_threshold
-                                )
+                        # Re-evaluate evolved draft
+                        result = critic.evaluate(generated, blueprint)
 
-                                score = critic_result.get("score", 0.0)
-                                final_score = score
-
-                                # Log attempt
-                                if pipeline_attempt > 0:
-                                    print(f"    Pipeline retry {pipeline_attempt}: Score {score:.3f}")
-
-                                # Check if score is acceptable for pipeline
-                                if score >= critic_min_pipeline_score:
-                                    break  # Good enough, proceed
-
-                                # If score too low and we have more retries, continue
-                                if pipeline_attempt < critic_max_pipeline_retries:
-                                    print(f"    ⚠ Score {score:.3f} below pipeline threshold {critic_min_pipeline_score}, retrying...")
-                                    # Refresh structure/situation matches for next attempt
-                                    print(f"    🔄 Refreshing structure and situation matches at pipeline level...")
-
-                                    # Refresh structure match (only in single-author mode, blend mode uses different logic)
-                                    if not is_blend_mode:
-                                        if window_matches and unit_idx_in_chunk < len(window_matches):
-                                            _, structure_match = window_matches[unit_idx_in_chunk]
-                                            print(f"    Retrieved new structure match from window (rhythm): {structure_match[:80]}...")
-                                        else:
-                                            structure_match = find_structure_match(
-                                                atlas,
-                                                current_cluster,
-                                                input_text=content_unit.original_text,
-                                                length_tolerance=atlas_config.get("length_tolerance", 0.3),
-                                                navigator=structure_navigator
-                                            )
-                                            if structure_match:
-                                                print(f"    Retrieved new structure match (rhythm): {structure_match[:80]}...")
-
-                                    # Refresh situation match
-                                    situation_match = find_situation_match(
-                                        atlas,
-                                        content_unit.original_text,
-                                        similarity_threshold=similarity_threshold
-                                    )
-                                    if situation_match:
-                                        print(f"    Retrieved new situation match (vocabulary): {situation_match[:80]}...")
-                                else:
-                                    # Last attempt, accept what we have but warn
-                                    print(f"    ⚠ Final score {score:.3f} below pipeline threshold {critic_min_pipeline_score} after all retries")
-
-                            except ConvergenceError as e:
-                                # Critic loop failed to converge
-                                if pipeline_attempt < critic_max_pipeline_retries:
-                                    print(f"    ⚠ Critic convergence failed: {e}")
-                                    print(f"    Retrying at pipeline level (attempt {pipeline_attempt + 1}/{critic_max_pipeline_retries + 1})...")
-                                    continue
-                                else:
-                                    # No more retries, raise the error
-                                    raise
-
-                        # Log final result
-                        passed = critic_result.get("pass", False) if critic_result else False
-                        print(f"    Generated: {generated}")
-                        print(f"    DEBUG: Full original input: '{content_unit.original_text}'")
-                        print(f"    DEBUG: Full generated output: '{generated}'")
-                        print(f"    Critic score: {final_score:.3f} (pass: {passed})")
-
-                        if not passed:
-                            feedback = critic_result.get("feedback", "") if critic_result else ""
-                            if feedback:
-                                print(f"    Critic feedback: {feedback[:100]}...")
-
-                        # Warn if score is still low
-                        if final_score < critic_min_pipeline_score:
-                            print(f"    ⚠ WARNING: Final score {final_score:.3f} is below pipeline threshold {critic_min_pipeline_score}")
-
-                        para_output.append(generated)
-                        generated_text_so_far.append(generated)
-
-                        # Write sentence immediately to output file
-                        if output_handle:
-                            # Add space before sentence if not first in paragraph
-                            if unit_idx > 0:
-                                output_handle.write(" ")
-                            output_handle.write(generated)
-                            output_handle.flush()  # Ensure immediate write
-
-                        # Print final score summary before moving to next sentence
-                        print(f"    ✓ Final score: {final_score:.3f} (pass: {passed})")
-
-                        # Add blank line before next sentence for readability
-                        if unit_idx < len(para_units) - 1:
-                            print()
-
-                    except ConvergenceError as e:
-                        print(f"    ✗ CRITICAL: Failed to converge after all retries: {e}")
-                        # Use original text as fallback
-                        fallback_text = content_unit.original_text
-                        para_output.append(fallback_text)
-                        generated_text_so_far.append(fallback_text)
-
-                        # Write fallback text immediately to output file
-                        if output_handle:
-                            # Add space before sentence if not first in paragraph
-                            if unit_idx > 0:
-                                output_handle.write(" ")
-                            output_handle.write(fallback_text)
-                            output_handle.flush()  # Ensure immediate write
-
-                        print(f"    ⚠ Using original text due to convergence failure")
-
+                        if verbose:
+                            print(f"  Evolution Result: pass={result['pass']}, score={result['score']:.2f}")
+                            if result['pass']:
+                                print(f"    ✓ Evolution successful: Score improved to {result['score']:.2f}")
+                                print(f"    Evolved text: {generated}")
+                            else:
+                                print(f"    ✗ Evolution failed: Final score {result['score']:.2f}")
+                                print(f"    Evolved text: {generated}")
                     except Exception as e:
-                        print(f"    ⚠ Generation failed: {e}")
-                        import traceback
-                        traceback.print_exc()
-                        # Fallback: use original text
-                        fallback_text = content_unit.original_text
-                        para_output.append(fallback_text)
-                        generated_text_so_far.append(fallback_text)
+                        if verbose:
+                            print(f"  ⚠ Evolution failed with exception: {e}")
+                        # Continue with initial draft
 
-                        # Write fallback text immediately to output file
-                        if output_handle:
-                            # Add space before sentence if not first in paragraph
-                            if unit_idx > 0:
-                                output_handle.write(" ")
-                            output_handle.write(fallback_text)
-                            output_handle.flush()  # Ensure immediate write
+            except Exception as e:
+                print(f"Warning: Initial generation failed: {e}")
+                result = None
 
-            # Combine paragraph sentences (for return value)
-            para_text = " ".join(para_output)
-            final_output.append(para_text)
+            # Step 6: Accept or fallback
+            # Soft Landing: If we have a decent draft (Score >= 0.75), KEEP IT.
+            # This prevents throwing away good work (e.g., 0.81 scores) just because pass=False
+            if result and result.get("score", 0.0) >= 0.75:
+                # Accept even if pass=False - score >= 0.75 is good enough
+                # DEBUG: Before appending, verify we haven't seen this before
+                if generated in generated_sentences:
+                    print(f"  ⚠ WARNING: Duplicate generated sentence detected!")
+                    if verbose:
+                        print(f"    Generated text: {generated[:80]}...")
+                        print(f"    This sentence was already generated at an earlier index")
+                        # Find where it was first generated
+                        first_idx = next(i for i, s in enumerate(generated_sentences) if s == generated)
+                        print(f"    First occurrence was at sentence index {first_idx}")
+                    # Skip duplicate - don't append again
+                    if verbose:
+                        print(f"  ✓ Accepted (but skipped duplicate)")
+                else:
+                    generated_sentences.append(generated)
+                    current_paragraph_sentences.append(generated)
 
-            # Add paragraph break if not last paragraph (sentences already written)
-            if output_handle and para_idx < len(paragraphs_content) - 1:
-                output_handle.write("\n\n")
-                output_handle.flush()
+                    # Update context for next iteration
+                    previous_generated_text = generated
 
-            # Update current cluster based on generated text
-            current_cluster = _determine_current_cluster(generated_text_so_far, atlas)
-            if current_cluster is not None:
-                print(f"  ✓ Paragraph complete. Next cluster: {current_cluster}")
+                    # Write sentence immediately if callback provided
+                    if write_callback:
+                        is_new_paragraph = (sent_idx == 0)
+                        write_callback(generated, is_new_paragraph, is_first_paragraph)
+                        if is_new_paragraph and is_first_paragraph:
+                            is_first_paragraph = False
 
-    finally:
-        if output_handle:
-            output_handle.close()
-            print(f"\n✓ Output file closed: {output_file}")
+                    if verbose:
+                        pass_status = "PASS" if result.get("pass", False) else "SOFT PASS"
+                        print(f"  ✓ Accepted ({pass_status}, score: {result.get('score', 0.0):.2f}): {generated}")
+            elif result and result.get("score", 0.0) < 0.60:
+                # Evolution failed or initial generation failed, use literal translation fallback
+                # Lowered threshold to 0.60 to avoid discarding "diamonds in the rough" (good style, minor issues)
+                if verbose:
+                    print(f"  ↻ Evolution/Generation failed (score < 0.60), using literal translation")
+                try:
+                    # Pass rhetorical_type and examples for style-preserving fallback
+                    generated = translator.translate_literal(
+                        blueprint=blueprint,
+                        author_name=author_name,
+                        style_dna=style_dna,
+                        rhetorical_type=rhetorical_type,
+                        examples=examples
+                    )
+                    if verbose:
+                        print(f"  Style-preserving fallback: {generated}")
 
-    return final_output
+                    # DEBUG: Check for duplicate before appending
+                    if generated in generated_sentences:
+                        print(f"  ⚠ WARNING: Duplicate generated sentence detected (literal fallback)!")
+                        if verbose:
+                            print(f"    Generated text: {generated[:80]}...")
+                    else:
+                        generated_sentences.append(generated)
+                        current_paragraph_sentences.append(generated)
+
+                        # Update context for next iteration
+                        previous_generated_text = generated
+
+                        # Write sentence immediately if callback provided
+                        if write_callback:
+                            is_new_paragraph = (sent_idx == 0)
+                            write_callback(generated, is_new_paragraph, is_first_paragraph)
+                            if is_new_paragraph and is_first_paragraph:
+                                is_first_paragraph = False
+
+                        if verbose:
+                            print(f"  ✓ Accepted (literal fallback): {generated}")
+                except Exception as e:
+                    print(f"Warning: Literal translation failed: {e}")
+                    # Ultimate fallback: use original sentence
+                    if verbose:
+                        print(f"  ↻ Using original sentence as fallback")
+
+                    # DEBUG: Check for duplicate before appending
+                    if sentence in generated_sentences:
+                        print(f"  ⚠ WARNING: Duplicate generated sentence detected (ultimate fallback)!")
+                    else:
+                        generated_sentences.append(sentence)
+                        current_paragraph_sentences.append(sentence)
+
+                        # Update context for next iteration (use original sentence as context)
+                        previous_generated_text = sentence
+
+                        # Write sentence immediately if callback provided
+                        if write_callback:
+                            is_new_paragraph = (sent_idx == 0)
+                            write_callback(sentence, is_new_paragraph, is_first_paragraph)
+                            if is_new_paragraph and is_first_paragraph:
+                                is_first_paragraph = False
+
+                        if verbose:
+                            print(f"  ✓ Accepted (original fallback): {sentence}")
+
+        # Join sentences within paragraph with spaces
+        if generated_sentences:
+            para_text = ' '.join(generated_sentences)
+            if verbose:
+                print(f"\n  Paragraph output: {para_text[:100]}{'...' if len(para_text) > 100 else ''}")
+            generated_paragraphs.append(para_text)
+
+            # Reset for next paragraph
+            current_paragraph_sentences = []
+
+    return generated_paragraphs
 
 
 def run_pipeline(
@@ -662,9 +561,10 @@ def run_pipeline(
     output_file: Optional[str] = None,
     max_retries: int = 3,
     atlas_cache_path: Optional[str] = None,
-    blend_ratio: Optional[float] = None
+    blend_ratio: Optional[float] = None,
+    verbose: bool = False
 ) -> List[str]:
-    """Run the Style Atlas pipeline with file I/O.
+    """Run the pipeline with file I/O.
 
     Args:
         input_file: Path to input text file (optional if input_text provided).
@@ -673,10 +573,10 @@ def run_pipeline(
         output_file: Optional path to save output.
         max_retries: Maximum number of retries per generation.
         atlas_cache_path: Optional path to ChromaDB persistence directory (falls back to config.json if None).
-        blend_ratio: Optional blend ratio for style mixing (overrides config.json).
+        blend_ratio: Optional blend ratio for style mixing (ignored in Pipeline 2.0, kept for compatibility).
 
     Returns:
-        List of generated paragraphs.
+        List of generated paragraphs (each paragraph is a space-joined string of sentences).
     """
     # Load input text
     if input_text is None:
@@ -685,20 +585,123 @@ def run_pipeline(
         with open(input_file, 'r', encoding='utf-8') as f:
             input_text = f.read()
 
+    # Load config
+    with open(config_path, 'r') as f:
+        config = json.load(f)
+
     # Resolve atlas_cache_path from config if not provided
     if atlas_cache_path is None:
-        with open(config_path, 'r') as f:
-            config = json.load(f)
         atlas_cache_path = config.get("atlas", {}).get("persist_path")
 
-    # Run pipeline
-    output = process_text(
-        input_text=input_text,
-        config_path=config_path,
-        max_retries=max_retries,
-        output_file=output_file,
-        atlas_cache_path=atlas_cache_path,
-        blend_ratio=blend_ratio
-    )
+    # Load atlas
+    if atlas_cache_path:
+        atlas_file = Path(atlas_cache_path) / "atlas.json"
+        if atlas_file.exists():
+            atlas = load_atlas(str(atlas_file), persist_directory=atlas_cache_path)
+        else:
+            raise FileNotFoundError(
+                f"Atlas file not found: {atlas_file}. "
+                "Please build the atlas first using: python scripts/load_style.py"
+            )
+    else:
+        raise ValueError("Atlas cache path not specified. Set in config.json or via --atlas-cache")
+
+    # Get author name from config
+    blend_config = config.get("blend", {})
+    authors = blend_config.get("authors", [])
+    if not authors:
+        raise ValueError("No authors specified in config.json. Set 'blend.authors' to a list of author names.")
+    author_name = authors[0]  # Use first author (Pipeline 2.0 doesn't support blending yet)
+
+    # Get style DNA from registry
+    if atlas_cache_path:
+        registry = StyleRegistry(atlas_cache_path)
+        exists, suggestion = registry.validate_author(author_name)
+        if not exists:
+            print(f"Warning: Author '{author_name}' not found in registry.")
+            if suggestion:
+                print(f"  {suggestion}")
+
+        style_dna = registry.get_dna(author_name)
+        if not style_dna:
+            # Fallback: try to get from atlas
+            style_dna = atlas.author_style_dna.get(author_name, "")
+            if not style_dna:
+                print(f"Warning: No Style DNA found for '{author_name}'. Using empty DNA.")
+                available = list(registry.get_all_profiles().keys())
+                if available:
+                    print(f"Available authors in registry: {', '.join(sorted(available))}")
+                print(f"Generate Style DNA using: python scripts/generate_style_dna.py --author '{author_name}'")
+                style_dna = ""
+        else:
+            if verbose:
+                print(f"  ✓ Loaded Style DNA from registry for '{author_name}'")
+    else:
+        style_dna = atlas.author_style_dna.get(author_name, "")
+
+    # Open output file early if specified
+    output_file_handle = None
+    write_callback = None
+
+    if output_file:
+        output_path = Path(output_file)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file_handle = open(output_path, 'w', encoding='utf-8')
+
+        # Track state for incremental writing
+        is_first_sentence = True
+        is_first_in_paragraph = True
+
+        def write_sentence(sentence: Optional[str], is_new_paragraph: bool, is_first_paragraph: bool):
+            """Write sentence incrementally to file.
+
+            Args:
+                sentence: Sentence text to write, or None for paragraph break.
+                is_new_paragraph: Whether this is the first sentence of a new paragraph.
+                is_first_paragraph: Whether this is the very first paragraph.
+            """
+            nonlocal is_first_sentence, is_first_in_paragraph
+
+            if sentence is None:
+                # Paragraph break
+                output_file_handle.write('\n\n')
+                is_first_in_paragraph = True
+            else:
+                # Write sentence
+                if is_new_paragraph and not is_first_paragraph:
+                    # Start new paragraph (add paragraph break before)
+                    output_file_handle.write('\n\n')
+                    is_first_in_paragraph = True  # Reset for new paragraph
+
+                if is_first_in_paragraph:
+                    # First sentence in paragraph - no leading space
+                    output_file_handle.write(sentence)
+                    is_first_in_paragraph = False
+                else:
+                    # Subsequent sentence - add space before
+                    output_file_handle.write(' ' + sentence)
+
+                is_first_sentence = False
+                output_file_handle.flush()  # Ensure immediate write to disk
+
+        write_callback = write_sentence
+
+    try:
+        # Process text
+        output = process_text(
+            verbose=verbose,
+            input_text=input_text,
+            atlas=atlas,
+            author_name=author_name,
+            style_dna=style_dna,
+            config_path=config_path,
+            max_retries=max_retries,
+            write_callback=write_callback
+        )
+    finally:
+        # Close file if we opened it
+        if output_file_handle:
+            output_file_handle.close()
 
     return output
+

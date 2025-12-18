@@ -16,5 +16,11 @@ YOUR DIRECTIVES:
    - **PREFERENCE: Minimize em-dashes (—) in your output. Prefer commas, parentheses, or restructuring sentences. Only use em-dashes if the Structural Reference explicitly requires them.**
 4. PRESERVE REFERENCES AND QUOTATIONS: All [^number] style citation references and all direct quotations must be preserved EXACTLY as they appear in the original. This is non-negotiable.
 5. NO AI TROPES: Do not use flowery, generic AI language. Be specific, grounded, and human.
-6. Generate ONLY the rewritten text, nothing else (no explanations, no notes).
+6. LOGICAL CONSISTENCY: Modifiers must logically match the noun's definition.
+   - **Analyze Key Concepts:** Before rewriting, understand the definition of your Keywords (e.g., "Finitude" means "having limits").
+   - **Modifier Alignment:** Do NOT use adjectives or adverbs that contradict the definition of the noun.
+     - *Bad Example:* "Ceaseless finitude" (Contradiction: Unending End).
+     - *Good Example:* "Strict finitude" or "Inescapable finitude" (Reinforcement).
+   - **Avoid Oxymorons:** Unless the Rhetorical Type is specifically "PARADOX," avoid conflicting terms.
+7. Generate ONLY the rewritten text, nothing else (no explanations, no notes).
 

@@ -9,6 +9,7 @@ This module builds a Style Atlas by:
 
 import json
 import pickle
+import random
 from pathlib import Path
 from typing import Dict, List, Optional
 from dataclasses import dataclass, asdict
@@ -98,6 +99,203 @@ class StyleAtlas:
         if isinstance(self.style_vectors, list):
             self.style_vectors = [np.array(v) if not isinstance(v, np.ndarray) else v
                                  for v in self.style_vectors]
+
+    def get_examples_by_rhetoric(
+        self,
+        rhetorical_type,
+        top_k: int = 3,
+        exclude: Optional[List[str]] = None,
+        author_name: Optional[str] = None,
+        query_text: Optional[str] = None
+    ) -> List[str]:
+        """Get examples from atlas using 4-Tier Fallback Strategy.
+
+        Tier 1: Perfect Match (Rhetorical Type + Length ±30%)
+        Tier 2: Length Match (Ignore Rhetorical Type, Match Length ±30%)
+        Tier 3: Type Match (Ignore Length, Match Rhetorical Type)
+        Tier 4: Desperate (Vector similarity, author only)
+
+        Args:
+            rhetorical_type: RhetoricalType enum value to filter by.
+            top_k: Number of examples to return (default: 3).
+            exclude: Optional list of text strings to exclude from results.
+            author_name: Optional author name to filter examples by.
+            query_text: Optional query text to calculate length window for filtering.
+
+        Returns:
+            List of example text strings. Only returns empty if database is completely empty.
+        """
+        if not CHROMADB_AVAILABLE:
+            return []
+
+        # Import here to avoid circular dependency
+        from src.atlas.rhetoric import RhetoricalType
+
+        # Handle string input (for flexibility)
+        if isinstance(rhetorical_type, str):
+            # Try to match to enum
+            for rtype in RhetoricalType:
+                if rtype.value == rhetorical_type:
+                    rhetorical_type = rtype
+                    break
+            else:
+                # Not found, try Tier 4 (desperate)
+                return self._tier4_vector_search(query_text, author_name, top_k, exclude)
+
+        try:
+            # Get collection
+            if not hasattr(self, '_collection'):
+                if hasattr(self, '_client'):
+                    self._collection = self._client.get_collection(name=self.collection_name)
+                else:
+                    return []
+
+            collection = self._collection
+
+            # Calculate length window if query_text provided
+            min_length = None
+            max_length = None
+            if query_text:
+                input_length = len(query_text)
+                min_length = int(input_length * 0.7)
+                max_length = int(input_length * 1.3)
+
+            # TIER 1: Perfect Match - Rhetorical Type + Length ±30%
+            if query_text and min_length and max_length:
+                where_conditions = [
+                    {"rhetorical_type": rhetorical_type.value},
+                    {"text_length": {"$gte": min_length}},
+                    {"text_length": {"$lte": max_length}}
+                ]
+                if author_name:
+                    where_conditions.append({"author_id": author_name})
+
+                where_clause = {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
+
+                try:
+                    results = collection.get(where=where_clause, limit=top_k * 2)
+                    if results and results.get('documents'):
+                        examples = self._filter_and_shuffle(results['documents'], exclude, top_k)
+                        if examples:
+                            return examples
+                except Exception:
+                    pass  # Fall through to Tier 2
+
+            # TIER 2: Length Match - Ignore Rhetorical Type, Match Length ±30%
+            # (Better to have the right rhythm than the right logic)
+            if query_text and min_length and max_length:
+                where_conditions = [
+                    {"text_length": {"$gte": min_length}},
+                    {"text_length": {"$lte": max_length}}
+                ]
+                if author_name:
+                    where_conditions.append({"author_id": author_name})
+
+                where_clause = {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
+
+                try:
+                    results = collection.get(where=where_clause, limit=top_k * 2)
+                    if results and results.get('documents'):
+                        examples = self._filter_and_shuffle(results['documents'], exclude, top_k)
+                        if examples:
+                            return examples
+                except Exception:
+                    pass  # Fall through to Tier 3
+
+            # TIER 3: Type Match - Ignore Length, Match Rhetorical Type
+            # (Better to have the right logic than the right rhythm)
+            where_conditions = [{"rhetorical_type": rhetorical_type.value}]
+            if author_name:
+                where_conditions.append({"author_id": author_name})
+
+            where_clause = {"$and": where_conditions} if len(where_conditions) > 1 else where_conditions[0]
+
+            try:
+                results = collection.get(where=where_clause, limit=top_k * 2)
+                if results and results.get('documents'):
+                    examples = self._filter_and_shuffle(results['documents'], exclude, top_k)
+                    if examples:
+                        return examples
+            except Exception:
+                pass  # Fall through to Tier 4
+
+            # TIER 4: Desperate - Vector similarity, author only
+            # Ignore everything, return top vector matches restricted ONLY by author
+            return self._tier4_vector_search(query_text, author_name, top_k, exclude)
+
+        except Exception as e:
+            # If anything fails, try Tier 4 as last resort
+            return self._tier4_vector_search(query_text, author_name, top_k, exclude)
+
+    def _filter_and_shuffle(self, documents: List[str], exclude: Optional[List[str]], top_k: int) -> List[str]:
+        """Filter out excluded texts and shuffle for variety."""
+        if exclude:
+            documents = [ex for ex in documents if ex not in exclude]
+        random.shuffle(documents)
+        return documents[:top_k]
+
+    def _tier4_vector_search(
+        self,
+        query_text: Optional[str],
+        author_name: Optional[str],
+        top_k: int,
+        exclude: Optional[List[str]]
+    ) -> List[str]:
+        """Tier 4: Vector similarity search restricted by author only.
+
+        Args:
+            query_text: Optional query text for semantic similarity.
+            author_name: Optional author name to filter by.
+            top_k: Number of results to return.
+            exclude: Optional list of texts to exclude.
+
+        Returns:
+            List of example text strings, or empty if database is empty.
+        """
+        try:
+            collection = self._collection
+
+            # Build where clause (author only)
+            where_clause = None
+            if author_name:
+                where_clause = {"author_id": author_name}
+
+            if query_text:
+                # Use vector similarity search
+                from sentence_transformers import SentenceTransformer
+                model = SentenceTransformer('all-MiniLM-L6-v2')
+                query_embedding = model.encode(query_text, normalize_embeddings=True)
+
+                results = collection.query(
+                    query_embeddings=[query_embedding.tolist()],
+                    n_results=top_k * 2,
+                    where=where_clause
+                )
+
+                if results and results.get('documents') and len(results['documents'][0]) > 0:
+                    examples = results['documents'][0]
+                    return self._filter_and_shuffle(examples, exclude, top_k)
+            else:
+                # No query text, just get random examples by author
+                results = collection.get(
+                    where=where_clause,
+                    limit=top_k * 2
+                )
+                if results and results.get('documents'):
+                    return self._filter_and_shuffle(results['documents'], exclude, top_k)
+
+            # If we get here, database might be empty
+            return []
+
+        except Exception:
+            # Last resort: try to get ANY documents
+            try:
+                results = collection.get(limit=top_k)
+                if results and results.get('documents'):
+                    return self._filter_and_shuffle(results['documents'], exclude, top_k)
+            except Exception:
+                pass
+            return []
 
 
 def _chunk_into_paragraphs(text: str) -> List[str]:
@@ -406,6 +604,16 @@ def build_style_atlas(
             word_count = len(combined_text.split())
             sentence_count = len(window["skeletons"])
 
+        # Calculate text_length (character count) for length window filtering
+        text_length = len(combined_text)
+
+        # Classify rhetorical type for this window
+        # Use the first sentence in the window for classification (representative)
+        from src.atlas.rhetoric import RhetoricalClassifier
+        classifier = RhetoricalClassifier()
+        first_sentence = window["skeletons"][0] if window["skeletons"] else combined_text
+        rhetorical_type = classifier.classify_heuristic(first_sentence)
+
         # Store skeletons (individual sentences) as JSON string in metadata
         # ChromaDB doesn't support lists, so we'll store as JSON string
         import json
@@ -416,7 +624,9 @@ def build_style_atlas(
             "word_count": word_count,
             "sentence_count": sentence_count,
             "skeletons": skeletons_json,  # JSON string of sentence list
-            "avg_length": int(window["avg_length"])
+            "avg_length": int(window["avg_length"]),
+            "text_length": text_length,  # Character count for length window filtering
+            "rhetorical_type": rhetorical_type.value  # Rhetorical type classification
         }
 
         # Add author_id if provided

@@ -24,6 +24,9 @@ HIERARCHY OF RULES (If conflicts arise, higher rules win):
    - CRITICAL: Title Case sentences (e.g., "The Human View Of Discrete Levels Scale...") are FORBIDDEN - they are word salad, not sentences
    - Check for incomplete thoughts, dangling clauses, and nonsensical constructions
    - Examples of semantic failures: "The code, even though it is embedded in every particle and field." (incomplete - missing main clause), "limits, even though they are only implied by an exterior." (incomplete fragment), "The Human View of Discrete Levels Scale as a Local Perspective Artifact Observe the Mandelbrot set." (word salad - jumble of keywords)
+   - **CRITICAL: Logical Contradictions:** Check if adjectives/adverbs contradict their nouns (e.g., "infinite boundary", "ceaseless limit", "ceaseless finitude").
+     - If found, mark as **CRITICAL FAILURE** with score 0.0 and provide feedback: "CRITICAL: Logical contradiction found: [Adjective] contradicts [Noun]. Use a modifier that aligns with the noun's definition."
+     - Examples to flag: "ceaseless finitude" (ceaseless = unending, finitude = having limits), "infinite boundary" (infinite = unlimited, boundary = limit), "eternal decay" (eternal = permanent, decay = deterioration)
    - If a sentence is grammatically correct but semantically incomplete/nonsensical, score MUST be 0.0
    - If grammar is broken or text is unreadable, this is a CRITICAL FAILURE - score MUST be 0.0
    - Examples of failures: "Human experience confirms finitude's rule?" (awkward phrasing), incomplete sentences, broken syntax, word salad
@@ -74,6 +77,7 @@ You must output JSON with:
   - MUST be false if grammar is broken, meaning is lost, or hallucinated proper nouns/entities appear
 - "feedback": string (ONE single, specific, actionable instruction. Do not list multiple errors. Pick the one that violates the highest priority rule. Format as direct editing instruction, not a review. Include specific metrics like word counts when relevant, e.g., "Current text has 25 words; Target has 12. Delete adjectives and split the relative clause.")
   - For grammar failures: "CRITICAL: Text contains grammatical errors. [specific error]. Rewrite with proper grammar."
+  - For logical contradictions: "CRITICAL: Logical contradiction found: [Adjective] contradicts [Noun]. Use a modifier that aligns with the noun's definition."
   - For hallucinated proper nouns/entities: "CRITICAL: Text contains proper noun/entity '[word]' that does not appear in original. Remove all proper nouns and entities not present in original text."
   - For meaning loss: "CRITICAL: Text omits [specific concept/fact] from original. Include all concepts from original text."
 - "score": float (0.0 to 1.0, where 1.0 is perfect style match)

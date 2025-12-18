@@ -8,7 +8,7 @@ ChromaDB index rebuilds.
 import json
 import os
 from datetime import datetime
-from typing import Dict, Optional
+from typing import Dict, Optional, Tuple
 
 
 class StyleRegistry:
@@ -52,8 +52,18 @@ class StyleRegistry:
         Returns:
             Style DNA string, or empty string if not found.
         """
+        # Try exact match first (fast path)
         profile = self.profiles.get(author_name, {})
-        return profile.get("style_dna", "")
+        if profile:
+            return profile.get("style_dna", "")
+
+        # Try case-insensitive match (handles "Mao" vs "mao" etc.)
+        author_lower = author_name.lower()
+        for key, profile in self.profiles.items():
+            if key.lower() == author_lower:
+                return profile.get("style_dna", "")
+
+        return ""
 
     def set_dna(self, author_name: str, dna: str):
         """Store Style DNA for an author.
@@ -93,4 +103,39 @@ class StyleRegistry:
             Dictionary of all author profiles.
         """
         return self.profiles.copy()
+
+    def validate_author(self, author_name: str) -> Tuple[bool, str]:
+        """Validate if an author exists in the registry.
+
+        Args:
+            author_name: Name of the author to check.
+
+        Returns:
+            Tuple of (exists: bool, suggestion: str)
+            If author doesn't exist, suggestion contains similar author names.
+        """
+        # Check exact match
+        if author_name in self.profiles:
+            return True, ""
+
+        # Check case-insensitive match
+        author_lower = author_name.lower()
+        matches = [key for key in self.profiles.keys() if key.lower() == author_lower]
+        if matches:
+            return True, f"Found as '{matches[0]}' (case difference)"
+
+        # Find similar names (simple fuzzy match)
+        available = list(self.profiles.keys())
+        suggestions = []
+        for key in available:
+            if author_lower in key.lower() or key.lower() in author_lower:
+                suggestions.append(key)
+
+        suggestion_msg = ""
+        if suggestions:
+            suggestion_msg = f"Did you mean: {', '.join(suggestions[:3])}?"
+        elif available:
+            suggestion_msg = f"Available authors: {', '.join(sorted(available))}"
+
+        return False, suggestion_msg
 

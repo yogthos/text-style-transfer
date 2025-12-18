@@ -545,7 +545,21 @@ def evaluate_style_match(
     style_examples_str = "\n".join([f"  - {ex}" for ex in style_examples]) if style_examples else "N/A"
 
     # Build evaluation prompt
-    evaluation_prompt = f"""Evaluate the following text transformation:
+    from pathlib import Path
+    prompts_dir = Path(__file__).parent.parent.parent / "prompts"
+    evaluation_template_path = prompts_dir / "scorer_evaluation_user.md"
+    system_template_path = prompts_dir / "scorer_evaluation_system.md"
+
+    if evaluation_template_path.exists():
+        evaluation_template = evaluation_template_path.read_text().strip()
+        evaluation_prompt = evaluation_template.format(
+            original_text=original_text,
+            generated_text=generated_text,
+            style_examples_str=style_examples_str
+        )
+    else:
+        # Fallback
+        evaluation_prompt = f"""Evaluate the following text transformation:
 
 ORIGINAL TEXT:
 {original_text}
@@ -576,7 +590,10 @@ FEEDBACK: [specific feedback on what's good/bad and how to improve]
 Be specific in your feedback. If style doesn't match, explain what's wrong (e.g., "too verbose", "not direct enough", "sentence structure too complex")."""
 
     # Call LLM evaluator
-    system_prompt = "You are an expert text evaluator. Provide clear, specific feedback and scores."
+    if system_template_path.exists():
+        system_prompt = system_template_path.read_text().strip()
+    else:
+        system_prompt = "You are an expert text evaluator. Provide clear, specific feedback and scores."
     response = llm.call(
         system_prompt=system_prompt,
         user_prompt=evaluation_prompt,

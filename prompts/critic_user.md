@@ -13,6 +13,9 @@ Evaluate the GENERATED TEXT against the HIERARCHY:
    - **CRITICAL**: Title Case sentences (e.g., "The Human View Of Discrete Levels Scale...") are FORBIDDEN - they are word salad, not sentences
    - Check for incomplete thoughts, dangling clauses, and nonsensical constructions
    - Examples of semantic failures: "The code, even though it is embedded in every particle and field." (incomplete - missing main clause), "limits, even though they are only implied by an exterior." (incomplete fragment), "The Human View of Discrete Levels Scale as a Local Perspective Artifact Observe the Mandelbrot set." (word salad - jumble of keywords)
+   - **CRITICAL: Logical Contradictions:** Check if adjectives/adverbs contradict their nouns (e.g., "infinite boundary", "ceaseless limit", "ceaseless finitude").
+     - If found, this is a CRITICAL FAILURE - mark "pass": false, "score": 0.0, "primary_failure_type": "grammar"
+     - Examples to flag: "ceaseless finitude" (ceaseless = unending, finitude = having limits), "infinite boundary" (infinite = unlimited, boundary = limit), "eternal decay" (eternal = permanent, decay = deterioration)
    - **CRITICAL**: If the Structural Reference uses em-dashes (—), colons (:), or other punctuation, and the Generated Text matches it, this is VALID STYLE, NOT a grammar error.
    - **NEVER flag punctuation as grammar error if it matches the Structural Reference.**
    - If grammar is broken, text is unreadable, OR text is semantically incomplete/nonsensical (AND it doesn't match the Structural Reference), this is a CRITICAL FAILURE - mark "pass": false, "score": 0.0, "primary_failure_type": "grammar"
@@ -35,6 +38,7 @@ Evaluate the GENERATED TEXT against the HIERARCHY:
    - If the Original Text contains multiple facts/concepts, verify ALL are present
    - If any facts, concepts, or details are missing, this is a CRITICAL FAILURE - mark "pass": false, "score": 0.0, "primary_failure_type": "meaning"
    - Examples: If original mentions "biological cycle", "stars", "logical trap", "container problem", "fractal model", "Mandelbrot set" - ALL must appear in output
+   - **CRITICAL - LIST PRESERVATION:** If the original contains lists (e.g., "birth, life, and decay"), ALL items in the list must appear in the output. Do NOT accept output that only includes some items (e.g., "birth" alone or "birth and decay" without "life"). Every item in every list must be present. Missing any item from a list is a CRITICAL FAILURE.
 3. STRUCTURAL RIGIDITY: Does it match the syntax/length/punctuation of the STRUCTURAL REFERENCE? (Second Priority)
 4. VOCABULARY FLAVOR: Does it use the word choices/tone of the SITUATIONAL REFERENCE? (Third Priority)
 
@@ -45,6 +49,7 @@ Format your feedback as a direct editing instruction with specific metrics when 
 Example: "Current text has 25 words; Target has 12. Delete adjectives and split the relative clause."
 
 For grammar failures: "CRITICAL: Text contains grammatical errors. [specific error]. Rewrite with proper grammar."
+For logical contradictions: "CRITICAL: Logical contradiction found: [Adjective] contradicts [Noun]. Use a modifier that aligns with the noun's definition."
 For hallucinated proper nouns/entities: "CRITICAL: Text contains proper noun/entity '[word]' that does not appear in original. Remove all proper nouns and entities not present in original text."
 For meaning loss: "CRITICAL: Text omits [specific concept/fact] from original. Include all concepts from original text."
 

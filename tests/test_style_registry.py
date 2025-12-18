@@ -223,6 +223,147 @@ def test_style_registry_long_dna():
         assert len(retrieved) == len(long_dna)
 
 
+def test_style_registry_case_insensitive_lookup():
+    """Test case-insensitive lookup in get_dna()."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        # Set DNA with specific case
+        registry.set_dna("Mao", "Authoritative, dialectical, and declarative.")
+        registry.set_dna("Dawkins", "Analytical, didactic, and precise.")
+
+        # Test exact match (fast path)
+        assert registry.get_dna("Mao") == "Authoritative, dialectical, and declarative."
+        assert registry.get_dna("Dawkins") == "Analytical, didactic, and precise."
+
+        # Test case-insensitive lookup
+        assert registry.get_dna("mao") == "Authoritative, dialectical, and declarative."
+        assert registry.get_dna("MAO") == "Authoritative, dialectical, and declarative."
+        assert registry.get_dna("MaO") == "Authoritative, dialectical, and declarative."
+
+        assert registry.get_dna("dawkins") == "Analytical, didactic, and precise."
+        assert registry.get_dna("DAWKINS") == "Analytical, didactic, and precise."
+        assert registry.get_dna("DawKiNs") == "Analytical, didactic, and precise."
+
+        # Test non-existent author (case-insensitive)
+        assert registry.get_dna("Shakespeare") == ""
+        assert registry.get_dna("shakespeare") == ""
+
+
+def test_style_registry_validate_author_exact_match():
+    """Test validate_author with exact match."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        registry.set_dna("Mao", "Test DNA")
+        registry.set_dna("Dawkins", "Test DNA 2")
+
+        # Exact match should return True with empty suggestion
+        exists, suggestion = registry.validate_author("Mao")
+        assert exists is True
+        assert suggestion == ""
+
+        exists, suggestion = registry.validate_author("Dawkins")
+        assert exists is True
+        assert suggestion == ""
+
+
+def test_style_registry_validate_author_case_insensitive():
+    """Test validate_author with case-insensitive match."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        registry.set_dna("Mao", "Test DNA")
+        registry.set_dna("Dawkins", "Test DNA 2")
+
+        # Case-insensitive match should return True with suggestion
+        exists, suggestion = registry.validate_author("mao")
+        assert exists is True
+        assert "Found as 'Mao' (case difference)" in suggestion
+
+        exists, suggestion = registry.validate_author("MAO")
+        assert exists is True
+        assert "Found as 'Mao' (case difference)" in suggestion
+
+        exists, suggestion = registry.validate_author("dawkins")
+        assert exists is True
+        assert "Found as 'Dawkins' (case difference)" in suggestion
+
+
+def test_style_registry_validate_author_not_found():
+    """Test validate_author with non-existent author."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        registry.set_dna("Mao", "Test DNA")
+        registry.set_dna("Dawkins", "Test DNA 2")
+        registry.set_dna("Lovecraft", "Test DNA 3")
+
+        # Non-existent author should return False with suggestions
+        exists, suggestion = registry.validate_author("Shakespeare")
+        assert exists is False
+        assert "Available authors" in suggestion
+        assert "Mao" in suggestion
+        assert "Dawkins" in suggestion
+        assert "Lovecraft" in suggestion
+
+
+def test_style_registry_validate_author_fuzzy_match():
+    """Test validate_author with fuzzy matching suggestions."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        registry.set_dna("Mao", "Test DNA")
+        registry.set_dna("Dawkins", "Test DNA 2")
+        registry.set_dna("Lovecraft", "Test DNA 3")
+
+        # Partial match should suggest similar names
+        exists, suggestion = registry.validate_author("Maoist")
+        assert exists is False
+        assert "Did you mean" in suggestion
+        assert "Mao" in suggestion
+
+        exists, suggestion = registry.validate_author("Daw")
+        assert exists is False
+        assert "Did you mean" in suggestion
+        assert "Dawkins" in suggestion
+
+
+def test_style_registry_validate_author_empty_registry():
+    """Test validate_author with empty registry."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        # Empty registry should return False with empty suggestion
+        exists, suggestion = registry.validate_author("Mao")
+        assert exists is False
+        assert suggestion == ""
+
+
+def test_style_registry_validate_author_single_author():
+    """Test validate_author with single author in registry."""
+    with tempfile.TemporaryDirectory() as tmpdir:
+        registry = StyleRegistry(tmpdir)
+
+        registry.set_dna("Mao", "Test DNA")
+
+        # Exact match
+        exists, suggestion = registry.validate_author("Mao")
+        assert exists is True
+        assert suggestion == ""
+
+        # Case-insensitive match
+        exists, suggestion = registry.validate_author("mao")
+        assert exists is True
+        assert "Found as 'Mao' (case difference)" in suggestion
+
+        # Not found
+        exists, suggestion = registry.validate_author("Dawkins")
+        assert exists is False
+        assert "Available authors" in suggestion
+        assert "Mao" in suggestion
+
+
 if __name__ == "__main__":
     print("Running Style Registry tests...\n")
 
@@ -265,6 +406,27 @@ if __name__ == "__main__":
 
         test_style_registry_long_dna()
         print("✓ Long DNA test passed")
+
+        test_style_registry_case_insensitive_lookup()
+        print("✓ Case-insensitive lookup test passed")
+
+        test_style_registry_validate_author_exact_match()
+        print("✓ Validate author exact match test passed")
+
+        test_style_registry_validate_author_case_insensitive()
+        print("✓ Validate author case-insensitive test passed")
+
+        test_style_registry_validate_author_not_found()
+        print("✓ Validate author not found test passed")
+
+        test_style_registry_validate_author_fuzzy_match()
+        print("✓ Validate author fuzzy match test passed")
+
+        test_style_registry_validate_author_empty_registry()
+        print("✓ Validate author empty registry test passed")
+
+        test_style_registry_validate_author_single_author()
+        print("✓ Validate author single author test passed")
 
         print("\n✓ All Style Registry tests completed!")
 

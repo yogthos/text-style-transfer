@@ -168,6 +168,45 @@ def is_valid_structural_template(text: str) -> bool:
     return True
 
 
+def sanitize_structural_template(text: str) -> str:
+    """
+    Removes forceful logical connectors from the start of templates
+    to prevent logic clashes (e.g. 'Therefore, because...').
+
+    This ensures the Generator uses the INPUT'S logic, not the TEMPLATE'S logic.
+
+    Args:
+        text: Structural template text that may start with logic connectors.
+
+    Returns:
+        Cleaned text with logic connectors removed from the start.
+    """
+    if not text:
+        return ""
+
+    import re
+
+    # Logic starters that force a specific logical relationship
+    logic_starters = [
+        "Therefore", "Consequently", "Thus", "Hence", "Accordingly",
+        "However", "Nevertheless", "Furthermore", "Moreover", "In contrast",
+        "It is", "There is", "That is"
+    ]
+
+    clean_text = text.strip()
+    for word in logic_starters:
+        # Matches "Therefore," or "Therefore " at start of string
+        if re.match(f"^{re.escape(word)}[, ]", clean_text, re.IGNORECASE):
+            # Remove the word and any immediate punctuation/space
+            clean_text = re.sub(f"^{re.escape(word)}[, ]+", "", clean_text, flags=re.IGNORECASE)
+            # Capitalize the new first letter
+            if clean_text:
+                clean_text = clean_text[0].upper() + clean_text[1:] if len(clean_text) > 1 else clean_text.upper()
+            break
+
+    return clean_text
+
+
 def _calculate_structural_distance(candidate: Dict, reference: str) -> float:
     """Calculate structural distance between candidate and reference.
 
@@ -722,15 +761,18 @@ def find_structure_match(
 
         # Hard Cap: Only consider candidates within configured length ratio bounds
         # This prevents "Procrustean Bed" problem where we try to force incompatible lengths
+        # NEW: STRICTER LENGTH BOUNDS FOR RETRIEVAL
+        # Don't even show the generator a template that is < 60% of input length.
+        # It forces the model to truncate content.
         # Get thresholds from config (with fallback defaults)
         try:
             with open("config.json", 'r') as f:
                 config = json.load(f)
             atlas_config = config.get("atlas", {})
-            min_length_ratio = atlas_config.get("min_length_ratio", 0.5)
+            min_length_ratio = atlas_config.get("min_length_ratio", 0.6)  # Increased from 0.5 to 0.6
             max_length_ratio = atlas_config.get("max_length_ratio", 2.0)
         except (FileNotFoundError, json.JSONDecodeError, KeyError):
-            min_length_ratio = 0.5
+            min_length_ratio = 0.6  # Increased from 0.5 to 0.6
             max_length_ratio = 2.0
 
         if len_ratio < min_length_ratio or len_ratio > max_length_ratio:
@@ -759,16 +801,19 @@ def find_structure_match(
             continue
 
         # Gaussian Length Penalty: Score candidates based on length similarity
-        # score = 1.0 / (1.0 + abs(log(len_ratio)))
-        # This gives a huge boost to exact matches and massive penalty to mismatches
+        # Prefer templates that are 100-120% of input length (Expansion bias)
+        # This discourages picking 5-word templates for 10-word inputs
+        # Gaussian curve centered at 1.1 (slightly longer is preferred)
         if len_ratio > 0:
-            length_penalty = 1.0 / (1.0 + abs(math.log(len_ratio)))
+            # Gaussian: exp(-0.5 * ((x - center) / width)^2)
+            # Center at 1.1 (10% longer), width of 0.2 (20% standard deviation)
+            length_score = math.exp(-0.5 * ((len_ratio - 1.1) / 0.2) ** 2)
         else:
-            length_penalty = 0.0
+            length_score = 0.0
 
-        # For now, we use length_penalty as the quality score
+        # For now, we use length_score as the quality score
         # (In future, could multiply by vector_similarity if we have it)
-        quality_score = length_penalty
+        quality_score = length_score
 
         # Distance weighting - prefer structurally different candidates
         if prefer_different_from:

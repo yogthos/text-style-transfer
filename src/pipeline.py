@@ -248,6 +248,15 @@ def process_text(
             print(f"  Falling back to single-author mode")
             is_blend_mode = False
 
+    # Extract Style DNA for authors
+    style_dna_dict = {}
+    if atlas and atlas.author_style_dna:
+        style_dna_dict = atlas.author_style_dna.copy()
+        if style_dna_dict:
+            print(f"  ✓ Loaded Style DNA for {len(style_dna_dict)} author(s)")
+            for author, dna in style_dna_dict.items():
+                print(f"    - {author}: {dna[:60]}..." if len(dna) > 60 else f"    - {author}: {dna}")
+
     # Build cluster Markov chain
     print("Phase 1: Building cluster Markov chain...")
     cluster_markov = build_cluster_markov(atlas)
@@ -481,6 +490,7 @@ def process_text(
                                         global_vocab_list=global_vocab_list,
                                         author_names=author_names,
                                         blend_ratio=final_blend_ratio if is_blend_mode else None,
+                                        style_dna_dict=style_dna_dict,
                                         **kwargs
                                     ),
                                     content_unit=content_unit,

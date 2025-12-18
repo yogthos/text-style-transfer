@@ -39,13 +39,24 @@ def is_valid_structural_template(text: str) -> bool:
     words = text.split()
 
     # CRITICAL: Reject tiny fragments (e.g., "If 4^...", "Page 12")
-    # This is the first check to catch obvious garbage early
-    if len(words) < 3:
+    # Increased from 3 to 4 to catch more fragments
+    if len(words) < 4:
         return False
 
     # Check for non-sentence junk (no vowels, mostly numbers/symbols)
     # Rejects things like "4^", "123", "---", etc.
     if not any(c.lower() in 'aeiouy' for c in text):
+        return False
+
+    # Navigation Artifacts Killer
+    # Rejects: "Return to Table of Contents", "Back to page 5", "See page 12", etc.
+    lower_text = text.lower().strip()
+    navigation_patterns = [
+        "return to", "back to", "continued on", "see page", "table of contents",
+        "see figure", "see chapter", "see section", "refer to", "see above",
+        "see below", "continued from", "go to", "jump to"
+    ]
+    if any(lower_text.startswith(pattern) for pattern in navigation_patterns):
         return False
 
     # Try to load spaCy (optional)
@@ -74,7 +85,20 @@ def is_valid_structural_template(text: str) -> bool:
             has_verb = any(token.pos_ == "VERB" for token in doc)
             if not has_verb:
                 return False
-            # 4. Junk Filter (using spaCy tokens)
+
+            # 4. Imperative Fragment Check
+            # Rejects imperative-only phrases that lack subjects (e.g., "See Figure 1", "Return to page")
+            # Check if first token is a verb (imperative) and sentence is short
+            if len(doc) > 0:
+                first_token = doc[0]
+                if first_token.pos_ == "VERB" and len(doc) <= 6:
+                    # Likely an imperative fragment without a subject
+                    # Check if there's a subject later in the sentence
+                    has_subject = any(token.dep_ in ["nsubj", "nsubjpass"] for token in doc)
+                    if not has_subject:
+                        return False
+
+            # 5. Junk Filter (using spaCy tokens)
             if len(doc) < 4:  # Very short fragments
                 return False
         except Exception:
@@ -82,8 +106,8 @@ def is_valid_structural_template(text: str) -> bool:
             pass
     else:
         # Fallback: basic length check (no spaCy available)
-        # Already checked for < 3 words above, so this is redundant but kept for safety
-        if len(words) < 5:
+        # Increased from 5 to 6 to be more strict
+        if len(words) < 6:
             return False
 
     return True

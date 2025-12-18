@@ -84,6 +84,9 @@ class StyleAtlas:
     num_clusters: int
     """Number of clusters used."""
 
+    author_style_dna: Optional[Dict[str, str]] = None
+    """Mapping from author name to Style DNA string."""
+
     def __post_init__(self):
         """Ensure numpy arrays are properly typed."""
         if isinstance(self.cluster_centers, list):
@@ -373,6 +376,33 @@ def build_style_atlas(
     cluster_ids = {prefixed_id: int(cluster_labels[idx])
                   for idx, prefixed_id in enumerate(prefixed_ids)}
 
+    # Centroid-based sample selection for Style DNA generation
+    # Find the largest cluster and select the window closest to its center
+    representative_sample = None
+    if num_clusters > 0 and len(cluster_labels) > 0:
+        from collections import Counter
+        cluster_counts = Counter(cluster_labels)
+        largest_cluster_id = cluster_counts.most_common(1)[0][0]
+
+        # Find window closest to cluster center
+        largest_cluster_center = cluster_centers[largest_cluster_id]
+        min_distance = float('inf')
+        best_sample_idx = None
+
+        for idx, (label, style_vec) in enumerate(zip(cluster_labels, style_vectors)):
+            if label == largest_cluster_id:
+                distance = np.linalg.norm(style_vec - largest_cluster_center)
+                if distance < min_distance:
+                    min_distance = distance
+                    best_sample_idx = idx
+
+        # Extract sample text from the best window
+        if best_sample_idx is not None and best_sample_idx < len(windows):
+            sample_window = windows[best_sample_idx]
+            # Use first 5 sentences from the window as representative sample
+            sample_sentences = sample_window.get("skeletons", [])[:5]
+            representative_sample = " ".join(sample_sentences)
+            print(f"  Selected representative sample from cluster {largest_cluster_id} (closest to centroid)")
 
     # Create StyleAtlas object
     atlas = StyleAtlas(
@@ -380,12 +410,42 @@ def build_style_atlas(
         cluster_ids=cluster_ids,
         cluster_centers=cluster_centers,
         style_vectors=style_vectors,
-        num_clusters=num_clusters
+        num_clusters=num_clusters,
+        author_style_dna={}
     )
 
     # Store collection reference (for later use)
     atlas._client = client
     atlas._collection = collection
+
+    # Generate and store Style DNA if author_id is provided
+    if author_id and representative_sample:
+        from src.atlas.style_registry import StyleRegistry
+        from src.generator.prompt_builder import generate_author_style_dna
+
+        # Determine config_path (use default, could be passed as parameter if needed)
+        # For now, we'll use the default "config.json" in the project root
+        config_path = "config.json"
+
+        # Initialize Style Registry
+        cache_dir = persist_directory if persist_directory else "atlas_cache"
+        registry = StyleRegistry(cache_dir)
+
+        # Check if DNA already exists
+        existing_dna = registry.get_dna(author_id)
+        if existing_dna:
+            print(f"  Using existing Style DNA for {author_id}")
+            atlas.author_style_dna[author_id] = existing_dna
+        else:
+            # Generate new Style DNA
+            print(f"  Generating Style DNA for {author_id}...")
+            try:
+                dna = generate_author_style_dna(author_id, representative_sample, config_path)
+                registry.set_dna(author_id, dna)
+                atlas.author_style_dna[author_id] = dna
+            except Exception as e:
+                print(f"  ⚠ Warning: Failed to generate Style DNA for {author_id}: {e}")
+                print(f"  Continuing without Style DNA injection.")
 
     return atlas
 
@@ -403,7 +463,8 @@ def save_atlas(atlas: StyleAtlas, filepath: str):
         'cluster_ids': atlas.cluster_ids,
         'cluster_centers': atlas.cluster_centers.tolist(),
         'style_vectors': [v.tolist() for v in atlas.style_vectors],
-        'num_clusters': atlas.num_clusters
+        'num_clusters': atlas.num_clusters,
+        'author_style_dna': atlas.author_style_dna or {}
     }
 
     with open(filepath, 'w') as f:
@@ -432,11 +493,25 @@ def load_atlas(
         cluster_ids=data['cluster_ids'],
         cluster_centers=np.array(data['cluster_centers']),
         style_vectors=[np.array(v) for v in data['style_vectors']],
-        num_clusters=data['num_clusters']
+        num_clusters=data['num_clusters'],
+        author_style_dna=data.get('author_style_dna', {})
     )
 
     if not CHROMADB_AVAILABLE:
         raise ImportError("ChromaDB is not available. Cannot load atlas.")
+
+    # Load Style DNA from StyleRegistry if available
+    if persist_directory:
+        from src.atlas.style_registry import StyleRegistry
+        registry = StyleRegistry(persist_directory)
+
+        # Load DNA for all authors found in registry
+        # Note: We load all profiles, but the pipeline will determine which authors to use
+        all_profiles = registry.get_all_profiles()
+        for author_name, profile in all_profiles.items():
+            dna = profile.get("style_dna", "")
+            if dna:
+                atlas.author_style_dna[author_name] = dna
 
     # Reconnect to ChromaDB collection
     if persist_directory:

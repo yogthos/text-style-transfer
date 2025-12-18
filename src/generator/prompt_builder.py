@@ -142,15 +142,91 @@ def _analyze_structure(text: str) -> Dict[str, any]:
     }
 
 
+def generate_author_style_dna(author_name: str, sample_text: str, config_path: str = "config.json") -> str:
+    """Generates a dense 'Style DNA' string to prime the main generator.
+
+    Uses an LLM to analyze the author's writing style and generate a concise
+    description that activates the model's latent knowledge of the author.
+
+    Args:
+        author_name: Name of the author (e.g., "Hemingway", "Lovecraft").
+        sample_text: Representative sample text from the author (should be from centroid).
+        config_path: Path to configuration file.
+
+    Returns:
+        Style DNA string (max 40 words) describing the author's style characteristics.
+        Returns fallback string if generation fails or sample is too short.
+    """
+    # Validate sample text
+    if not sample_text or len(sample_text) < 50:
+        fallback = f"Distinctive voice of {author_name}."
+        print(f"    ⚠ Sample text too short for {author_name}, using fallback DNA.")
+        return fallback
+
+    # Truncate sample to first 1000 chars for context
+    sample_snippet = sample_text[:1000]
+    if len(sample_text) > 1000:
+        sample_snippet += "..."
+
+    # Build prompt for Style DNA generation
+    system_prompt = """You are a literary style analyst. Your task is to analyze writing style and generate concise, accurate style descriptions."""
+
+    user_prompt = f"""Analyze this sample text by {author_name}:
+"{sample_snippet}"
+
+Output a concise 'Style DNA' string (max 40 words) describing:
+1. Sentence rhythm (e.g., staccato, flowing, labyrinthine)
+2. Vocabulary preference (e.g., technical, archaic, concrete, abstract)
+3. Rhetorical habits (e.g., irony, directness, metaphors, passive voice)
+
+Format: [Adjectives describing tone] + [Structural habits].
+Example: "Stoic, minimalist, and journalistic. Uses short declarative sentences with concrete nouns and strong verbs; avoids adjectives, adverbs, and complex subordination."
+
+Output ONLY the Style DNA string, nothing else."""
+
+    try:
+        # Use LLMProvider to generate Style DNA
+        from src.generator.llm_provider import LLMProvider
+        llm = LLMProvider(config_path=config_path)
+
+        dna_string = llm.call(
+            system_prompt=system_prompt,
+            user_prompt=user_prompt,
+            model_type="editor",  # Use editor model for generation
+            require_json=False,
+            temperature=0.3,  # Lower temperature for more consistent analysis
+            max_tokens=100
+        ).strip()
+
+        # Validate and clean the response
+        if not dna_string or len(dna_string) < 10:
+            fallback = f"Distinctive voice of {author_name}."
+            print(f"    ⚠ Generated DNA too short for {author_name}, using fallback.")
+            return fallback
+
+        # Print for verification (as specified in plan)
+        print(f"    🧬 Generated Style DNA for {author_name}: {dna_string}")
+
+        return dna_string
+
+    except Exception as e:
+        # Graceful fallback on error
+        fallback = f"Distinctive voice of {author_name}."
+        print(f"    ⚠ Style DNA generation failed for {author_name}: {e}. Using fallback.")
+        return fallback
+
+
 class PromptAssembler:
     """Constructs highly constrained prompts using RAG data to prevent 'LLM Slop'."""
 
-    def __init__(self, target_author_name: str = "Target Author", banned_words: Optional[List[str]] = None):
+    def __init__(self, target_author_name: str = "Target Author", banned_words: Optional[List[str]] = None, style_dna: Optional[str] = None, style_dna_dict: Optional[Dict[str, str]] = None):
         """Initialize the prompt assembler.
 
         Args:
             target_author_name: Name of the target author (for persona definition).
             banned_words: List of words to ban (prevents generic AI language).
+            style_dna: Style DNA string for single-author mode.
+            style_dna_dict: Dictionary mapping author names to Style DNA strings (for blend mode).
         """
         self.author_name = target_author_name
 
@@ -160,6 +236,10 @@ class PromptAssembler:
             "bustling", "crucial", "meticulous", "comprehensive", "fostering"
         ]
 
+        # Style DNA for persona priming
+        self.style_dna = style_dna
+        self.style_dna_dict = style_dna_dict
+
     def build_system_message(self) -> str:
         """Define the rigid persona. The LLM is not a writer; it is a style engine.
 
@@ -167,7 +247,65 @@ class PromptAssembler:
             System prompt string.
         """
         template = _load_prompt_template("generator_system.md")
-        return template.format(author_name=self.author_name)
+        base_prompt = template.format(author_name=self.author_name)
+
+        # Inject Style DNA if available
+        style_dna_section = self._build_style_dna_section()
+        if style_dna_section:
+            # Insert Style DNA section after the role definition but before operational rules
+            # Find the first "YOUR DIRECTIVES" or "OPERATIONAL" section and insert before it
+            if "YOUR DIRECTIVES" in base_prompt:
+                base_prompt = base_prompt.replace("YOUR DIRECTIVES:", f"{style_dna_section}\n\nYOUR DIRECTIVES:")
+            elif "OPERATIONAL RULES" in base_prompt:
+                base_prompt = base_prompt.replace("OPERATIONAL RULES", f"{style_dna_section}\n\nOPERATIONAL RULES")
+            else:
+                # Fallback: append before the end
+                base_prompt = f"{base_prompt}\n\n{style_dna_section}"
+
+        return base_prompt
+
+    def _build_style_dna_section(self) -> str:
+        """Build the Style DNA section for the system prompt.
+
+        Returns:
+            Style DNA section string, or empty string if no DNA available.
+        """
+        # Handle blend mode (multiple authors)
+        if self.style_dna_dict and len(self.style_dna_dict) >= 2:
+            # Get author names from dict keys
+            authors = list(self.style_dna_dict.keys())
+            if len(authors) >= 2:
+                dna_a = self.style_dna_dict.get(authors[0], "")
+                dna_b = self.style_dna_dict.get(authors[1], "")
+
+                if dna_a and dna_b:
+                    return f"""### YOUR STYLE DNA (THE INSTRUCTIONS)
+To authentically write as {authors[0]} and {authors[1]}, you must adhere to these rules:
+
+**PRIMARY STYLE ({authors[0]}):**
+> {dna_a}
+
+**SECONDARY INFLUENCE ({authors[1]}):**
+> {dna_b}
+
+Blend these styles naturally, with the primary style dominant."""
+                elif dna_a:
+                    return f"""### YOUR STYLE DNA (THE INSTRUCTIONS)
+To authentically write as {authors[0]}, you must adhere to these rules:
+> **{dna_a}**"""
+                elif dna_b:
+                    return f"""### YOUR STYLE DNA (THE INSTRUCTIONS)
+To authentically write as {authors[1]}, you must adhere to these rules:
+> **{dna_b}**"""
+
+        # Handle single-author mode
+        if self.style_dna:
+            return f"""### YOUR STYLE DNA (THE INSTRUCTIONS)
+To authentically write as {self.author_name}, you must adhere to these rules:
+> **{self.style_dna}**"""
+
+        # No Style DNA available
+        return ""
 
     def build_generation_prompt(
         self,
@@ -176,7 +314,8 @@ class PromptAssembler:
         structure_match: str,
         style_metrics: Optional[Dict[str, float]] = None,
         global_vocab_list: Optional[List[str]] = None,
-        use_fallback_structure: bool = False
+        use_fallback_structure: bool = False,
+        constraint_mode: str = "STRICT"
     ) -> str:
         """Assemble the Few-Shot prompt using Dual-RAG data.
 
@@ -205,6 +344,19 @@ class PromptAssembler:
             else:
                 avg_sentence_len = len(words)
             style_metrics = {'avg_sentence_len': avg_sentence_len}
+
+        # Handle constraint modes and fallback structure mode
+        # SAFETY mode overrides use_fallback_structure
+        if constraint_mode == "SAFETY":
+            use_fallback_structure = True
+
+        # Build constraint instruction based on mode
+        if constraint_mode == "STRICT":
+            constraint_instruction = "CRITICAL: You must mimic the Structural Reference's syntax, punctuation, and sentence structure EXACTLY."
+        elif constraint_mode == "LOOSE":
+            constraint_instruction = "GUIDANCE: Use the Structural Reference as a rhythm guide, but prioritize Meaning. You may expand or contract the structure to fit the content. You may change punctuation if necessary for grammar."
+        else:  # SAFETY
+            constraint_instruction = "INSTRUCTION: Ignore the Structural Reference. Rewrite the input content clearly using the target author's vocabulary and general style. Preserve all meaning."
 
         # Handle fallback structure mode
         if use_fallback_structure:
@@ -240,6 +392,9 @@ class PromptAssembler:
                 structure_instructions.append("- Use asterisks (*) for emphasis or special notation")
 
             structure_instructions_text = "\n".join(structure_instructions)
+
+        # Prepend constraint instruction to structure instructions
+        structure_instructions_text = f"{constraint_instruction}\n\n{structure_instructions_text}"
 
         # Build situation match content
         if situation_match:
@@ -291,7 +446,8 @@ Observe their specific word choices and tone in this snippet:
         hybrid_vocab: List[str],
         author_a: str,
         author_b: str,
-        blend_ratio: float = 0.5
+        blend_ratio: float = 0.5,
+        constraint_mode: str = "STRICT"
     ) -> str:
         """Build a blended style prompt for mixing two author styles.
 
@@ -302,10 +458,19 @@ Observe their specific word choices and tone in this snippet:
             author_a: First author name.
             author_b: Second author name.
             blend_ratio: Blend ratio (0.0 = All Author A, 1.0 = All Author B).
+            constraint_mode: Constraint mode ("STRICT", "LOOSE", or "SAFETY").
 
         Returns:
             Complete user prompt string for blended style generation.
         """
+        # Build constraint instruction based on mode
+        if constraint_mode == "STRICT":
+            constraint_instruction = "CRITICAL: You must mimic the bridge template's syntax, punctuation, and sentence structure EXACTLY."
+        elif constraint_mode == "LOOSE":
+            constraint_instruction = "GUIDANCE: Use the bridge template as a rhythm guide, but prioritize Meaning. You may expand or contract the structure to fit the content. You may change punctuation if necessary for grammar."
+        else:  # SAFETY
+            constraint_instruction = "INSTRUCTION: Ignore the bridge template's syntax. Rewrite the input content clearly using the blended author vocabulary and general style. Preserve all meaning."
+
         # Load blended prompt template
         template = _load_prompt_template("generation_blended.md")
 
@@ -320,8 +485,11 @@ Observe their specific word choices and tone in this snippet:
         # Format vocabulary list
         vocab_text = ", ".join(hybrid_vocab) if hybrid_vocab else "N/A"
 
+        # Prepend constraint instruction to bridge template description
+        bridge_template_with_constraint = f"{constraint_instruction}\n\nBridge Template: {bridge_template}"
+
         return template.format(
-            bridge_template=bridge_template,
+            bridge_template=bridge_template_with_constraint,
             hybrid_vocab=vocab_text,
             author_a=author_a,
             author_b=author_b,

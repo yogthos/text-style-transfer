@@ -1434,28 +1434,31 @@ def generate_with_critic(
     # Allow up to max_retries generations and max_edit_attempts edits per generation
     max_total_attempts = max_retries * (1 + max_edit_attempts)
     total_attempts = 0  # Unified counter for all attempts (generations + edits)
+    current_stage = "STRICT"  # Progressive constraint relaxation: STRICT -> LOOSE -> SAFETY
     for attempt in range(max_total_attempts):
         total_attempts += 1
-        # Smart Retreat: After 2 generation attempts, drop strict structural constraint
-        if generation_attempts == 2 and not structure_dropped:
-            print("    ⚠ Dropping strict structural constraint (Fallback Mode)")
-            structure_dropped = True
-            current_structure = None  # Signal to use fallback
-            should_regenerate = True  # Force regeneration with new structure
 
-        # Structure Match Refresh: When convergence is failing, try alternative matches
+        # RELAXATION LADDER: Linear progression based on attempt count
+        # Attempt 0-1: STRICT mode (perfect style transfer)
+        # Attempt 2-3: LOOSE mode (rhythmic match, ignore structure/length)
+        # Attempt 4+: SAFETY mode (meaning preservation only, skip critic)
+        if generation_attempts < 2:
+            current_stage = "STRICT"
+        elif generation_attempts < 4:
+            if current_stage != "LOOSE":
+                current_stage = "LOOSE"
+                print("    ⚠ Switching to LOOSE constraint mode (Relaxing Structure/Length).")
+        else:
+            if current_stage != "SAFETY":
+                current_stage = "SAFETY"
+                print("    ⚠ Switching to SAFETY mode (Dropping Structure, prioritizing Meaning).")
+
+        # Structure Match Refresh: Only in STRICT mode, try alternative matches
+        # Do NOT reset generation counter - let state machine advance naturally
         should_refresh_structure = False
-        refresh_triggered = False
-
-        # Trigger conditions:
-        # 1. After 2+ attempts with very low score (< 0.5)
-        # 2. After 3+ attempts with score below good_enough_threshold
-        if generation_attempts >= 2 and best_score < 0.5:
+        if current_stage == "STRICT" and generation_attempts >= 2 and best_score < 0.5:
             should_refresh_structure = True
             print(f"    🔄 Low score ({best_score:.3f}) after {generation_attempts} attempts. Triggering structure refresh...")
-        elif generation_attempts >= 3 and best_score < good_enough_threshold:
-            should_refresh_structure = True
-            print(f"    🔄 Score ({best_score:.3f}) below threshold after {generation_attempts} attempts. Triggering structure refresh...")
 
         if should_refresh_structure and atlas and target_cluster_id is not None:
             from src.atlas.navigator import find_structure_match
@@ -1488,11 +1491,8 @@ def generate_with_critic(
                 current_structure = new_structure_match
                 structure_dropped = False  # Reset fallback mode with new structure
                 should_regenerate = True
-                # Reset counters to give new structure a fair chance
-                generation_attempts = 0
-                feedback_history = []  # Clear feedback history for fresh start
-                refresh_triggered = True
-                print(f"    ✓ Switched to alternative structure match. Resetting generation counter.")
+                # DO NOT reset generation counter - let state machine advance naturally
+                print(f"    ✓ Switched to alternative structure match. Continuing with current stage.")
             else:
                 print(f"    ⚠ No alternative structure matches available. Continuing with current structure.")
 
@@ -1508,7 +1508,8 @@ def generate_with_critic(
             # Generate with hint from previous attempts
             generate_kwargs = {
                 'hint': hint,
-                'use_fallback_structure': structure_dropped
+                'use_fallback_structure': structure_dropped,
+                'constraint_mode': current_stage
             }
             current_text = generate_fn(content_unit, current_structure or structure_match, situation_match, config_path, **generate_kwargs)
             print(f"    DEBUG: Generated text (attempt {generation_attempts + 1}): '{current_text}'")
@@ -1533,7 +1534,8 @@ def generate_with_critic(
             }
             score = 0.0
         # HARD GATE 2: Check semantic similarity (meaning preservation)
-        elif content_unit.original_text and not check_semantic_similarity(current_text, content_unit.original_text):
+        # Lower threshold to 0.5 for style transfer context (style changes can legitimately lower similarity)
+        elif content_unit.original_text and not check_semantic_similarity(current_text, content_unit.original_text, threshold=0.5):
             print("    ⚠ FAIL: Semantic similarity too low (Meaning lost).")
             critic_result = {
                 "pass": False,
@@ -1570,17 +1572,57 @@ def generate_with_critic(
                 critic_result = length_gate_result
                 score = critic_result.get("score", 0.0)
             else:
-                # Length is acceptable - proceed with LLM critic evaluation
-                # Pass structure_input_ratio so critic can be lenient about length when structure is very different
-                critic_result = critic_evaluate(
-                    current_text,
-                    eval_structure,
-                    situation_match,
-                    original_text=content_unit.original_text,
-                    config_path=config_path,
-                    structure_input_ratio=structure_input_ratio
-                )
-                score = critic_result.get("score", 0.0)
+                # B. LLM CRITIC BYPASS (SAFETY Mode)
+                # ----------------------------------
+                # In SAFETY mode, skip the LLM critic entirely to ensure convergence
+                # We already passed Grammar/Semantic Hard Gates above, so we are safe.
+                if current_stage == "SAFETY":
+                    print("    ✓ SAFETY Mode: Skipping Critic. Accepting based on Hard Gates.")
+                    critic_result = {
+                        "pass": True,
+                        "score": 1.0,
+                        "primary_failure_type": "none",
+                        "feedback": "SAFETY mode: Accepted based on hard gates (grammar and semantic similarity passed)."
+                    }
+                    score = 1.0
+                else:
+                    # Length is acceptable - proceed with LLM critic evaluation
+                    # Pass structure_input_ratio so critic can be lenient about length when structure is very different
+                    critic_result = critic_evaluate(
+                        current_text,
+                        eval_structure,
+                        situation_match,
+                        original_text=content_unit.original_text,
+                        config_path=config_path,
+                        structure_input_ratio=structure_input_ratio
+                    )
+                    score = critic_result.get("score", 0.0)
+
+                    # C. SMART OVERRIDES (The Fix for "Score 0.0")
+                    # --------------------------------------------
+
+                    # Override 1: Punctuation Style (The "Exclamation Mark" Fix)
+                    # If the critic complains about grammar but the punctuation matches the reference, it's valid style.
+                    if critic_result.get("primary_failure_type") == "grammar":
+                        # Check for matching exclamations
+                        if "!" in eval_structure and "!" in current_text:
+                            print("    ✓ Overriding Grammar complaint: Exclamation matches style.")
+                            critic_result["pass"] = True
+                            critic_result["score"] = 0.85
+                            score = 0.85
+                        # Check for matching question marks
+                        elif "?" in eval_structure and "?" in current_text:
+                            print("    ✓ Overriding Grammar complaint: Question mark matches style.")
+                            critic_result["pass"] = True
+                            critic_result["score"] = 0.85
+                            score = 0.85
+
+                    # Override 2: LOOSE Mode (Ignore Structure/Length)
+                    if current_stage == "LOOSE" and critic_result.get("primary_failure_type") == "structure":
+                        print("    ✓ LOOSE Mode: Ignoring structure/length mismatch.")
+                        critic_result["pass"] = True
+                        critic_result["score"] = max(critic_result.get("score", 0.0), 0.8)
+                        score = critic_result["score"]
 
         # Track the "Global Best" to ensure we never lose ground
         if score > best_score:

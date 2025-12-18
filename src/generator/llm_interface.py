@@ -24,7 +24,9 @@ def generate_sentence(
     global_vocab_list: Optional[List[str]] = None,
     author_names: Optional[List[str]] = None,
     blend_ratio: Optional[float] = None,
-    use_fallback_structure: bool = False
+    use_fallback_structure: bool = False,
+    constraint_mode: str = "STRICT",
+    style_dna_dict: Optional[dict] = None
 ) -> str:
     """Generate a sentence using LLM with dual RAG references.
 
@@ -48,8 +50,31 @@ def generate_sentence(
     # Initialize LLM provider
     llm = LLMProvider(config_path=config_path)
 
-    # Initialize prompt assembler
-    assembler = PromptAssembler(target_author_name=target_author_name)
+    # Extract Style DNA for the author(s)
+    style_dna = None
+    style_dna_dict_for_assembler = None
+
+    if style_dna_dict:
+        if author_names and len(author_names) >= 2 and blend_ratio is not None:
+            # Blend mode: pass dict with both authors
+            style_dna_dict_for_assembler = {}
+            for author in author_names:
+                if author in style_dna_dict:
+                    style_dna_dict_for_assembler[author] = style_dna_dict[author]
+        else:
+            # Single-author mode: extract DNA for target author
+            if target_author_name in style_dna_dict:
+                style_dna = style_dna_dict[target_author_name]
+            # Also check author_names if provided (for single-author mode)
+            elif author_names and len(author_names) > 0 and author_names[0] in style_dna_dict:
+                style_dna = style_dna_dict[author_names[0]]
+
+    # Initialize prompt assembler with Style DNA
+    assembler = PromptAssembler(
+        target_author_name=target_author_name,
+        style_dna=style_dna,
+        style_dna_dict=style_dna_dict_for_assembler
+    )
 
     # Build system prompt using PromptAssembler
     system_prompt = assembler.build_system_message()
@@ -82,7 +107,8 @@ def generate_sentence(
             hybrid_vocab=global_vocab_list or [],
             author_a=author_names[0],
             author_b=author_names[1],
-            blend_ratio=blend_ratio
+            blend_ratio=blend_ratio,
+            constraint_mode=constraint_mode
         )
     else:
         # Single-author mode: use regular prompt
@@ -92,7 +118,8 @@ def generate_sentence(
             structure_match=structure_match,
             style_metrics=style_metrics,
             global_vocab_list=global_vocab_list,
-            use_fallback_structure=use_fallback_structure
+            use_fallback_structure=use_fallback_structure,
+            constraint_mode=constraint_mode
         )
 
     # Add entity preservation if needed

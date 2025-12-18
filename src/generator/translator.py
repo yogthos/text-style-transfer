@@ -50,9 +50,15 @@ REFINEMENT_PROMPT = """
 You are refining a draft text to improve its accuracy and flow.
 
 ### INPUT DATA
-1. **Original Intent (Blueprint):** {blueprint_text}
+1. **Original Blueprint:** "{blueprint_text}" (This is the TRUTH. Do not deviate.)
 2. **Current Draft:** {current_draft}
-3. **Critic Feedback:** {critique_feedback}
+3. **Error Report:** {critique_feedback}
+
+### STRATEGY
+- The Critic has flagged specific issues.
+- If the Error Report says "Missing Concepts", **ADD** them from the Blueprint.
+- If the Error Report says "Hallucinated", **REMOVE** the extra words.
+- If the Error Report says "Incomplete", **simplify the syntax**.
 
 ### TASK: Mutate and Polish
 - **Priority 1 (Fix Errors):** Address the specific "Missing" or "Hallucinated" concepts listed in the feedback.
@@ -61,8 +67,21 @@ You are refining a draft text to improve its accuracy and flow.
     - *Constraint:* Do not change the core meaning or subject matter.
 - **Style:** Maintain the requested rhetorical style: {rhetorical_type}.
 
+### COMMAND
+Rewrite the draft to fix the errors while maintaining the Blueprint's meaning.
+
 ### OUTPUT
 Return ONLY the refined sentence.
+"""
+
+# Simplification prompt for emergency pivot when stuck
+SIMPLIFICATION_PROMPT = """
+### EMERGENCY REWRITE
+The previous drafts are too complex or hallucinated.
+Rewrite the following Blueprint into a SINGLE, SIMPLE, DECLARATIVE sentence.
+Use ONLY the keywords provided. Do not be poetic.
+
+Blueprint: "{blueprint_text}"
 """
 
 
@@ -428,6 +447,57 @@ Rewrite (output ONLY the rewritten text, no explanations or instructions):"""
 
         return " | ".join(parts) if parts else blueprint.original_text
 
+    def _generate_simplification(
+        self,
+        best_draft: str,
+        blueprint: SemanticBlueprint,
+        author_name: str,
+        style_dna: str,
+        rhetorical_type: RhetoricalType
+    ) -> str:
+        """Generate a simplified version when stuck at low scores.
+
+        This is a "Hail Mary" attempt that strips the sentence down to basics
+        when the evolution loop has stagnated at a low score.
+
+        Args:
+            best_draft: Current best draft (may be ignored in favor of blueprint)
+            blueprint: Original semantic blueprint
+            author_name: Target author name
+            style_dna: Style DNA description
+            rhetorical_type: Rhetorical mode
+
+        Returns:
+            Simplified text generated from blueprint
+        """
+        blueprint_text = self._get_blueprint_text(blueprint)
+
+        simplification_prompt = SIMPLIFICATION_PROMPT.format(
+            blueprint_text=blueprint_text
+        )
+
+        system_prompt = f"""You are {author_name}.
+Your writing style: {style_dna}
+
+Your task is to create a simple, declarative sentence from the blueprint.
+Be literal and direct. Do not be poetic or complex."""
+
+        try:
+            simplified = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=simplification_prompt,
+                temperature=0.2,  # Low temperature for simplicity
+                max_tokens=self.translator_config.get("max_tokens", 200)
+            )
+            simplified = clean_generated_text(simplified)
+            simplified = simplified.strip()
+            # Restore citations and quotes if missing
+            simplified = self._restore_citations_and_quotes(simplified, blueprint)
+            return simplified
+        except Exception as e:
+            # Fallback: return best draft if simplification fails
+            return best_draft
+
     def _evolve_text(
         self,
         initial_draft: str,
@@ -470,6 +540,10 @@ Rewrite (output ONLY the rewritten text, no explanations or instructions):"""
         patience_counter = 0
         patience_threshold = refinement_config.get("patience_threshold", 3)
         patience_min_score = refinement_config.get("patience_min_score", 0.80)
+
+        # Stagnation Breaker parameters (separate from patience)
+        stagnation_counter = 0
+        stagnation_threshold = 3
 
         # Dynamic temperature parameters
         current_temp = refinement_config.get("initial_temperature",
@@ -551,10 +625,11 @@ Keep what works, fix what doesn't."""
 
                 # Hill climbing: only accept improvements
                 if candidate_score > best_score:
-                    # Improvement: reset temperature and patience
+                    # Improvement: reset temperature, patience, and stagnation counter
                     current_temp = refinement_config.get("initial_temperature",
                                                          refinement_config.get("refinement_temperature", 0.3))
                     patience_counter = 0
+                    stagnation_counter = 0
                     best_draft = candidate_draft
                     best_score = candidate_score
                     best_feedback = candidate_feedback
@@ -572,11 +647,28 @@ Keep what works, fix what doesn't."""
                             print(f"  Evolution: Draft accepted after improvement (recall: {candidate_result['recall_score']:.2f}, precision: {candidate_result['precision_score']:.2f}, score: {candidate_score:.2f})")
                         break
                 else:
-                    # No improvement: increment patience and increase temperature
+                    # No improvement: increment patience, stagnation, and increase temperature
                     patience_counter += 1
+                    stagnation_counter += 1
                     current_temp = min(current_temp + temperature_increment, max_temperature)
                     if verbose:
-                        print(f"    ↻ Stuck at {best_score:.2f}, increasing temperature to {current_temp:.2f} (patience: {patience_counter}/{patience_threshold})")
+                        print(f"    ↻ Stuck at {best_score:.2f}, increasing temperature to {current_temp:.2f} (patience: {patience_counter}/{patience_threshold}, stagnation: {stagnation_counter}/{stagnation_threshold})")
+
+                    # Stagnation Breaker: triggers regardless of score after 3 non-improvements
+                    if stagnation_counter >= stagnation_threshold:
+                        if verbose:
+                            print(f"  DEBUG: Stagnation detected (3 gens at {best_score:.2f}).")
+
+                        if best_score >= 0.85:
+                            if verbose:
+                                print("  DEBUG: Score is acceptable. Early exit.")
+                            break
+                        else:
+                            if verbose:
+                                print("  DEBUG: Score is low. Attempting 'Simplification Pivot'...")
+                            # Try one last radical simplification before giving up
+                            final_attempt = self._generate_simplification(best_draft, blueprint, author_name, style_dna, rhetorical_type)
+                            return (final_attempt, best_score)
 
                     # Smart Patience: early exit if stuck at good enough score
                     if patience_counter >= patience_threshold and best_score >= patience_min_score:

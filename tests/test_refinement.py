@@ -530,6 +530,234 @@ def test_dynamic_temperature_resets_on_improvement():
     print("✓ test_dynamic_temperature_resets_on_improvement passed")
 
 
+def test_stagnation_breaker_high_score_early_exit():
+    """Test that stagnation breaker triggers early exit when score >= 0.85."""
+    translator = StyleTranslator(config_path="config.json")
+    translator.llm_provider = MagicMock()
+
+    mock_critic = MagicMock(spec=SemanticCritic)
+
+    initial_draft = "Initial draft"
+    blueprint = SemanticBlueprint(
+        original_text="Test",
+        svo_triples=[],
+        named_entities=[],
+        core_keywords=set(),
+        citations=[],
+        quotes=[]
+    )
+
+    # Mock critic: always return same score (0.86) - stuck but high enough
+    def mock_evaluate(text, blueprint):
+        return {"pass": False, "score": 0.86, "feedback": "Stuck", "recall_score": 0.9, "precision_score": 0.8}
+
+    mock_critic.evaluate = Mock(side_effect=mock_evaluate)
+    translator.llm_provider.call = Mock(return_value="Candidate draft")
+
+    # Run evolution
+    best_draft, best_score = translator._evolve_text(
+        initial_draft=initial_draft,
+        blueprint=blueprint,
+        author_name="Test Author",
+        style_dna="Test style",
+        rhetorical_type=RhetoricalType.OBSERVATION,
+        initial_score=0.86,
+        initial_feedback="Stuck",
+        critic=mock_critic,
+        verbose=False
+    )
+
+    # Should exit early after 3 generations without improvement (stagnation)
+    # Should not call simplification (score >= 0.85)
+    assert best_score == 0.86, "Should keep the high score"
+    # Should have called LLM 3 times (stagnation threshold)
+    assert translator.llm_provider.call.call_count == 3, \
+        f"Should call LLM 3 times before stagnation exit, called {translator.llm_provider.call.call_count}"
+
+    print("✓ test_stagnation_breaker_high_score_early_exit passed")
+
+
+def test_stagnation_breaker_low_score_simplification():
+    """Test that stagnation breaker triggers simplification when score < 0.85."""
+    translator = StyleTranslator(config_path="config.json")
+    translator.llm_provider = MagicMock()
+
+    mock_critic = MagicMock(spec=SemanticCritic)
+
+    initial_draft = "Initial draft"
+    blueprint = SemanticBlueprint(
+        original_text="Test sentence.",
+        svo_triples=[("test", "be", "sentence")],
+        named_entities=[],
+        core_keywords={"test", "sentence"},
+        citations=[],
+        quotes=[]
+    )
+
+    # Mock critic: always return same low score (0.73) - stuck at low score
+    def mock_evaluate(text, blueprint):
+        return {"pass": False, "score": 0.73, "feedback": "Stuck", "recall_score": 0.7, "precision_score": 0.7}
+
+    mock_critic.evaluate = Mock(side_effect=mock_evaluate)
+
+    # Track calls to see if simplification is called
+    call_count = [0]
+    def mock_call(*args, **kwargs):
+        call_count[0] += 1
+        if call_count[0] <= 3:
+            # First 3 calls are refinement attempts
+            return "Candidate draft"
+        else:
+            # 4th call should be simplification
+            return "Simplified draft"
+
+    translator.llm_provider.call = Mock(side_effect=mock_call)
+
+    # Run evolution
+    best_draft, best_score = translator._evolve_text(
+        initial_draft=initial_draft,
+        blueprint=blueprint,
+        author_name="Test Author",
+        style_dna="Test style",
+        rhetorical_type=RhetoricalType.OBSERVATION,
+        initial_score=0.73,
+        initial_feedback="Stuck",
+        critic=mock_critic,
+        verbose=False
+    )
+
+    # Should have called simplification (4th call)
+    assert translator.llm_provider.call.call_count == 4, \
+        f"Should call LLM 4 times (3 refinement + 1 simplification), called {translator.llm_provider.call.call_count}"
+    assert best_draft == "Simplified draft", "Should return simplified draft"
+    assert best_score == 0.73, "Score should remain the same"
+
+    print("✓ test_stagnation_breaker_low_score_simplification passed")
+
+
+def test_stagnation_counter_resets_on_improvement():
+    """Test that stagnation counter resets when score improves."""
+    translator = StyleTranslator(config_path="config.json")
+    translator.llm_provider = MagicMock()
+
+    mock_critic = MagicMock(spec=SemanticCritic)
+
+    initial_draft = "Initial draft"
+    blueprint = SemanticBlueprint(
+        original_text="Test",
+        svo_triples=[],
+        named_entities=[],
+        core_keywords=set(),
+        citations=[],
+        quotes=[]
+    )
+
+    # Mock critic: return improving scores (0.6, 0.6, 0.6, 0.7) - improvement on 4th
+    scores = [0.6, 0.6, 0.6, 0.7, 0.7, 0.7]
+    score_index = [0]
+
+    def mock_evaluate(text, blueprint):
+        idx = score_index[0]
+        score_index[0] += 1
+        if idx < len(scores):
+            return {"pass": False, "score": scores[idx], "feedback": f"Score {scores[idx]}", "recall_score": 0.8, "precision_score": 0.7}
+        return {"pass": False, "score": 0.6, "feedback": "Default", "recall_score": 0.8, "precision_score": 0.7}
+
+    mock_critic.evaluate = Mock(side_effect=mock_evaluate)
+    translator.llm_provider.call = Mock(return_value="Candidate draft")
+
+    # Run evolution
+    best_draft, best_score = translator._evolve_text(
+        initial_draft=initial_draft,
+        blueprint=blueprint,
+        author_name="Test Author",
+        style_dna="Test style",
+        rhetorical_type=RhetoricalType.OBSERVATION,
+        initial_score=0.6,
+        initial_feedback="Initial",
+        critic=mock_critic,
+        verbose=False
+    )
+
+    # Should have improved to 0.7, and stagnation should have reset
+    # Should not trigger stagnation exit because improvement happened
+    assert best_score == 0.7, "Score should improve to 0.7"
+    # Should have called LLM more than 3 times (improvement happened, so continued)
+    assert translator.llm_provider.call.call_count >= 4, \
+        f"Should continue after improvement, called {translator.llm_provider.call.call_count} times"
+
+    print("✓ test_stagnation_counter_resets_on_improvement passed")
+
+
+def test_refinement_prompt_references_blueprint():
+    """Test that REFINEMENT_PROMPT explicitly references blueprint as source of truth."""
+    from src.generator.translator import REFINEMENT_PROMPT
+
+    blueprint_text = "Subjects: cat | Actions: sit | Objects: mat"
+    current_draft = "The cat sat on the mat."
+    critique_feedback = "Missing object"
+    rhetorical_type = "OBSERVATION"
+
+    prompt = REFINEMENT_PROMPT.format(
+        blueprint_text=blueprint_text,
+        current_draft=current_draft,
+        critique_feedback=critique_feedback,
+        rhetorical_type=rhetorical_type
+    )
+
+    # Check for explicit blueprint reference
+    assert "Original Blueprint" in prompt, "Prompt should mention 'Original Blueprint'"
+    assert "TRUTH" in prompt or "truth" in prompt.lower(), "Prompt should indicate blueprint is the truth"
+    assert "Do not deviate" in prompt or "do not deviate" in prompt.lower(), \
+        "Prompt should instruct not to deviate from blueprint"
+
+    # Check for error-specific instructions
+    assert "Missing Concepts" in prompt or "missing" in prompt.lower(), \
+        "Prompt should mention missing concepts"
+    assert "Hallucinated" in prompt or "hallucinated" in prompt.lower(), \
+        "Prompt should mention hallucinated content"
+    assert "Incomplete" in prompt or "incomplete" in prompt.lower(), \
+        "Prompt should mention incomplete sentences"
+
+    print("✓ test_refinement_prompt_references_blueprint passed")
+
+
+def test_simplification_prompt_generation():
+    """Test that simplification method generates simplified output."""
+    translator = StyleTranslator(config_path="config.json")
+    translator.llm_provider = MagicMock()
+
+    best_draft = "Complex draft with many words"
+    blueprint = SemanticBlueprint(
+        original_text="The cat sat on the mat.",
+        svo_triples=[("cat", "sit", "mat")],
+        named_entities=[],
+        core_keywords={"cat", "sit", "mat"},
+        citations=[],
+        quotes=[]
+    )
+
+    # Mock LLM to return simplified version
+    translator.llm_provider.call = Mock(return_value="Cat sits on mat.")
+
+    simplified = translator._generate_simplification(
+        best_draft=best_draft,
+        blueprint=blueprint,
+        author_name="Test Author",
+        style_dna="Simple and direct",
+        rhetorical_type=RhetoricalType.OBSERVATION
+    )
+
+    assert simplified == "Cat sits on mat.", "Should return simplified draft"
+    assert translator.llm_provider.call.called, "Should call LLM for simplification"
+
+    # Check that the call used low temperature
+    call_args = translator.llm_provider.call.call_args
+    assert call_args[1]["temperature"] == 0.2, "Should use low temperature for simplification"
+
+    print("✓ test_simplification_prompt_generation passed")
+
+
 if __name__ == "__main__":
     test_refinement_prompt_construction()
     test_refinement_prompt_includes_fluency()
@@ -546,5 +774,10 @@ if __name__ == "__main__":
     test_smart_patience_early_exit()
     test_fluency_forgiveness_accepts_perfect_recall()
     test_precision_trap_fix_end_to_end()
+    test_stagnation_breaker_high_score_early_exit()
+    test_stagnation_breaker_low_score_simplification()
+    test_stagnation_counter_resets_on_improvement()
+    test_refinement_prompt_references_blueprint()
+    test_simplification_prompt_generation()
     print("\n✓ All refinement tests completed!")
 

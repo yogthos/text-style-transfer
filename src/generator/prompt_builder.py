@@ -352,18 +352,25 @@ To authentically write as {self.author_name}, you must adhere to these rules:
 
         # Build constraint instruction based on mode
         if constraint_mode == "STRICT":
-            constraint_instruction = """CRITICAL: Use the Structural Reference as a SYNTAX BLUEPRINT, not a word source.
-    - Match the sentence structure pattern (simple, compound, complex)
-    - Match the punctuation style (commas, dashes, semicolons)
-    - Match the rhythm and pacing
-    - **DO NOT COPY WORDS**: Do not use phrases like "If you could see", "Then came", "Concerning" from the reference
-    - **DO NOT REPEAT**: Avoid using transition words like "therefore", "concerning", "thus" more than once
-    - Adapt the structure to fit ALL content from Input Text
-    - Preserve natural English flow - do not create stilted or unnatural phrasing"""
+            constraint_instruction = """### STRUCTURAL INSTRUCTIONS
+1. **RHYTHM:** Use the Structural Reference as a guide for tone and pacing.
+2. **LENGTH:** You are NOT bound by the reference's word count.
+   - **EXPAND** the structure if your input has more information.
+   - **COMPLETE** your sentences. Do not write fragments just to be short.
+   - **GRAMMAR:** Grammatical correctness is more important than matching the template structure.
+3. **STRUCTURE:** Match the sentence structure pattern (simple, compound, complex) and punctuation style.
+4. **DO NOT COPY WORDS**: Do not use phrases like "If you could see", "Then came", "Concerning" from the reference.
+5. **DO NOT REPEAT**: Avoid using transition words like "therefore", "concerning", "thus" more than once.
+6. **ADAPT**: Adapt the structure to fit ALL content from Input Text.
+7. **PRESERVE FLOW**: Preserve natural English flow - do not create stilted or unnatural phrasing."""
         elif constraint_mode == "LOOSE":
-            constraint_instruction = """GUIDANCE: Prioritize meaning. Use the Structural Reference only for rhythm.
-- Write natural, grammatical English.
-- Do not copy strange punctuation (like ' . ') from the reference."""
+            constraint_instruction = """### STRUCTURAL INSTRUCTIONS
+1. **RHYTHM:** Use the Structural Reference only for rhythm and pacing.
+2. **LENGTH:** You are NOT bound by the reference's word count.
+   - **EXPAND** if needed to include all content.
+   - **COMPLETE** your sentences. Grammar > Length.
+3. **NATURAL:** Write natural, grammatical English.
+4. **PUNCTUATION:** Do not copy strange punctuation (like ' . ') from the reference."""
         else:  # SAFETY
             constraint_instruction = "INSTRUCTION: Ignore the Structural Reference. Rewrite the input content clearly using the target author's vocabulary and general style. Preserve all meaning."
 
@@ -402,8 +409,23 @@ To authentically write as {self.author_name}, you must adhere to these rules:
 
             structure_instructions_text = "\n".join(structure_instructions)
 
-        # Prepend constraint instruction to structure instructions
-        structure_instructions_text = f"{constraint_instruction}\n\n{structure_instructions_text}"
+        # Add Expansion & Logic Rules
+        expansion_rules = """
+### EXPANSION & LOGIC RULES (NEW)
+1. **EXPANSION IS ALLOWED:** You may expand the text if necessary to improve flow, clarity, or rhetorical weight.
+   - You can add transitional phrases to connect ideas smoothly.
+   - You can add adjectives or short clauses to strengthen the existing argument.
+   - **LIMIT:** Do not invent new facts. Only expand on *existing* ideas.
+
+2. **LOGIC FIRST:** The logic of the Input Text is supreme.
+   - If the Structural Reference starts with "Therefore" but the Input is a standalone statement, DELETE the "Therefore."
+   - Never write "Therefore, because" or "Thus, however."
+
+3. **GRAMMAR OVER STRUCTURE:** If adhering to the Structural Reference would create a fragment or awkward sentence, BREAK THE STRUCTURE. Your final output must be grammatically perfect English.
+"""
+
+        # Prepend expansion rules and constraint instruction to structure instructions
+        structure_instructions_text = f"{expansion_rules}\n\n{constraint_instruction}\n\n{structure_instructions_text}"
 
         # Build situation match content
         if situation_match:

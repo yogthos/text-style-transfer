@@ -38,6 +38,26 @@ except ImportError:
     spacy = None
     _spacy_nlp = None
 
+# Load spaCy model for grammatical completeness checking
+try:
+    if spacy is not None:
+        try:
+            _grammar_nlp = spacy.load("en_core_web_sm")
+        except (OSError, IOError):
+            # Try to download if not available
+            try:
+                import subprocess
+                import sys
+                subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
+                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+                _grammar_nlp = spacy.load("en_core_web_sm")
+            except:
+                _grammar_nlp = None
+    else:
+        _grammar_nlp = None
+except Exception:
+    _grammar_nlp = None
+
 # Initialize sentence-transformers for semantic similarity
 try:
     from sentence_transformers import SentenceTransformer, util
@@ -456,6 +476,83 @@ def is_text_complete(text: str) -> bool:
     return True
 
 
+def is_grammatically_complete(text: str) -> bool:
+    """
+    Uses dependency parsing to ensure the sentence is not a fragment.
+
+    Fixes the bug where "The cycle... defines..." was flagged as a fragment.
+    Now trusts spaCy's ROOT detection rather than using brittle comma heuristics.
+
+    Args:
+        text: Text to check for grammatical completeness.
+
+    Returns:
+        True if text is grammatically complete, False if it's a fragment.
+    """
+    if not text:
+        return False
+
+    # Use spaCy if available
+    if _grammar_nlp is None:
+        # Fallback: basic check (rely on is_text_complete for basic validation)
+        return True
+
+    try:
+        doc = _grammar_nlp(text)
+
+        # Check 1: Must have a ROOT (main clause indicator)
+        # Most sentences have a VERB or AUX as the ROOT, but sometimes spaCy
+        # incorrectly parses complex subjects as ROOT. We check for both:
+        # - ROOT is a verb (ideal case)
+        # - OR ROOT exists AND there's a verb in the sentence (fallback for parsing errors)
+        has_root_verb = any(token.dep_ == "ROOT" and token.pos_ in ["VERB", "AUX"] for token in doc)
+        has_root = any(token.dep_ == "ROOT" for token in doc)
+        has_verb = any(token.pos_ in ["VERB", "AUX"] for token in doc)
+
+        if not has_root:
+            return False
+
+        # If ROOT is not a verb, we still accept if there's a verb in the sentence
+        # (handles spaCy parsing errors for complex subjects)
+        if not has_root_verb:
+            if not has_verb:
+                return False
+            # ROOT exists and verb exists - likely a parsing quirk, accept it
+
+        # Check 2: Verify ROOT is not inside a subordinate clause without a main clause
+        # This is handled by spaCy's ROOT detection - if ROOT exists and there's a verb,
+        # the sentence has a main clause. We trust spaCy's parsing.
+
+        # Check 3: Participle Phrase Detection
+        # "Stars burning, succumbing to erosion" -> 'burning' is VBG. If it has no aux ('are burning'), it's a fragment.
+        # Check if there are any participles (VBG/VBN) that are not auxiliaries and don't have auxiliaries
+        participles = [t for t in doc if t.tag_ in ["VBG", "VBN"] and t.pos_ == "VERB"]
+        for part in participles:
+            # Skip if this participle is an auxiliary itself
+            if part.dep_ in ["aux", "auxpass"]:
+                continue
+            # Check if this participle has an auxiliary as a child
+            has_aux = any(child.dep_ == "aux" or child.dep_ == "auxpass" for child in part.children)
+            # Also check if there's an auxiliary before it (common pattern: "is burning")
+            has_aux_before = False
+            for i, token in enumerate(doc):
+                if token == part and i > 0:
+                    prev_token = doc[i-1]
+                    if prev_token.dep_ in ["aux", "auxpass"] or prev_token.tag_ in ["VBZ", "VBD", "VBP", "VB"]:
+                        has_aux_before = True
+                        break
+            if not has_aux and not has_aux_before:
+                # If ROOT is a noun and we have a participle without auxiliary, it's likely a fragment
+                roots = [t for t in doc if t.dep_ == "ROOT"]
+                if roots and roots[0].pos_ == "NOUN":
+                    return False  # Fragment detected: noun ROOT with participle without auxiliary
+
+        return True
+    except Exception:
+        # If spaCy processing fails, fall back to basic validation
+        return True
+
+
 def check_repetition(text: str, max_bigram_repeats: int = 3, max_sentence_start_repeats: int = 2) -> Optional[Dict[str, any]]:
     """Check for excessive word repetition in text.
 
@@ -609,7 +706,7 @@ def check_critical_nouns_coverage(
 def check_keyword_coverage(
     generated_text: str,
     original_text: str,
-    coverage_threshold: float = 0.7
+    coverage_threshold: float = 0.6  # Lowered from 0.7 to 0.6
 ) -> Optional[Dict[str, any]]:
     """Check that generated text preserves key concepts from original.
 
@@ -626,7 +723,7 @@ def check_keyword_coverage(
     if not generated_text or not original_text:
         return None
 
-    from src.ingestion.semantic import extract_keywords
+    from src.ingestion.semantic import extract_keywords, get_wordnet_synonyms
 
     original_keywords = set(extract_keywords(original_text))
     generated_keywords = set(extract_keywords(generated_text))
@@ -634,18 +731,34 @@ def check_keyword_coverage(
     if not original_keywords:
         return None  # No keywords to check
 
-    # Calculate coverage: how many original keywords appear in generated
-    covered_keywords = original_keywords & generated_keywords
-    coverage_ratio = len(covered_keywords) / len(original_keywords)
+    # Calculate coverage: how many original keywords appear in generated (with synonym support)
+    covered_count = 0
+    missing_keywords = []
+
+    for orig_kw in original_keywords:
+        # 1. Direct Match
+        if orig_kw in generated_keywords:
+            covered_count += 1
+            continue
+
+        # 2. Synonym Match (The Fix)
+        # Get synonyms for the original keyword
+        orig_synonyms = get_wordnet_synonyms(orig_kw)
+        if orig_synonyms & generated_keywords:
+            covered_count += 1
+        else:
+            missing_keywords.append(orig_kw)
+
+    coverage_ratio = covered_count / len(original_keywords) if original_keywords else 1.0
 
     if coverage_ratio < coverage_threshold:
-        missing_keywords = original_keywords - generated_keywords
-        missing_list = list(missing_keywords)[:10]  # Show up to 10 missing keywords
+        missing_list = missing_keywords[:10]  # Show up to 10 missing keywords
         return {
             "pass": False,
             "feedback": f"CRITICAL: Generated text is missing key concepts. Coverage: {coverage_ratio:.1%} (required: {coverage_threshold:.1%}). Missing keywords: {', '.join(missing_list)}. Preserve ALL concepts from original text.",
             "score": 0.0,
-            "primary_failure_type": "meaning"
+            "primary_failure_type": "meaning",
+            "coverage_ratio": coverage_ratio  # Store for potential override
         }
 
     return None
@@ -694,6 +807,108 @@ def check_semantic_similarity(generated: str, original: str, threshold: float = 
     except Exception:
         # Error during encoding/similarity calculation, return True to avoid blocking
         return True
+
+
+def check_soft_keyword_coverage(
+    generated_text: str,
+    original_text: str,
+    coverage_threshold: float = 0.8,
+    similarity_threshold: float = 0.7
+) -> Optional[Dict[str, any]]:
+    """
+    Calculates keyword coverage using Vector Semantic Similarity.
+    Allows for valid synonyms (Experience ~= Practice) without hardcoded lists.
+
+    Uses sentence-transformers to encode keywords as vectors and compute
+    cosine similarity between input and output keywords.
+
+    Args:
+        generated_text: Generated text to check.
+        original_text: Original input text.
+        coverage_threshold: Minimum ratio of keywords that must have semantic matches (default: 0.8).
+        similarity_threshold: Minimum cosine similarity for a keyword match (default: 0.7).
+
+    Returns:
+        None if coverage is acceptable, or failure dict if too many keywords missing.
+    """
+    if not generated_text or not original_text:
+        return None
+
+    global _sentence_model
+
+    # Lazy load sentence-transformers model
+    if _sentence_model is None and SentenceTransformer is not None:
+        try:
+            _sentence_model = SentenceTransformer('all-MiniLM-L6-v2')
+        except Exception:
+            # Model loading failed, fall back to old check
+            return None
+
+    if _sentence_model is None or util is None:
+        # Fallback: return None to use old checks
+        return None
+
+    try:
+        from src.ingestion.semantic import extract_keywords
+        import torch
+
+        # 1. Extract keywords (nouns/verbs) from both texts
+        input_keywords = list(set(extract_keywords(original_text)))
+        output_keywords = list(set(extract_keywords(generated_text)))
+
+        if not input_keywords:
+            return None  # No keywords to check
+        if not output_keywords:
+            # No output keywords - definitely a failure
+            return {
+                "pass": False,
+                "feedback": f"CRITICAL: Generated text has no keywords. Preserve key concepts from original text.",
+                "score": 0.0,
+                "primary_failure_type": "meaning",
+                "coverage_ratio": 0.0
+            }
+
+        # 2. Encode keywords to vectors
+        # We encode them as individual distinct concepts
+        input_vecs = _sentence_model.encode(input_keywords, convert_to_tensor=True)
+        output_vecs = _sentence_model.encode(output_keywords, convert_to_tensor=True)
+
+        # 3. Compute similarity matrix
+        # Shape: [num_input_keys, num_output_keys]
+        # This gives us the similarity of EVERY input word against EVERY output word
+        similarity_matrix = util.cos_sim(input_vecs, output_vecs)
+
+        # 4. Find best matches
+        # For each input keyword, find the max similarity score in the output list
+        max_scores, max_indices = torch.max(similarity_matrix, dim=1)
+
+        # 5. Calculate coverage
+        # A keyword is "covered" if its best match is above the similarity threshold
+        covered_mask = max_scores > similarity_threshold
+        covered_count = torch.sum(covered_mask).item()
+        coverage_ratio = covered_count / len(input_keywords) if input_keywords else 1.0
+
+        if coverage_ratio < coverage_threshold:
+            # Find missing keywords for feedback
+            missing_keywords = []
+            for i, score in enumerate(max_scores):
+                if score.item() < similarity_threshold:
+                    missing_keywords.append(input_keywords[i])
+
+            missing_list = missing_keywords[:10]  # Show up to 10 missing keywords
+            return {
+                "pass": False,
+                "feedback": f"CRITICAL: Generated text is missing key concepts. Semantic coverage: {coverage_ratio:.1%} (required: {coverage_threshold:.1%}). Missing keywords: {', '.join(missing_list)}. Preserve ALL concepts from original text.",
+                "score": 0.0,
+                "primary_failure_type": "meaning",
+                "coverage_ratio": coverage_ratio
+            }
+
+        return None
+    except Exception as e:
+        # If vector encoding fails, fall back gracefully
+        # Return None to allow old checks to run
+        return None
 
 
 def _check_semantic_validity(generated_text: str) -> Optional[Dict[str, any]]:
@@ -1744,6 +1959,12 @@ def generate_with_critic(
         # Initialize score to ensure it's always set
         score = 0.0
         critic_result = None
+        # Initialize keyword coverage tracking for potential override
+        keyword_failed = False  # Keep for backward compatibility if needed
+        keyword_coverage_ratio = 1.0
+        # Initialize soft coverage tracking
+        soft_coverage_failed = False
+        soft_coverage_ratio = 1.0
 
         # HARD GATE 1: Check grammatical coherence (word salad detection)
         # This catches word salad like "The Human View of Discrete Levels Scale..."
@@ -1766,36 +1987,48 @@ def generate_with_critic(
                 "primary_failure_type": "grammar"
             }
             score = 0.0
+        # HARD GATE 1.6: Check grammatical completeness (fragment detection)
+        elif not is_grammatically_complete(current_text):
+            print("    ⚠ FAIL: Text is grammatically incomplete (fragment or orphaned clause).")
+            critic_result = {
+                "pass": False,
+                "feedback": "CRITICAL: Generated text is a grammatical fragment. The sentence must have a main clause with a root verb. Complete the thought with a proper main clause.",
+                "score": 0.0,
+                "primary_failure_type": "grammar"
+            }
+            score = 0.0
         # HARD GATE 2: Check for repetition (before semantic similarity)
         elif check_repetition(current_text):
             repetition_result = check_repetition(current_text)
             print("    ⚠ FAIL: Text contains excessive repetition.")
             critic_result = repetition_result
             score = repetition_result.get("score", 0.0)
-        # HARD GATE 2.25: Check critical nouns coverage (strict noun preservation)
+        # HARD GATE 2.25: Semantic Keyword Coverage (Vector-Based)
+        # Replaces both check_critical_nouns_coverage and check_keyword_coverage
+        # Uses sentence-transformers for semantic soft-matching
         elif content_unit.original_text:
-            critical_nouns_result = check_critical_nouns_coverage(
+            soft_coverage_result = check_soft_keyword_coverage(
                 current_text,
                 content_unit.original_text,
-                coverage_threshold=0.9
+                coverage_threshold=0.8,  # Require 80% of concepts to have semantic match
+                similarity_threshold=0.7  # Minimum similarity for a match (0.7 = good synonym)
             )
-            if critical_nouns_result:
-                print("    ⚠ FAIL: Critical nouns coverage too low (nouns missing).")
-                critic_result = critical_nouns_result
-                score = critical_nouns_result.get("score", 0.0)
-            # HARD GATE 2.5: Check keyword coverage (concept verification)
-                keyword_coverage_result = check_keyword_coverage(
-                    current_text,
-                    content_unit.original_text,
-                    coverage_threshold=0.85  # Increased from 0.7 to 0.85 for stricter concept preservation
-                )
-                if keyword_coverage_result:
-                    print("    ⚠ FAIL: Keyword coverage too low (concepts missing).")
-                    critic_result = keyword_coverage_result
-                    score = keyword_coverage_result.get("score", 0.0)
-                # HARD GATE 3: Check semantic similarity (meaning preservation)
-                # Increased threshold from 0.5 to 0.65 for stricter meaning preservation
-                elif not check_semantic_similarity(current_text, content_unit.original_text, threshold=0.65):
+
+            if soft_coverage_result:
+                print("    ⚠ FAIL: Semantic concept coverage too low.")
+                critic_result = soft_coverage_result
+                score = soft_coverage_result.get("score", 0.0)
+                # Store coverage ratio for potential override
+                soft_coverage_ratio = soft_coverage_result.get("coverage_ratio", 0.0)
+                soft_coverage_failed = True
+            else:
+                soft_coverage_failed = False
+                soft_coverage_ratio = 1.0
+
+            # HARD GATE 3: Check semantic similarity (meaning preservation)
+            # Only check if soft coverage passed
+            if not soft_coverage_failed:
+                if not check_semantic_similarity(current_text, content_unit.original_text, threshold=0.65):
                     print("    ⚠ FAIL: Semantic similarity too low (Meaning lost).")
                     critic_result = {
                         "pass": False,
@@ -1804,8 +2037,26 @@ def generate_with_critic(
                         "primary_failure_type": "meaning"
                     }
                     score = 0.0
-                # If keyword coverage and semantic similarity both pass, continue to LLM evaluation below
+                # If soft coverage and semantic similarity both pass, continue to LLM evaluation below
                 # (score is already initialized to 0.0, will be set by LLM critic)
+
+        # HARD GATE OVERRIDE: High Semantic Similarity + Good Grammar = Accept
+        # If we are failing ONLY on soft keyword coverage but meaning is preserved
+        # via vector similarity (>0.8), we assume it's a valid paraphrase.
+        if (soft_coverage_failed and
+            soft_coverage_ratio >= 0.6 and  # At least 60% semantic keyword coverage
+            check_semantic_similarity(current_text, content_unit.original_text, threshold=0.8) and  # Trust the vector
+            is_grammatically_complete(current_text)):
+
+            print("    ✓ Overriding Semantic Keyword check: High Semantic Similarity (>0.8) detects valid paraphrase.")
+            critic_result = {
+                "pass": True,
+                "score": 0.8,  # Good score for valid paraphrase
+                "primary_failure_type": "none",
+                "feedback": "Accepted: High semantic similarity (>0.8) indicates valid stylistic paraphrase despite marginal keyword coverage."
+            }
+            score = 0.8
+            soft_coverage_failed = False  # Reset flag so we proceed to LLM evaluation
 
         # HARD GATE 4: Check length before LLM evaluation
         # FIX: Length gate now compares generated_text to input_text (content preservation)

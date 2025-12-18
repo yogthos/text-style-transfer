@@ -74,48 +74,69 @@ def get_representative_sample_for_author(collection, author_id: str) -> str:
     metadatas = results['metadatas']
     documents = results['documents']
 
-    # Compute style vectors for all documents
+    # OPTIMIZATION: Limit the number of documents processed to avoid slow computation
+    # For large corpora, we sample a subset (max 100 documents) to find representative sample
+    MAX_DOCS_TO_PROCESS = 100
+    if len(documents) > MAX_DOCS_TO_PROCESS:
+        # Sample documents evenly across the corpus
+        import random
+        sample_indices = sorted(random.sample(range(len(documents)), MAX_DOCS_TO_PROCESS))
+        sampled_documents = [documents[i] for i in sample_indices]
+        sampled_metadatas = [metadatas[i] for i in sample_indices]
+    else:
+        sample_indices = list(range(len(documents)))
+        sampled_documents = documents
+        sampled_metadatas = metadatas
+
+    # Compute style vectors for sampled documents
     style_vectors = []
     valid_indices = []
-    for idx, doc_text in enumerate(documents):
+    total_docs = len(sampled_documents)
+    for local_idx, doc_text in enumerate(sampled_documents):
         if doc_text and len(doc_text.strip()) > 50:  # Minimum length check
             try:
+                # Show progress for large batches
+                if total_docs > 10 and (local_idx + 1) % max(1, total_docs // 10) == 0:
+                    print(f"    Processing document {local_idx + 1}/{total_docs}...", end='\r')
                 style_vec = get_style_vector(doc_text)
                 style_vectors.append(style_vec)
-                valid_indices.append(idx)
+                # Map back to original index
+                original_idx = sample_indices[local_idx]
+                valid_indices.append(original_idx)
             except Exception:
                 continue
+    if total_docs > 10:
+        print()  # New line after progress
 
     if not style_vectors:
         return ""
 
     # Group by cluster_id if available
     cluster_groups = defaultdict(list)
-    for valid_idx in valid_indices:
+    for vec_idx, valid_idx in enumerate(valid_indices):
         meta = metadatas[valid_idx]
         cluster_id = meta.get('cluster_id')
         if cluster_id is not None:
-            cluster_groups[cluster_id].append(valid_idx)
+            cluster_groups[cluster_id].append((valid_idx, vec_idx))
 
     # Find largest cluster or use all documents
     if cluster_groups:
         cluster_counts = {cid: len(indices) for cid, indices in cluster_groups.items()}
         largest_cluster_id = max(cluster_counts.items(), key=lambda x: x[1])[0]
-        cluster_indices = cluster_groups[largest_cluster_id]
+        cluster_items = cluster_groups[largest_cluster_id]
 
-        # Get style vectors for this cluster
-        cluster_style_vectors = [style_vectors[valid_indices.index(idx)] for idx in cluster_indices]
+        # Get style vectors for this cluster (using vec_idx from tuple)
+        cluster_style_vectors = [style_vectors[vec_idx] for _, vec_idx in cluster_items]
         cluster_center = np.mean(cluster_style_vectors, axis=0)
 
         # Find document closest to cluster center
         min_distance = float('inf')
         best_idx = None
-        for idx in cluster_indices:
-            vec_idx = valid_indices.index(idx)
+        for orig_idx, vec_idx in cluster_items:
             distance = np.linalg.norm(style_vectors[vec_idx] - cluster_center)
             if distance < min_distance:
                 min_distance = distance
-                best_idx = idx
+                best_idx = orig_idx
     else:
         # No cluster info - use centroid of all documents
         all_center = np.mean(style_vectors, axis=0)
@@ -337,6 +358,13 @@ Examples:
             # Get representative sample
             if args.verbose:
                 print(f"  Retrieving representative sample...")
+            # Get document count first for progress indication
+            try:
+                doc_count = len(collection.get(where={"author_id": author_id}, include=["documents"]).get('documents', []))
+                if doc_count > 100:
+                    print(f"  Processing {doc_count} documents (sampling 100 for performance)...")
+            except:
+                pass
             representative_sample = get_representative_sample_for_author(collection, author_id)
 
             if not representative_sample or len(representative_sample.strip()) < 50:

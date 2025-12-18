@@ -297,6 +297,26 @@ class StyleAtlas:
                 pass
             return []
 
+    def get_author_style_vector(self, author_name: str) -> Optional[np.ndarray]:
+        """Get the average style vector for a specific author.
+
+        Uses StyleBlender internally to calculate the author centroid.
+
+        Args:
+            author_name: Author identifier to get style vector for.
+
+        Returns:
+            Mean style vector (numpy array) representing the author's average style,
+            or None if author not found or StyleBlender unavailable.
+        """
+        try:
+            from src.atlas.blender import StyleBlender
+            blender = StyleBlender(self)
+            return blender.get_author_centroid(author_name)
+        except (ValueError, ImportError, Exception) as e:
+            # Author not found or StyleBlender unavailable - return None
+            return None
+
 
 def _chunk_into_paragraphs(text: str) -> List[str]:
     """Chunk text into paragraphs.

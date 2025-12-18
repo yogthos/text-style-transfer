@@ -12,7 +12,6 @@ from src.atlas.rhetoric import RhetoricalType, RhetoricalClassifier
 from src.generator.translator import StyleTranslator
 from src.validator.semantic_critic import SemanticCritic
 from src.ingestion.blueprint import SemanticBlueprint
-from src.pipeline_v2 import process_text_v2
 from src.atlas.builder import StyleAtlas
 
 
@@ -155,6 +154,11 @@ def test_final_checklist():
     print("✓ Generator: Prompt explicitly separates Style Examples from Input Blueprint")
 
     # 3. Critic: Does the Semantic Critic use sentence-transformers (vectors) instead of string matching?
+    try:
+        from src.validator.semantic_critic import SENTENCE_TRANSFORMERS_AVAILABLE
+    except ImportError:
+        SENTENCE_TRANSFORMERS_AVAILABLE = False
+
     critic = SemanticCritic()
     uses_vectors = critic.semantic_model is not None or SENTENCE_TRANSFORMERS_AVAILABLE
     assert uses_vectors, "Critic should use sentence-transformers"
@@ -173,7 +177,10 @@ def test_final_checklist():
 
 if __name__ == "__main__":
     # Import needed for test
-    from src.validator.semantic_critic import SENTENCE_TRANSFORMERS_AVAILABLE
+    try:
+        from src.validator.semantic_critic import SENTENCE_TRANSFORMERS_AVAILABLE
+    except ImportError:
+        SENTENCE_TRANSFORMERS_AVAILABLE = False
 
     test_phase2_rhetorical_classification()
     test_phase3_prompt_separation()

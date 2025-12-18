@@ -2605,7 +2605,7 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         if not paragraph or not paragraph.strip():
             return paragraph
 
-        # Step 1: Extract atomic propositions
+        # Step 1: Extract atomic propositions (with citations bound to facts)
         if verbose:
             print(f"  Extracting atomic propositions from paragraph...")
         propositions = self.proposition_extractor.extract_atomic_propositions(paragraph)
@@ -2615,6 +2615,24 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         if not propositions:
             # Fallback: use original paragraph
             return paragraph
+
+        # Step 1.5: Extract direct quotations separately (for quote preservation)
+        quote_pattern = r'["\'](?:[^"\']|(?<=\\)["\'])*["\']'
+        extracted_quotes = []
+        for match in re.finditer(quote_pattern, paragraph):
+            quote_text = match.group(0)
+            # Only consider substantial quotations (more than just punctuation)
+            if len(quote_text.strip('"\'')) > 2:
+                extracted_quotes.append(quote_text)
+
+        if verbose and extracted_quotes:
+            print(f"  Extracted {len(extracted_quotes)} direct quotations")
+
+        # Extract expected citations from input paragraph (for verification)
+        citation_pattern = r'\[\^\d+\]'
+        expected_citations = set(re.findall(citation_pattern, paragraph))
+        if verbose and expected_citations:
+            print(f"  Expected citations: {sorted(expected_citations)}")
 
         # Step 2: Retrieve complex/long style examples
         # For paragraph fusion, we want LONG examples (ignore length mismatch filters)
@@ -2666,13 +2684,54 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
             if verbose:
                 print(f"  Extracted style DNA: {style_dna.get('tone', 'Unknown')} tone")
 
+        # Extract style_lexicon for use in evaluation and repair
+        style_lexicon = None
+        if style_dna and isinstance(style_dna, dict):
+            style_lexicon = style_dna.get("lexicon", [])
+
         # Step 4: Format and call LLM with PARAGRAPH_FUSION_PROMPT
         propositions_list = "\n".join([f"- {prop}" for prop in propositions])
         style_examples_text = "\n\n".join([f"Example {i+1}: \"{ex}\"" for i, ex in enumerate(complex_examples[:3])])
 
+        # Extract lexicon and format mandatory vocabulary section
+        mandatory_vocabulary = ""
+        if style_dna and isinstance(style_dna, dict):
+            lexicon = style_dna.get("lexicon", [])
+            if lexicon:
+                # Limit to top 15 most frequent words to avoid overwhelming prompt context
+                top_lexicon = lexicon[:15]
+                lexicon_text = ", ".join(top_lexicon)
+                mandatory_vocabulary = f"""### MANDATORY VOCABULARY:
+You MUST use at least 3-5 distinct words from this list in your paragraph: {lexicon_text}
+These words are characteristic of the target author's voice. Integrate them naturally into your writing."""
+
+        # Extract rhetorical connectors from examples
+        rhetorical_connectors = ""
+        # Common transition phrases to look for in examples
+        common_connectors = [
+            "furthermore", "moreover", "consequently", "therefore", "thus", "hence",
+            "it follows that", "in this way", "in this manner", "accordingly",
+            "as a result", "for this reason", "indeed", "in fact", "specifically",
+            "in particular", "notably", "significantly", "importantly", "crucially"
+        ]
+        # Extract connectors found in examples
+        found_connectors = []
+        examples_text_combined = " ".join(complex_examples[:3]).lower()
+        for connector in common_connectors:
+            if connector in examples_text_combined:
+                found_connectors.append(connector)
+
+        if found_connectors:
+            connectors_text = ", ".join(found_connectors[:10])  # Limit to 10
+            rhetorical_connectors = f"""### RHETORICAL CONNECTORS:
+Use these transition phrases to link the propositions naturally: {connectors_text}
+These connectors match the author's style and help create flowing, complex sentences."""
+
         prompt = PARAGRAPH_FUSION_PROMPT.format(
             propositions_list=propositions_list,
-            style_examples=style_examples_text
+            style_examples=style_examples_text,
+            mandatory_vocabulary=mandatory_vocabulary,
+            rhetorical_connectors=rhetorical_connectors
         )
 
         if verbose:
@@ -2722,15 +2781,40 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
             proposition_recall_threshold = self.paragraph_fusion_config.get("proposition_recall_threshold", 0.8)
 
             for i, variation in enumerate(variations):
+                if verbose:
+                    print(f"    Evaluating variation {i+1}/{len(variations)}...")
+
                 # Clean variation (remove "Variation X:" prefix if present)
                 cleaned_variation = re.sub(r'^Variation \d+:\s*', '', variation.strip())
+
+                # Task 4: Verify citations and quotes are present
+                found_citations = set(re.findall(citation_pattern, cleaned_variation))
+                missing_citations = expected_citations - found_citations
+
+                # Check quotes (exact match required)
+                found_quotes = []
+                for match in re.finditer(quote_pattern, cleaned_variation):
+                    quote_text = match.group(0)
+                    if len(quote_text.strip('"\'')) > 2:
+                        found_quotes.append(quote_text)
+                missing_quotes = [q for q in extracted_quotes if q not in found_quotes]
+
+                # If citations or quotes are missing, mark for repair (but still evaluate)
+                needs_artifact_repair = len(missing_citations) > 0 or len(missing_quotes) > 0
+
+                if verbose and needs_artifact_repair:
+                    if missing_citations:
+                        print(f"    Variation {i+1}: Missing citations: {sorted(missing_citations)}")
+                    if missing_quotes:
+                        print(f"    Variation {i+1}: Missing quotes: {len(missing_quotes)}")
 
                 critic_result = critic.evaluate(
                     generated_text=cleaned_variation,
                     input_blueprint=blueprint,
                     propositions=propositions,
                     is_paragraph=True,
-                    author_style_vector=author_style_vector
+                    author_style_vector=author_style_vector,
+                    style_lexicon=style_lexicon
                 )
 
                 evaluated_candidates.append({
@@ -2738,7 +2822,10 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                     "recall": critic_result.get("proposition_recall", 0.0),
                     "style_alignment": critic_result.get("style_alignment", 0.0),
                     "score": critic_result.get("score", 0.0),
-                    "result": critic_result
+                    "result": critic_result,
+                    "missing_citations": missing_citations,
+                    "missing_quotes": missing_quotes,
+                    "needs_artifact_repair": needs_artifact_repair
                 })
 
                 if verbose:
@@ -2754,8 +2841,29 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
             ]
 
             if qualified_candidates:
-                # 2. From qualified pool, pick highest composite score (Style + Meaning)
-                best_candidate = max(qualified_candidates, key=lambda x: x["score"])
+                # 2. From qualified pool, prioritize candidates without missing citations/quotes
+                # Then pick highest composite score (Style + Meaning)
+                complete_candidates = [c for c in qualified_candidates if not c.get("needs_artifact_repair", False)]
+                if complete_candidates:
+                    best_candidate = max(complete_candidates, key=lambda x: x["score"])
+                else:
+                    # If all have missing artifacts, pick best and repair
+                    best_candidate = max(qualified_candidates, key=lambda x: x["score"])
+
+                # Repair missing citations/quotes if needed
+                if best_candidate.get("needs_artifact_repair", False):
+                    repaired = self._repair_missing_artifacts(
+                        best_candidate["text"],
+                        best_candidate.get("missing_citations", set()),
+                        best_candidate.get("missing_quotes", []),
+                        style_lexicon=style_lexicon,
+                        verbose=verbose
+                    )
+                    if repaired:
+                        best_candidate["text"] = repaired
+                        if verbose:
+                            print(f"  ✓ Repaired missing citations/quotes")
+
                 if verbose:
                     print(f"  ✓ Selected qualified candidate: recall={best_candidate['recall']:.2f}, "
                           f"score={best_candidate['score']:.2f}")
@@ -2767,111 +2875,305 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                     print(f"  ⚠ No qualified candidates (recall >= {proposition_recall_threshold}), "
                           f"using best recall: {best_candidate['recall']:.2f}")
 
-                # Task 3: "Delta" Repair Loop - if recall < 0.7, attempt repair
+                # Task 3: "Delta" Repair Loop - if recall < threshold, attempt repair
                 repair_threshold = 0.7
-                if best_candidate["recall"] < repair_threshold:
-                    if verbose:
-                        print(f"  🔧 Repair loop triggered: recall {best_candidate['recall']:.2f} < {repair_threshold}")
+                max_repair_attempts = 2
+                repair_attempt = 0
+                current_best = best_candidate
 
-                    # Identify missing propositions
-                    recall_details = best_candidate["result"].get("recall_details", {})
+                while current_best["recall"] < proposition_recall_threshold and repair_attempt < max_repair_attempts:
+                    repair_attempt += 1
+                    if verbose:
+                        print(f"  🔧 Repair loop attempt {repair_attempt}/{max_repair_attempts}: recall {current_best['recall']:.2f} < {proposition_recall_threshold:.2f}")
+
+                    # Identify missing propositions from current best candidate
+                    recall_details = current_best["result"].get("recall_details", {})
                     missing_propositions = recall_details.get("missing", [])
 
-                    if missing_propositions:
-                        if verbose:
-                            print(f"  Missing {len(missing_propositions)} propositions: {missing_propositions[:3]}...")
+                    if not missing_propositions:
+                        break  # No missing propositions, no need to repair
 
-                        # Generate repair prompt
-                        repair_prompt = f"""The following paragraph is good but missed these specific facts: {', '.join(missing_propositions[:5])}.
+                    if verbose:
+                        print(f"  Missing {len(missing_propositions)} propositions:")
+                        for prop in missing_propositions[:5]:
+                            print(f"    - {prop}")
+                        if len(missing_propositions) > 5:
+                            print(f"    ... and {len(missing_propositions) - 5} more")
 
-Rewrite it to include them seamlessly. Maintain the style and structure, but ensure all the missing facts are incorporated naturally.
+                    # Get preserved propositions for full checklist
+                    preserved_propositions = recall_details.get("preserved", [])
+                    all_propositions = preserved_propositions + missing_propositions
 
-Original paragraph:
-"{best_candidate['text']}"
+                    # Generate repair prompt with FULL proposition checklist
+                    all_propositions_list = "\n".join([f"{i+1}. {prop}" for i, prop in enumerate(all_propositions)])
+                    missing_list = "\n".join([f"{i+1}. {prop}" for i, prop in enumerate(missing_propositions[:10])])
 
-Generate 3 new variations that include all the missing facts. Output as a JSON array of strings:
+                    # Add style preservation instructions if lexicon available
+                    style_preservation = ""
+                    if style_lexicon:
+                        lexicon_text = ", ".join(style_lexicon[:15])  # Limit to 15
+                        style_preservation = f"""
+
+**CRITICAL: Do not lose the style of the original draft. You must maintain the Vocabulary ({lexicon_text}) and the Complex Sentence Structure. Do not simplify the text just to add the facts."""
+
+                    repair_prompt = f"""You need to re-write this paragraph to ensure ALL facts are present.
+
+**THE FULL CHECKLIST:**
+You must ensure EVERY one of the following propositions is present in the text. Check them off one by one as you write:
+{all_propositions_list}
+
+**MISSING ITEMS:**
+Pay special attention to these, which were missing in the last draft:
+{missing_list}
+
+**Style Constraint:** Maintain the complex sentence structure and vocabulary you used before. Do not simplify the text just to add the facts.{style_preservation}
+
+Original paragraph (for style reference):
+"{current_best['text']}"
+
+**Task:** Rewrite the paragraph completely. Ensure ALL propositions from the checklist above are present. Integrate them naturally into flowing, complex sentences. Do not just append facts at the end.
+
+Generate 3 new variations that include ALL facts from the checklist. Output as a JSON array of strings:
 [
   "Repaired variation 1...",
   "Repaired variation 2...",
   "Repaired variation 3..."
 ]"""
 
-                        try:
-                            # Generate repair variations
-                            repair_response = self.llm_provider.call(
-                                system_prompt="You are a ghostwriter repairing a paragraph to include missing facts. Output ONLY valid JSON arrays.",
-                                user_prompt=repair_prompt,
-                                model_type="editor",
-                                require_json=True,
-                                temperature=0.6,  # Slightly lower temperature for focused repair
-                                max_tokens=self.translator_config.get("max_tokens", 500)
-                            )
+                    try:
+                        # Generate repair variations
+                        repair_response = self.llm_provider.call(
+                            system_prompt="You are a ghostwriter repairing a paragraph to include missing facts. Output ONLY valid JSON arrays.",
+                            user_prompt=repair_prompt,
+                            model_type="editor",
+                            require_json=True,
+                            temperature=0.6,  # Slightly lower temperature for focused repair
+                            max_tokens=self.translator_config.get("max_tokens", 500)
+                        )
 
-                            repair_variations = self._extract_json_list(repair_response)
-                            repair_variations = repair_variations[:3]  # Limit to 3
+                        repair_variations = self._extract_json_list(repair_response)
+                        repair_variations = repair_variations[:3]  # Limit to 3
 
-                            if repair_variations:
-                                if verbose:
-                                    print(f"  Generated {len(repair_variations)} repair variations, evaluating...")
-
-                                # Evaluate repair variations
-                                for i, repair_var in enumerate(repair_variations):
-                                    cleaned_repair = re.sub(r'^Repaired variation \d+:\s*', '', repair_var.strip())
-
-                                    repair_result = critic.evaluate(
-                                        generated_text=cleaned_repair,
-                                        input_blueprint=blueprint,
-                                        propositions=propositions,
-                                        is_paragraph=True,
-                                        author_style_vector=author_style_vector
-                                    )
-
-                                    evaluated_candidates.append({
-                                        "text": cleaned_repair,
-                                        "recall": repair_result.get("proposition_recall", 0.0),
-                                        "style_alignment": repair_result.get("style_alignment", 0.0),
-                                        "score": repair_result.get("score", 0.0),
-                                        "result": repair_result
-                                    })
-
-                                    if verbose:
-                                        print(f"    Repair {i+1}: recall={repair_result.get('proposition_recall', 0.0):.2f}, "
-                                              f"style={repair_result.get('style_alignment', 0.0):.2f}, "
-                                              f"score={repair_result.get('score', 0.0):.2f}")
-
-                                # Re-select best from merged pool (original + repairs)
-                                qualified_after_repair = [
-                                    c for c in evaluated_candidates
-                                    if c["recall"] >= proposition_recall_threshold
-                                ]
-
-                                if qualified_after_repair:
-                                    best_after_repair = max(qualified_after_repair, key=lambda x: x["score"])
-                                    if verbose:
-                                        print(f"  ✓ Repair successful: recall={best_after_repair['recall']:.2f}, "
-                                              f"score={best_after_repair['score']:.2f}")
-                                    return best_after_repair["text"]
-                                else:
-                                    # Still no qualified, but pick best from all (including repairs)
-                                    best_after_repair = max(evaluated_candidates, key=lambda x: x["recall"])
-                                    if verbose:
-                                        print(f"  ⚠ Repair improved but still below threshold: "
-                                              f"recall={best_after_repair['recall']:.2f}")
-                                    return best_after_repair["text"]
-                            else:
-                                if verbose:
-                                    print(f"  ⚠ Repair generation failed, using original best candidate")
-                        except Exception as e:
+                        if repair_variations:
                             if verbose:
-                                print(f"  ⚠ Repair loop error: {e}, using original best candidate")
+                                print(f"  Generated {len(repair_variations)} repair variations, evaluating...")
 
-                # Return best candidate (either original or after failed repair)
-                return best_candidate["text"]
+                            # Evaluate repair variations
+                            for i, repair_var in enumerate(repair_variations):
+                                cleaned_repair = re.sub(r'^Repaired variation \d+:\s*', '', repair_var.strip())
+
+                                if verbose:
+                                    print(f"    Repair {i+1} text (first 100 chars): {cleaned_repair[:100]}...")
+
+                                # Verify citations and quotes in repair variations
+                                found_citations_repair = set(re.findall(citation_pattern, cleaned_repair))
+                                missing_citations_repair = expected_citations - found_citations_repair
+
+                                found_quotes_repair = []
+                                for match in re.finditer(quote_pattern, cleaned_repair):
+                                    quote_text = match.group(0)
+                                    if len(quote_text.strip('"\'')) > 2:
+                                        found_quotes_repair.append(quote_text)
+                                missing_quotes_repair = [q for q in extracted_quotes if q not in found_quotes_repair]
+
+                                needs_artifact_repair_repair = len(missing_citations_repair) > 0 or len(missing_quotes_repair) > 0
+
+                                repair_result = critic.evaluate(
+                                    generated_text=cleaned_repair,
+                                    input_blueprint=blueprint,
+                                    propositions=propositions,
+                                    is_paragraph=True,
+                                    author_style_vector=author_style_vector
+                                )
+
+                                # Extract similarity scores for debugging
+                                repair_recall_details = repair_result.get("recall_details", {})
+                                repair_similarity_scores = repair_recall_details.get("scores", {})
+                                repair_missing = repair_recall_details.get("missing", [])
+
+                                if verbose and repair_missing:
+                                    print(f"    Repair {i+1} missing propositions with similarity scores:")
+                                    for missing_prop in repair_missing[:5]:
+                                        score = repair_similarity_scores.get(missing_prop, 0.0)
+                                        best_match_key = f"{missing_prop}_best_match"
+                                        best_match = repair_similarity_scores.get(best_match_key, "N/A")
+                                        if best_match == "N/A" and score > 0:
+                                            # Fallback: try to find best match from generated sentences
+                                            best_match = "See generated text"
+                                        print(f"      [FAIL] '{missing_prop[:60]}...' - Best Match: '{best_match[:60] if isinstance(best_match, str) else str(best_match)[:60]}...' (Score: {score:.3f})")
+
+                                evaluated_candidates.append({
+                                    "text": cleaned_repair,
+                                    "recall": repair_result.get("proposition_recall", 0.0),
+                                    "style_alignment": repair_result.get("style_alignment", 0.0),
+                                    "score": repair_result.get("score", 0.0),
+                                    "result": repair_result,
+                                    "missing_citations": missing_citations_repair,
+                                    "missing_quotes": missing_quotes_repair,
+                                    "needs_artifact_repair": needs_artifact_repair_repair
+                                })
+
+                                if verbose:
+                                    print(f"    Repair {i+1}: recall={repair_result.get('proposition_recall', 0.0):.2f}, "
+                                          f"style={repair_result.get('style_alignment', 0.0):.2f}, "
+                                          f"score={repair_result.get('score', 0.0):.2f}")
+
+                            # Re-select best from merged pool (original + repairs)
+                            qualified_after_repair = [
+                                c for c in evaluated_candidates
+                                if c["recall"] >= proposition_recall_threshold
+                            ]
+
+                            if qualified_after_repair:
+                                best_after_repair = max(qualified_after_repair, key=lambda x: x["score"])
+                                if verbose:
+                                    print(f"  ✓ Repair {repair_attempt} successful: recall={best_after_repair['recall']:.2f}, "
+                                          f"score={best_after_repair['score']:.2f}")
+                                return best_after_repair["text"]
+                            else:
+                                # Still no qualified, but pick best from all (including repairs)
+                                best_after_repair = max(evaluated_candidates, key=lambda x: x["recall"])
+                                if verbose:
+                                    print(f"  ⚠ Repair {repair_attempt} improved to recall={best_after_repair['recall']:.2f} (still below threshold {proposition_recall_threshold:.2f})")
+
+                                # Update current_best for potential second repair pass
+                                current_best = best_after_repair
+                                # Continue loop to try second repair if needed
+                        else:
+                            if verbose:
+                                print(f"  ⚠ Repair {repair_attempt} generation failed, stopping repair loop")
+                            break  # Stop repair loop if generation fails
+                    except Exception as e:
+                        if verbose:
+                            print(f"  ⚠ Repair {repair_attempt} error: {e}, stopping repair loop")
+                        break  # Stop repair loop on error
+
+                # Repair missing citations/quotes if needed before returning
+                if current_best.get("needs_artifact_repair", False):
+                    repaired = self._repair_missing_artifacts(
+                        current_best["text"],
+                        current_best.get("missing_citations", set()),
+                        current_best.get("missing_quotes", []),
+                        style_lexicon=style_lexicon,
+                        verbose=verbose
+                    )
+                    if repaired:
+                        current_best["text"] = repaired
+                        if verbose:
+                            print(f"  ✓ Repaired missing citations/quotes before returning")
+
+                # Return best candidate (either original or after repair attempts)
+                if verbose and current_best["recall"] < proposition_recall_threshold:
+                    print(f"  ⚠ Final recall {current_best['recall']:.2f} below threshold {proposition_recall_threshold:.2f}, returning best available")
+                return current_best["text"]
 
         except Exception as e:
             if verbose:
                 print(f"  ✗ Paragraph fusion failed: {e}, using fallback")
             return paragraph  # Fallback to original
+
+    def _repair_missing_artifacts(
+        self,
+        candidate_text: str,
+        missing_citations: set,
+        missing_quotes: List[str],
+        style_lexicon: Optional[List[str]] = None,
+        verbose: bool = False
+    ) -> Optional[str]:
+        """Repair missing citations and quotes in generated text.
+
+        Args:
+            candidate_text: Generated text that may be missing citations/quotes.
+            missing_citations: Set of citation strings (e.g., {"[^1]", "[^2]"}).
+            missing_quotes: List of quote strings that should be present.
+            style_lexicon: Optional list of style words to preserve in the repair.
+            verbose: Whether to print debug information.
+
+        Returns:
+            Repaired text with citations/quotes inserted, or None if repair fails.
+        """
+        if not missing_citations and not missing_quotes:
+            return candidate_text  # Nothing to repair
+
+        if verbose:
+            print(f"  🔧 Repairing missing artifacts: {len(missing_citations)} citations, {len(missing_quotes)} quotes")
+
+        # Build repair prompt
+        repair_parts = []
+        if missing_citations:
+            citations_list = ", ".join(sorted(missing_citations))
+            repair_parts.append(f"Missing citations: {citations_list}. Please re-insert them next to their relevant claims.")
+        if missing_quotes:
+            quotes_list = "\n".join([f"- {quote}" for quote in missing_quotes[:5]])  # Limit to 5
+            repair_parts.append(f"Missing direct quotes (preserve exactly):\n{quotes_list}")
+
+        # Add style preservation instructions if lexicon provided
+        style_preservation = ""
+        if style_lexicon:
+            lexicon_text = ", ".join(style_lexicon[:15])  # Limit to 15
+            style_preservation = f"""
+
+**CRITICAL: Do not lose the style of the original draft. You must maintain the Vocabulary ({lexicon_text}) and the Complex Sentence Structure. Do not simplify the text just to add the citations/quotes."""
+
+        repair_prompt = f"""The following paragraph is good but is missing some citations and/or quotes:
+
+{chr(10).join(repair_parts)}
+
+Original paragraph:
+"{candidate_text}"{style_preservation}
+
+Rewrite the paragraph to include the missing citations and quotes. Place citations immediately after the claims they support. Include quotes exactly as shown. Maintain the style and structure.
+
+Output as a single paragraph (not JSON array):"""
+
+        try:
+            repair_response = self.llm_provider.call(
+                system_prompt="You are a ghostwriter repairing a paragraph to include missing citations and quotes. Output the repaired paragraph text directly, not JSON.",
+                user_prompt=repair_prompt,
+                model_type="editor",
+                require_json=False,
+                temperature=0.5,  # Lower temperature for precise repair
+                max_tokens=self.translator_config.get("max_tokens", 500)
+            )
+
+            repaired_text = repair_response.strip()
+
+            # Remove JSON array brackets if present (LLM sometimes returns JSON despite instructions)
+            if repaired_text.startswith('[') and repaired_text.endswith(']'):
+                try:
+                    parsed = json.loads(repaired_text)
+                    if isinstance(parsed, list) and len(parsed) > 0:
+                        repaired_text = parsed[0]  # Take first element if it's a list
+                except json.JSONDecodeError:
+                    # If JSON parsing fails, try to extract text between brackets
+                    pass
+
+            # Verify repair was successful
+            citation_pattern = r'\[\^\d+\]'
+            found_citations = set(re.findall(citation_pattern, repaired_text))
+            if missing_citations:
+                still_missing = missing_citations - found_citations
+                if still_missing and verbose:
+                    print(f"  ⚠ Some citations still missing after repair: {sorted(still_missing)}")
+
+            # Check quotes (exact match)
+            quote_pattern = r'["\'](?:[^"\']|(?<=\\)["\'])*["\']'
+            found_quotes = []
+            for match in re.finditer(quote_pattern, repaired_text):
+                quote_text = match.group(0)
+                if len(quote_text.strip('"\'')) > 2:
+                    found_quotes.append(quote_text)
+            if missing_quotes:
+                still_missing_quotes = [q for q in missing_quotes if q not in found_quotes]
+                if still_missing_quotes and verbose:
+                    print(f"  ⚠ Some quotes still missing after repair: {len(still_missing_quotes)}")
+
+            return repaired_text
+
+        except Exception as e:
+            if verbose:
+                print(f"  ⚠ Artifact repair failed: {e}")
+            return None  # Return None to indicate repair failed
 
     def _count_words(self, text: str) -> int:
         """Count words in text.

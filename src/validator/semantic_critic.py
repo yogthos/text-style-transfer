@@ -161,7 +161,8 @@ class SemanticCritic:
         skeleton_type: Optional[str] = None,
         propositions: Optional[List[str]] = None,
         is_paragraph: bool = False,
-        author_style_vector: Optional[np.ndarray] = None
+        author_style_vector: Optional[np.ndarray] = None,
+        style_lexicon: Optional[List[str]] = None
     ) -> Dict[str, any]:
         """Evaluate generated text against input blueprint.
 
@@ -214,7 +215,7 @@ class SemanticCritic:
         # PARAGRAPH MODE: Use proposition-based evaluation
         if is_paragraph and propositions:
             return self._evaluate_paragraph_mode(
-                generated_text, original_text, propositions, author_style_vector
+                generated_text, original_text, propositions, author_style_vector, style_lexicon=style_lexicon
             )
 
         # SENTENCE MODE: Continue with existing sentence-level logic
@@ -1257,7 +1258,7 @@ Return JSON:
 
         return True, ""
 
-    def _check_proposition_recall(self, generated_text: str, propositions: List[str]) -> Tuple[float, Dict]:
+    def _check_proposition_recall(self, generated_text: str, propositions: List[str], similarity_threshold: float = 0.45) -> Tuple[float, Dict]:
         """Check proposition recall by comparing each proposition against generated sentences.
 
         CRITICAL: Do NOT compare proposition vector against whole paragraph vector (too much noise).
@@ -1266,6 +1267,8 @@ Return JSON:
         Args:
             generated_text: Generated paragraph text.
             propositions: List of atomic proposition strings.
+            similarity_threshold: Similarity threshold for matching (default: 0.45 for sentence mode,
+                                0.40 recommended for paragraph mode to account for stylized text).
 
         Returns:
             Tuple of (recall_score: float, details_dict: Dict).
@@ -1304,9 +1307,9 @@ Return JSON:
         preserved = []
         missing = []
         scores = {}
-        threshold = 0.45  # Proposition is "present" if max similarity > 0.45
-        # Lowered from 0.65 to account for stylistic variation - semantically equivalent
-        # but differently worded text can have similarity ~0.5, which is still valid
+        threshold = similarity_threshold  # Use parameter instead of hardcoded value
+        # Default 0.45 for sentence mode, 0.40 for paragraph mode to account for stylized text
+        # where short propositions are embedded in long, complex sentences (vector signal dilution)
 
         for prop in propositions:
             max_similarity = 0.0
@@ -1332,6 +1335,9 @@ Return JSON:
                 preserved.append(prop)
             else:
                 missing.append(prop)
+                # Store best match info for debugging
+                if best_sentence:
+                    scores[f"{prop}_best_match"] = best_sentence[:100]  # First 100 chars
 
         recall = len(preserved) / len(propositions) if propositions else 0.0
         return recall, {"preserved": preserved, "missing": missing, "scores": scores}
@@ -1339,16 +1345,18 @@ Return JSON:
     def _check_style_alignment(
         self,
         generated_text: str,
-        author_style_vector: Optional[np.ndarray] = None
+        author_style_vector: Optional[np.ndarray] = None,
+        style_lexicon: Optional[List[str]] = None
     ) -> Tuple[float, Dict]:
         """Check style alignment between generated text and author style.
 
         REUSE EXISTING INFRASTRUCTURE: Uses get_style_vector from style_metrics.py
-        or author_style_vector from Atlas.
+        or author_style_vector from Atlas. Also calculates lexicon density.
 
         Args:
             generated_text: Generated paragraph text.
             author_style_vector: Optional pre-computed author style vector.
+            style_lexicon: Optional list of style words to check for lexicon density.
 
         Returns:
             Tuple of (style_score: float, details_dict: Dict).
@@ -1357,12 +1365,12 @@ Return JSON:
             from src.analyzer.style_metrics import get_style_vector
         except ImportError:
             # Fallback if style_metrics not available
-            return 0.5, {"similarity": 0.5, "avg_sentence_length": 0, "staccato_penalty": 0.0}
+            return 0.5, {"similarity": 0.5, "lexicon_density": 0.0, "avg_sentence_length": 0, "staccato_penalty": 0.0}
 
         # Get style vector for generated text
         generated_style_vector = get_style_vector(generated_text)
 
-        # Calculate style similarity
+        # Calculate style similarity (vector-based)
         style_similarity = 0.5  # Default if no author vector
         if author_style_vector is not None and NUMPY_AVAILABLE and np is not None:
             # Calculate cosine similarity
@@ -1372,6 +1380,37 @@ Return JSON:
             if norm_gen > 0 and norm_author > 0:
                 style_similarity = dot_product / (norm_gen * norm_author)
                 style_similarity = max(0.0, min(1.0, style_similarity))  # Clamp to [0, 1]
+
+        # Calculate lexicon density (percentage of words in generated_text that appear in style_lexicon)
+        lexicon_density = 0.0
+        if style_lexicon and generated_text:
+            # Get lemmatized tokens from generated text
+            generated_tokens = _get_significant_tokens(generated_text)
+
+            # Normalize style_lexicon to lemmatized form for matching
+            # Use spaCy if available, otherwise simple lowercasing
+            # OPTIMIZATION: Batch process all words at once instead of one-by-one
+            lexicon_lemmas = set()
+            if _spacy_nlp:
+                # Batch process: join all words and process once, then extract lemmas
+                lexicon_text = " ".join([word.lower().strip() for word in style_lexicon if word.strip()])
+                if lexicon_text:
+                    doc = _spacy_nlp(lexicon_text)
+                    for token in doc:
+                        if not token.is_stop and not token.is_punct:
+                            lexicon_lemmas.add(token.lemma_.lower())
+            else:
+                # Fallback: simple lowercasing
+                lexicon_lemmas = {word.lower().strip() for word in style_lexicon if word.strip()}
+
+            # Count matches (using lemmatized tokens)
+            matches = len(generated_tokens & lexicon_lemmas)
+            total_significant = len(generated_tokens)
+
+            if total_significant > 0:
+                lexicon_density = matches / total_significant
+            else:
+                lexicon_density = 0.0
 
         # Check sentence length distribution (punish "staccato" output)
         try:
@@ -1391,11 +1430,15 @@ Return JSON:
                 staccato_penalty = (15 - avg_sentence_length) / 15.0  # Penalty 0-1
                 style_similarity = max(0.0, style_similarity - staccato_penalty * 0.3)
 
-        # Final style score combines similarity and sentence length
-        style_score = style_similarity * (1.0 - staccato_penalty * 0.2)
+        # Composite score: (Vector_Sim * 0.7) + (Lexicon_Density * 0.3)
+        composite_score = (style_similarity * 0.7) + (lexicon_density * 0.3)
+
+        # Final style score combines composite score and sentence length penalty
+        style_score = composite_score * (1.0 - staccato_penalty * 0.2)
 
         return style_score, {
             "similarity": style_similarity,
+            "lexicon_density": lexicon_density,
             "avg_sentence_length": avg_sentence_length,
             "staccato_penalty": staccato_penalty
         }
@@ -1405,7 +1448,8 @@ Return JSON:
         generated_text: str,
         original_text: str,
         propositions: List[str],
-        author_style_vector: Optional[np.ndarray] = None
+        author_style_vector: Optional[np.ndarray] = None,
+        style_lexicon: Optional[List[str]] = None
     ) -> Dict[str, any]:
         """Evaluate paragraph in paragraph mode using proposition recall and style alignment.
 
@@ -1414,6 +1458,7 @@ Return JSON:
             original_text: Original input text.
             propositions: List of atomic propositions extracted from original.
             author_style_vector: Optional author style vector.
+            style_lexicon: Optional list of style words for lexicon density calculation.
 
         Returns:
             Dict with evaluation results (same format as sentence mode).
@@ -1426,11 +1471,19 @@ Return JSON:
         meaning_weight = paragraph_config.get("meaning_weight", 0.6)
         style_weight = paragraph_config.get("style_alignment_weight", 0.4)
 
-        # Metric 1: Proposition Recall
-        proposition_recall, recall_details = self._check_proposition_recall(generated_text, propositions)
+        # Metric 1: Proposition Recall (use relaxed threshold 0.40 for paragraph mode)
+        proposition_recall, recall_details = self._check_proposition_recall(
+            generated_text,
+            propositions,
+            similarity_threshold=0.40  # More lenient for paragraph mode to avoid false negatives
+        )
 
         # Metric 2: Style Alignment
-        style_alignment, style_details = self._check_style_alignment(generated_text, author_style_vector)
+        style_alignment, style_details = self._check_style_alignment(
+            generated_text,
+            author_style_vector,
+            style_lexicon=style_lexicon
+        )
 
         # Final score: (Meaning * 0.6) + (Style * 0.4)
         final_score = (proposition_recall * meaning_weight) + (style_alignment * style_weight)

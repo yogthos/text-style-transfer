@@ -70,11 +70,18 @@ class StyleBlender:
 
         # Extract style vectors by recomputing from document text
         # (style_vec is not stored in metadata because ChromaDB doesn't allow lists)
+        # OPTIMIZATION: Limit processing to avoid slowdowns with large corpora
+        MAX_DOCS_FOR_CENTROID = 100
+        documents_to_process = results.get('documents', [])
+        if len(documents_to_process) > MAX_DOCS_FOR_CENTROID:
+            # Sample documents evenly for performance
+            import random
+            sample_indices = sorted(random.sample(range(len(documents_to_process)), MAX_DOCS_FOR_CENTROID))
+            documents_to_process = [documents_to_process[i] for i in sample_indices]
+
         style_vectors = []
-        for idx, meta in enumerate(results['metadatas']):
-            # Recompute style vector from document text
-            if results.get('documents') and idx < len(results['documents']):
-                doc_text = results['documents'][idx]
+        for doc_text in documents_to_process:
+            if doc_text:
                 style_vec = get_style_vector(doc_text)
                 style_vectors.append(style_vec)
 

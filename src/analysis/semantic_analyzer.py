@@ -22,16 +22,17 @@ class PropositionExtractor:
 4. Preserve the core meaning but simplify the language.
 5. Do NOT combine multiple facts into one sentence.
 6. Do NOT add information that wasn't in the original text.
+7. **CRITICAL: PRESERVE all citation references** (e.g., `[^1]`, `[^2]`) and attach them to the specific fact they support. Do NOT strip citations from the propositions. If a fact has a citation in the original text, include it in the extracted proposition.
 
 ### INPUT TEXT:
 {text}
 
 ### OUTPUT FORMAT:
-Output a JSON array of strings, where each string is an atomic proposition.
+Output a JSON array of strings, where each string is an atomic proposition (with citations preserved if present).
 
 Example:
-Input: "Stars burn. They eventually die. The universe expands."
-Output: ["Stars burn", "Stars eventually die", "The universe expands"]
+Input: "Stars burn [^1]. They eventually die [^2]. The universe expands."
+Output: ["Stars burn [^1]", "Stars eventually die [^2]", "The universe expands"]
 
 ### OUTPUT:"""
 

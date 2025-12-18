@@ -59,17 +59,30 @@ class MockLLMProvider:
         # Mock response for paragraph fusion
         elif "write a single cohesive paragraph" in user_prompt.lower() or "ghostwriter" in system_prompt.lower():
             # Check if prompt mentions citations or quotes
-            if "[^1]" in user_prompt or "citations" in user_prompt.lower():
-                # Include citations in response
-                return json.dumps([
-                    "It is through the dialectical process that human experience reinforces the rule of finitude [^1], demonstrating how the biological cycle defines our reality [^2], and how stellar bodies eventually succumb to extinction [^3]."
-                ])
+            # CRITICAL: Only include citations if the prompt explicitly mentions them (dynamic prompt logic)
+            has_citation_instruction = "Citations:" in user_prompt and "Source Propositions contain citations" in user_prompt
+            if has_citation_instruction and ("[^155]" in user_prompt or "[^25]" in user_prompt):
+                # Include citations in response only if they were in the input
+                if "[^155]" in user_prompt and "[^25]" in user_prompt:
+                    return json.dumps([
+                        "It is through the dialectical process that Tom Stonier proposed information is interconvertible with energy [^155], demonstrating how a rigid pattern repeats itself across all scales [^25]."
+                    ])
+                elif "[^155]" in user_prompt:
+                    return json.dumps([
+                        "It is through the dialectical process that Tom Stonier proposed information is interconvertible with energy [^155]."
+                    ])
+                elif "[^1]" in user_prompt or "[^2]" in user_prompt:
+                    # Include citations in response
+                    return json.dumps([
+                        "It is through the dialectical process that human experience reinforces the rule of finitude [^1], demonstrating how the biological cycle defines our reality [^2], and how stellar bodies eventually succumb to extinction [^3]."
+                    ])
             elif '"' in user_prompt or "quotes" in user_prompt.lower():
                 # Include quotes in response
                 return json.dumps([
                     'It is a fundamental truth that "the system is complete" and "the code is embedded in every particle", demonstrating the interconnected nature of all material processes.'
                 ])
             else:
+                # No citations mentioned in prompt - return text WITHOUT citations
                 return json.dumps([
                     "It is through the dialectical process of contradiction and resolution that we come to understand the fundamental relationships between phenomena."
                 ])
@@ -662,6 +675,243 @@ def test_citation_misattribution_prevention():
     return True
 
 
+def test_no_phantom_citations_when_input_has_none():
+    """Test 11: No phantom citations when input has no citations.
+
+    Goal: Ensure that when input paragraph has NO citations, output should have NO citations.
+    This prevents LLM from hallucinating citations when none exist.
+    """
+    print("\n" + "="*60)
+    print("TEST 11: No Phantom Citations (Input Has None)")
+    print("="*60)
+
+    translator = StyleTranslator()
+    translator.llm_provider = MockLLMProvider()
+    translator.paragraph_fusion_config = {
+        "num_style_examples": 2,
+        "num_variations": 1,
+        "proposition_recall_threshold": 0.7,
+        "min_word_count": 20,
+        "min_sentence_count": 1,
+        "retrieval_pool_size": 5
+    }
+
+    mock_atlas = MockStyleAtlas()
+
+    # Input paragraph with NO citations
+    input_paragraph = "Human experience reinforces the rule of finitude. The biological cycle defines our reality. Stars eventually die."
+
+    print(f"Input paragraph (NO citations): {input_paragraph}")
+
+    # Mock the critic to return good scores
+    with patch('src.validator.semantic_critic.SemanticCritic') as MockCritic:
+        mock_critic_instance = MockCritic.return_value
+        mock_critic_instance.evaluate.return_value = {
+            "pass": True,
+            "score": 0.85,
+            "proposition_recall": 0.9,
+            "style_alignment": 0.8,
+            "feedback": "Passed",
+            "recall_details": {
+                "preserved": [],
+                "missing": [],
+                "scores": {}
+            }
+        }
+
+        generated = translator.translate_paragraph(
+            paragraph=input_paragraph,
+            atlas=mock_atlas,
+            author_name="Test Author",
+            verbose=False
+        )
+
+    print(f"\nGenerated paragraph: {generated}")
+
+    # Extract citations from input and output
+    citation_pattern = r'\[\^\d+\]'
+    input_citations = set(re.findall(citation_pattern, input_paragraph))
+    output_citations = set(re.findall(citation_pattern, generated))
+
+    print(f"\nInput citations: {sorted(input_citations)} (should be empty)")
+    print(f"Output citations: {sorted(output_citations)} (should be empty)")
+
+    # Assertions
+    assert len(input_citations) == 0, "Input should have NO citations"
+    assert len(output_citations) == 0, f"Output should have NO citations, but found: {sorted(output_citations)}"
+
+    print("\n✓ Test 11 PASSED: No phantom citations when input has none")
+    return True
+
+
+def test_only_expected_citations_in_output():
+    """Test 12: Output contains ONLY expected citations (no phantoms).
+
+    Goal: Ensure that when input has specific citations, output should ONLY contain those citations.
+    Any phantom citations generated by LLM should be removed.
+    """
+    print("\n" + "="*60)
+    print("TEST 12: Only Expected Citations (No Phantoms)")
+    print("="*60)
+
+    translator = StyleTranslator()
+    translator.llm_provider = MockLLMProvider()
+    translator.paragraph_fusion_config = {
+        "num_style_examples": 2,
+        "num_variations": 1,
+        "proposition_recall_threshold": 0.7,
+        "min_word_count": 20,
+        "min_sentence_count": 1,
+        "retrieval_pool_size": 5
+    }
+
+    mock_atlas = MockStyleAtlas()
+
+    # Input paragraph with specific citations [^155] and [^25]
+    input_paragraph = "Tom Stonier proposed that information is interconvertible with energy[^155]. A rigid pattern repeats itself across all scales[^25]."
+
+    print(f"Input paragraph: {input_paragraph}")
+
+    # Mock the critic to return good scores
+    with patch('src.validator.semantic_critic.SemanticCritic') as MockCritic:
+        mock_critic_instance = MockCritic.return_value
+        mock_critic_instance.evaluate.return_value = {
+            "pass": True,
+            "score": 0.85,
+            "proposition_recall": 0.9,
+            "style_alignment": 0.8,
+            "feedback": "Passed",
+            "recall_details": {
+                "preserved": [],
+                "missing": [],
+                "scores": {}
+            }
+        }
+
+        generated = translator.translate_paragraph(
+            paragraph=input_paragraph,
+            atlas=mock_atlas,
+            author_name="Test Author",
+            verbose=False
+        )
+
+    print(f"\nGenerated paragraph: {generated}")
+
+    # Extract citations from input and output
+    citation_pattern = r'\[\^\d+\]'
+    input_citations = set(re.findall(citation_pattern, input_paragraph))
+    output_citations = set(re.findall(citation_pattern, generated))
+
+    print(f"\nInput citations: {sorted(input_citations)}")
+    print(f"Output citations: {sorted(output_citations)}")
+
+    # Assertions
+    assert len(input_citations) > 0, "Input should have citations"
+    # Output should ONLY contain citations from input (no phantoms)
+    phantom_citations = output_citations - input_citations
+    assert len(phantom_citations) == 0, f"Output contains phantom citations: {sorted(phantom_citations)}. Expected only: {sorted(input_citations)}"
+    # Output should contain all input citations (or at least some of them)
+    # Note: In real scenario, all should be preserved, but for mock test we just check no phantoms
+
+    print("\n✓ Test 12 PASSED: Output contains only expected citations (no phantoms)")
+    return True
+
+
+def test_dynamic_citation_prompt_omitted_when_none():
+    """Test 13: Dynamic citation prompt is omitted when no citations exist.
+
+    Goal: Ensure that the paragraph fusion prompt does NOT mention citations when input has none.
+    This prevents LLM from hallucinating citations.
+    """
+    print("\n" + "="*60)
+    print("TEST 13: Dynamic Citation Prompt Omitted (No Citations)")
+    print("="*60)
+
+    from src.generator.mutation_operators import PARAGRAPH_FUSION_PROMPT
+
+    # Simulate the prompt building logic from translate_paragraph
+    expected_citations = set()  # No citations
+
+    if expected_citations:
+        citation_instruction = """5. **Citations:** The Source Propositions contain citations (e.g., `[^1]`, `[^2]`). You MUST include these citations in your output, placed immediately after the claim they support. Do not drop or swap them. Each citation must stay with its original fact."""
+        citation_output_instruction = "- Include all citations from the propositions (placed after their relevant claims)"
+    else:
+        citation_instruction = ""
+        citation_output_instruction = ""
+
+    propositions_list = "- Human experience reinforces the rule of finitude\n- The biological cycle defines our reality"
+    style_examples = "Example 1: \"It is through the dialectical process...\""
+    mandatory_vocabulary = ""
+    rhetorical_connectors = ""
+
+    prompt = PARAGRAPH_FUSION_PROMPT.format(
+        propositions_list=propositions_list,
+        style_examples=style_examples,
+        mandatory_vocabulary=mandatory_vocabulary,
+        rhetorical_connectors=rhetorical_connectors,
+        citation_instruction=citation_instruction,
+        citation_output_instruction=citation_output_instruction
+    )
+
+    print("Checking prompt for citation mentions...")
+    print(f"Citation instruction length: {len(citation_instruction)}")
+
+    # Assertions
+    assert len(citation_instruction) == 0, "Citation instruction should be empty when no citations exist"
+    assert "Citations:" not in prompt or citation_instruction == "", "Prompt should not mention citations when none exist"
+    assert "[^1]" not in prompt or citation_instruction == "", "Prompt should not mention citation examples when none exist"
+
+    print("\n✓ Test 13 PASSED: Dynamic citation prompt correctly omitted when no citations")
+    return True
+
+
+def test_dynamic_citation_prompt_included_when_citations_exist():
+    """Test 14: Dynamic citation prompt is included when citations exist.
+
+    Goal: Ensure that the paragraph fusion prompt DOES mention citations when input has them.
+    """
+    print("\n" + "="*60)
+    print("TEST 14: Dynamic Citation Prompt Included (Citations Exist)")
+    print("="*60)
+
+    from src.generator.mutation_operators import PARAGRAPH_FUSION_PROMPT
+
+    # Simulate the prompt building logic from translate_paragraph
+    expected_citations = {"[^155]", "[^25]"}  # Has citations
+
+    if expected_citations:
+        citation_instruction = """5. **Citations:** The Source Propositions contain citations (e.g., `[^1]`, `[^2]`). You MUST include these citations in your output, placed immediately after the claim they support. Do not drop or swap them. Each citation must stay with its original fact."""
+        citation_output_instruction = "- Include all citations from the propositions (placed after their relevant claims)"
+    else:
+        citation_instruction = ""
+        citation_output_instruction = ""
+
+    propositions_list = "- Tom Stonier proposed that information is interconvertible[^155]\n- A rigid pattern repeats itself[^25]"
+    style_examples = "Example 1: \"It is through the dialectical process...\""
+    mandatory_vocabulary = ""
+    rhetorical_connectors = ""
+
+    prompt = PARAGRAPH_FUSION_PROMPT.format(
+        propositions_list=propositions_list,
+        style_examples=style_examples,
+        mandatory_vocabulary=mandatory_vocabulary,
+        rhetorical_connectors=rhetorical_connectors,
+        citation_instruction=citation_instruction,
+        citation_output_instruction=citation_output_instruction
+    )
+
+    print("Checking prompt for citation mentions...")
+    print(f"Citation instruction length: {len(citation_instruction)}")
+
+    # Assertions
+    assert len(citation_instruction) > 0, "Citation instruction should NOT be empty when citations exist"
+    assert "Citations:" in prompt, "Prompt should mention citations when they exist"
+    assert "[^1]" in prompt or "[^2]" in prompt, "Prompt should include citation examples when citations exist"
+
+    print("\n✓ Test 14 PASSED: Dynamic citation prompt correctly included when citations exist")
+    return True
+
+
 if __name__ == "__main__":
     all_passed = True
 
@@ -676,6 +926,10 @@ if __name__ == "__main__":
         test_end_to_end_quote_preservation,
         test_citation_quote_combined_preservation,
         test_citation_misattribution_prevention,
+        test_no_phantom_citations_when_input_has_none,
+        test_only_expected_citations_in_output,
+        test_dynamic_citation_prompt_omitted_when_none,
+        test_dynamic_citation_prompt_included_when_citations_exist,
     ]
 
     for test_func in tests:

@@ -2727,11 +2727,22 @@ These words are characteristic of the target author's voice. Integrate them natu
 Use these transition phrases to link the propositions naturally: {connectors_text}
 These connectors match the author's style and help create flowing, complex sentences."""
 
+        # Build citation instruction dynamically - only include if citations exist
+        # Silence is golden: if no citations, don't mention them (prevents LLM hallucination)
+        if expected_citations:
+            citation_instruction = """5. **Citations:** The Source Propositions contain citations (e.g., `[^1]`, `[^2]`). You MUST include these citations in your output, placed immediately after the claim they support. Do not drop or swap them. Each citation must stay with its original fact."""
+            citation_output_instruction = "- Include all citations from the propositions (placed after their relevant claims)"
+        else:
+            citation_instruction = ""
+            citation_output_instruction = ""
+
         prompt = PARAGRAPH_FUSION_PROMPT.format(
             propositions_list=propositions_list,
             style_examples=style_examples_text,
             mandatory_vocabulary=mandatory_vocabulary,
-            rhetorical_connectors=rhetorical_connectors
+            rhetorical_connectors=rhetorical_connectors,
+            citation_instruction=citation_instruction,
+            citation_output_instruction=citation_output_instruction
         )
 
         if verbose:
@@ -3062,10 +3073,33 @@ Generate 3 new variations that include ALL facts from the checklist. Output as a
                         if verbose:
                             print(f"  ✓ Repaired missing citations/quotes before returning")
 
+                # Step 3: Explicit phantom citation removal (sanitize output)
+                # Remove any citations that don't exist in the original paragraph
+                final_text = current_best["text"]
+                citation_pattern = r'\[\^\d+\]'
+                found_citations = set(re.findall(citation_pattern, final_text))
+                phantom_citations = found_citations - expected_citations
+
+                if phantom_citations:
+                    if verbose:
+                        print(f"  🧹 Removing {len(phantom_citations)} phantom citations: {sorted(phantom_citations)}")
+                    # Remove each phantom citation from generated text
+                    for phantom in phantom_citations:
+                        # Remove the citation, handling spacing
+                        final_text = re.sub(re.escape(phantom) + r'\s*', '', final_text)
+                        final_text = re.sub(r'\s+' + re.escape(phantom), '', final_text)
+
+                # Step 1: Use standard restoration tool (integrate with existing system)
+                # Create a blueprint from the original paragraph for citation restoration
+                from src.ingestion.blueprint import BlueprintExtractor
+                extractor = BlueprintExtractor()
+                blueprint = extractor.extract(paragraph)
+                final_text = self._restore_citations_and_quotes(final_text, blueprint)
+
                 # Return best candidate (either original or after repair attempts)
                 if verbose and current_best["recall"] < proposition_recall_threshold:
                     print(f"  ⚠ Final recall {current_best['recall']:.2f} below threshold {proposition_recall_threshold:.2f}, returning best available")
-                return current_best["text"]
+                return final_text
 
         except Exception as e:
             if verbose:

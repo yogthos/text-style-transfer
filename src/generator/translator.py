@@ -3078,12 +3078,29 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         if style_dna and isinstance(style_dna, dict):
             lexicon = style_dna.get("lexicon", [])
             if lexicon:
-                # Limit to top 15 most frequent words to avoid overwhelming prompt context
-                top_lexicon = lexicon[:15]
-                lexicon_text = ", ".join(top_lexicon)
-                mandatory_vocabulary = f"""### MANDATORY VOCABULARY:
+                # Get ratio from config (default to 1.0 if missing for backward compatibility)
+                ratio = self.paragraph_fusion_config.get("style_lexicon_ratio", 1.0)
+
+                # Calculate count based on ratio (allow 0 if ratio is 0.0 to disable style injection)
+                count = int(len(lexicon) * ratio) if ratio > 0.0 else 0
+
+                # Only include MANDATORY_VOCABULARY section if count > 0
+                if count > 0:
+                    top_lexicon = lexicon[:count]
+                    lexicon_text = ", ".join(top_lexicon)
+
+                    # Dynamic instruction based on ratio
+                    if ratio < 0.3:
+                        instruction = "Sprinkle these style markers sparingly."
+                    elif ratio > 0.7:
+                        instruction = "Heavily saturate the text with this vocabulary."
+                    else:
+                        instruction = "Integrate these words naturally."
+
+                    mandatory_vocabulary = f"""### MANDATORY VOCABULARY:
 You MUST use at least 3-5 distinct words from this list in your paragraph: {lexicon_text}
-These words are characteristic of the target author's voice. Integrate them naturally into your writing."""
+These words are characteristic of the target author's voice. {instruction}"""
+                # If count == 0, mandatory_vocabulary remains empty string (no section added)
 
         # Extract rhetorical connectors from examples
         rhetorical_connectors = ""

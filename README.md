@@ -150,6 +150,7 @@ The first author in the list is used. Style DNA is loaded from the Style Registr
   "paragraph_fusion": {
     "enabled": true,
     "min_sentences_for_fusion": 2,
+    "style_lexicon_ratio": 0.4,
     "proposition_recall_threshold": 0.8,
     "meaning_weight": 0.6,
     "style_alignment_weight": 0.4,
@@ -157,6 +158,24 @@ The first author in the list is used. Style DNA is loaded from the Style Registr
   }
 }
 ```
+
+**Style Lexicon Ratio** (`style_lexicon_ratio`):
+- **Range**: `0.0` to `1.0`
+- **Default**: `0.4` (40% of extracted style vocabulary)
+- **Purpose**: Controls how much of the target author's vocabulary is injected into paragraph fusion prompts. This ratio scales naturally with the richness of the extracted Style DNA.
+
+**How it works:**
+- The system extracts a style lexicon (typically ~20 words) from the target author's examples
+- The ratio determines how many of these words are included in the prompt
+- Example: With a 20-word lexicon and `style_lexicon_ratio: 0.4`, the top 8 words (40%) are used
+
+**Special values:**
+- `0.0`: Disables style injection entirely (no MANDATORY_VOCABULARY section added)
+- `< 0.3`: Light style injection with instruction "Sprinkle these style markers sparingly."
+- `0.3 - 0.7`: Moderate style injection with instruction "Integrate these words naturally."
+- `> 0.7`: Heavy style injection with instruction "Heavily saturate the text with this vocabulary."
+
+This replaces the previous hardcoded 15-word limit with a flexible ratio that adapts to the size of the extracted lexicon.
 
 **Semantic Critic** (validation thresholds):
 ```json

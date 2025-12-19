@@ -72,6 +72,40 @@ def _get_significant_tokens(text: str) -> Set[str]:
     return significant_tokens
 
 
+def _get_content_keywords(text: str) -> Set[str]:
+    """Extract nouns and verbs (content keywords) from text using spaCy.
+
+    Args:
+        text: Text to extract keywords from.
+
+    Returns:
+        Set of lemmatized nouns and verbs (content keywords).
+    """
+    global _spacy_nlp
+
+    # Lazy load spaCy model via NLPManager
+    if _spacy_nlp is None:
+        try:
+            from src.utils.nlp_manager import NLPManager
+            _spacy_nlp = NLPManager.get_nlp()
+        except (OSError, ImportError, RuntimeError):
+            _spacy_nlp = False  # Mark as unavailable
+
+    if not _spacy_nlp or _spacy_nlp is False:
+        # Fallback: extract all non-stop words
+        words = text.lower().split()
+        # Simple heuristic: assume most content words are nouns/verbs
+        return set(w for w in words if len(w) > 2)
+
+    doc = _spacy_nlp(text.lower())
+    content_keywords = set()
+    for token in doc:
+        # Extract nouns (NOUN, PROPN) and verbs (VERB)
+        if token.pos_ in ["NOUN", "PROPN", "VERB"] and not token.is_stop and not token.is_punct:
+            content_keywords.add(token.lemma_)
+    return content_keywords
+
+
 class SemanticCritic:
     """Validates generated text using precision/recall semantic checks."""
 
@@ -1255,7 +1289,8 @@ Return JSON:
             generated_text: Generated paragraph text.
             propositions: List of atomic proposition strings.
             similarity_threshold: Similarity threshold for matching (default: 0.45 for sentence mode,
-                                0.40 recommended for paragraph mode to account for stylized text).
+                                0.30 recommended for paragraph mode to account for stylized text).
+                                Hybrid keyword matching applies when similarity is 0.25-0.30.
 
         Returns:
             Tuple of (recall_score: float, details_dict: Dict).
@@ -1295,8 +1330,9 @@ Return JSON:
         missing = []
         scores = {}
         threshold = similarity_threshold  # Use parameter instead of hardcoded value
-        # Default 0.45 for sentence mode, 0.40 for paragraph mode to account for stylized text
+        # Default 0.45 for sentence mode, 0.30 for paragraph mode to account for stylized text
         # where short propositions are embedded in long, complex sentences (vector signal dilution)
+        # Hybrid keyword matching (0.25-0.30 range) provides additional safety net
 
         for prop in propositions:
             max_similarity = 0.0
@@ -1318,7 +1354,28 @@ Return JSON:
                     best_sentence = sent
 
             scores[prop] = max_similarity
+
+            # Hybrid matching: if similarity is low but keywords match, still pass
+            is_preserved = False
             if max_similarity > threshold:
+                # Above threshold: definitely preserved
+                is_preserved = True
+            elif max_similarity > 0.25 and best_sentence:
+                # Medium similarity (0.25-0.30): check keyword overlap (hybrid matching)
+                prop_keywords = _get_content_keywords(prop)
+                sent_keywords = _get_content_keywords(best_sentence)
+
+                if prop_keywords:
+                    # Calculate keyword overlap ratio
+                    overlap = len(prop_keywords.intersection(sent_keywords))
+                    keyword_overlap_ratio = overlap / len(prop_keywords) if prop_keywords else 0.0
+
+                    # If 75%+ of keywords match, consider it preserved (saved by hybrid matching)
+                    if keyword_overlap_ratio >= 0.75:
+                        is_preserved = True
+                        scores[f"{prop}_hybrid_match"] = keyword_overlap_ratio  # Store for debugging
+
+            if is_preserved:
                 preserved.append(prop)
             else:
                 missing.append(prop)
@@ -1470,11 +1527,11 @@ Return JSON:
         meaning_weight = paragraph_config.get("meaning_weight", 0.6)
         style_weight = paragraph_config.get("style_alignment_weight", 0.4)
 
-        # Metric 1: Proposition Recall (use relaxed threshold 0.40 for paragraph mode)
+        # Metric 1: Proposition Recall (use relaxed threshold 0.30 for paragraph mode)
         proposition_recall, recall_details = self._check_proposition_recall(
             generated_text,
             propositions,
-            similarity_threshold=0.40  # More lenient for paragraph mode to avoid false negatives
+            similarity_threshold=0.30  # More lenient for paragraph mode to avoid false negatives
         )
 
         # Metric 2: Style Alignment

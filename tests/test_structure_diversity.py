@@ -187,6 +187,63 @@ class TestStructureTracker(unittest.TestCase):
         freq = self.tracker.get_opener_frequency("the")
         self.assertEqual(freq, 0.25)
 
+    def test_diversity_score_with_none_opener(self):
+        """Test diversity score calculation when opener is None (handles AttributeError)."""
+        # Add a structure with None opener
+        rhythm_map1 = [
+            {'length': 'long', 'type': 'conditional', 'opener': None},
+            {'length': 'medium', 'type': 'standard', 'opener': None}
+        ]
+        signature1 = "2_sent_none_conditional_balanced"
+        self.tracker.add_structure(signature1, rhythm_map1)
+
+        # Test similarity with another structure that also has None opener
+        rhythm_map2 = [
+            {'length': 'long', 'type': 'conditional', 'opener': None},
+            {'length': 'medium', 'type': 'standard', 'opener': None}
+        ]
+        signature2 = "2_sent_none_conditional_balanced"
+
+        # Should not raise AttributeError: 'NoneType' object has no attribute 'lower'
+        score = self.tracker.get_diversity_score(signature2, rhythm_map2)
+        # Should have low diversity (high similarity) since structures are identical
+        self.assertLess(score, 0.5)  # Very similar structures
+
+    def test_rhythm_similarity_with_none_opener(self):
+        """Test rhythm similarity calculation handles None opener correctly."""
+        # Create two rhythm maps with None openers
+        rhythm_map1 = [
+            {'length': 'long', 'type': 'conditional', 'opener': None},
+            {'length': 'medium', 'type': 'standard', 'opener': None}
+        ]
+        rhythm_map2 = [
+            {'length': 'long', 'type': 'conditional', 'opener': None},
+            {'length': 'medium', 'type': 'standard', 'opener': None}
+        ]
+
+        # Should not raise AttributeError
+        similarity = self.tracker._calculate_rhythm_similarity(rhythm_map1, rhythm_map2)
+        # Identical structures should have high similarity
+        self.assertGreater(similarity, 0.9)
+
+    def test_rhythm_similarity_mixed_openers(self):
+        """Test rhythm similarity with one None opener and one string opener."""
+        rhythm_map1 = [
+            {'length': 'long', 'type': 'conditional', 'opener': None},
+            {'length': 'medium', 'type': 'standard', 'opener': None}
+        ]
+        rhythm_map2 = [
+            {'length': 'long', 'type': 'conditional', 'opener': 'if'},
+            {'length': 'medium', 'type': 'standard', 'opener': None}
+        ]
+
+        # Should not raise AttributeError
+        similarity = self.tracker._calculate_rhythm_similarity(rhythm_map1, rhythm_map2)
+        # Different openers should reduce similarity
+        self.assertLess(similarity, 0.9)  # Lower similarity due to opener mismatch
+        # But still some similarity due to matching lengths and types
+        self.assertGreater(similarity, 0.0)
+
 
 class TestPositionalFiltering(unittest.TestCase):
     """Test positional filtering logic (integration test)."""

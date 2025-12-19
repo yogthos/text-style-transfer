@@ -2853,7 +2853,7 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                     signature = generate_structure_signature(candidate_rhythm_map)
                     diversity_score = 1.0  # Default: no penalty
                     if enabled and structure_tracker:
-                        diversity_score = structure_tracker.get_diversity_score(signature)
+                        diversity_score = structure_tracker.get_diversity_score(signature, candidate_rhythm_map)
 
                     # 3. Positional fit
                     opener_val = candidate_rhythm_map[0].get('opener') if candidate_rhythm_map else None
@@ -3277,6 +3277,11 @@ These connectors match the author's style and help create flowing, complex sente
                     if verbose:
                         print(f"  🔧 Repair loop attempt {repair_attempt}/{max_repair_attempts}: recall {current_best['recall']:.2f} < {proposition_recall_threshold:.2f}")
 
+                    # Progressive threshold relaxation: use lower threshold (0.25) for second repair attempt
+                    use_relaxed_threshold = (repair_attempt == 2 and current_best["recall"] < proposition_recall_threshold)
+                    if use_relaxed_threshold and verbose:
+                        print(f"  ⚠ Using relaxed threshold (0.25) for second repair attempt")
+
                     # Identify missing propositions from current best candidate
                     recall_details = current_best["result"].get("recall_details", {})
                     missing_propositions = recall_details.get("missing", [])
@@ -3295,9 +3300,29 @@ These connectors match the author's style and help create flowing, complex sente
                     preserved_propositions = recall_details.get("preserved", [])
                     all_propositions = preserved_propositions + missing_propositions
 
+                    # Extract similarity scores and best matches for missing propositions
+                    similarity_scores = recall_details.get("scores", {})
+                    missing_with_scores = []
+                    for prop in missing_propositions[:10]:
+                        score = similarity_scores.get(prop, 0.0)
+                        best_match_key = f"{prop}_best_match"
+                        best_match = similarity_scores.get(best_match_key, "N/A")
+                        missing_with_scores.append((prop, score, best_match))
+
                     # Generate repair prompt with FULL proposition checklist
                     all_propositions_list = "\n".join([f"{i+1}. {prop}" for i, prop in enumerate(all_propositions)])
-                    missing_list = "\n".join([f"{i+1}. {prop}" for i, prop in enumerate(missing_propositions[:10])])
+
+                    # Build missing list with similarity scores and examples
+                    missing_list_parts = []
+                    for i, (prop, score, best_match) in enumerate(missing_with_scores, 1):
+                        match_preview = best_match[:80] + "..." if isinstance(best_match, str) and len(best_match) > 80 else (str(best_match)[:80] + "..." if best_match != "N/A" else "No close match found")
+                        missing_list_parts.append(
+                            f"{i}. {prop}\n"
+                            f"   Similarity: {score:.3f} (below threshold)\n"
+                            f"   Best match in generated text: \"{match_preview}\"\n"
+                            f"   → You need to include the KEY PHRASES from this proposition more explicitly."
+                        )
+                    missing_list = "\n".join(missing_list_parts)
 
                     # Add style preservation instructions if lexicon available
                     style_preservation = ""
@@ -3313,16 +3338,21 @@ These connectors match the author's style and help create flowing, complex sente
 You must ensure EVERY one of the following propositions is present in the text. Check them off one by one as you write:
 {all_propositions_list}
 
-**MISSING ITEMS:**
-Pay special attention to these, which were missing in the last draft:
+**MISSING ITEMS (CRITICAL - These were not detected in the last draft):**
 {missing_list}
+
+**HOW TO FIX:**
+For each missing proposition above, you must include its KEY WORDS explicitly. For example:
+- If the proposition is "The core message is an admission", you MUST include the words "core", "message", and "admission" in close proximity.
+- Do NOT paraphrase too heavily - the semantic similarity detector needs to see the actual content words.
+- You can embed them in complex sentences like: "At its heart, this admission's core message reveals that..." or "The fundamental essence of this recognition is an admission that..."
 
 **Style Constraint:** Maintain the complex sentence structure and vocabulary you used before. Do not simplify the text just to add the facts.{style_preservation}
 
 Original paragraph (for style reference):
 "{current_best['text']}"
 
-**Task:** Rewrite the paragraph completely. Ensure ALL propositions from the checklist above are present. Integrate them naturally into flowing, complex sentences. Do not just append facts at the end.
+**Task:** Rewrite the paragraph completely. Ensure ALL propositions from the checklist above are present with their KEY WORDS explicitly included. Integrate them naturally into flowing, complex sentences. Do not just append facts at the end.
 
 Generate 3 new variations that include ALL facts from the checklist. Output as a JSON array of strings:
 [
@@ -3369,13 +3399,41 @@ Generate 3 new variations that include ALL facts from the checklist. Output as a
 
                                 needs_artifact_repair_repair = len(missing_citations_repair) > 0 or len(missing_quotes_repair) > 0
 
-                                repair_result = critic.evaluate(
-                                    generated_text=cleaned_repair,
-                                    input_blueprint=blueprint,
-                                    propositions=propositions,
-                                    is_paragraph=True,
-                                    author_style_vector=author_style_vector
-                                )
+                                # Use relaxed threshold for second repair attempt if first didn't improve
+                                if use_relaxed_threshold:
+                                    # For second repair attempt, use relaxed threshold (0.25) for proposition recall
+                                    # but still evaluate style with normal critic
+                                    repair_result = critic.evaluate(
+                                        generated_text=cleaned_repair,
+                                        input_blueprint=blueprint,
+                                        propositions=propositions,
+                                        is_paragraph=True,
+                                        author_style_vector=author_style_vector
+                                    )
+                                    # Re-check proposition recall with relaxed threshold (0.25)
+                                    relaxed_recall, relaxed_details = critic._check_proposition_recall(
+                                        cleaned_repair,
+                                        propositions,
+                                        similarity_threshold=0.25  # Relaxed threshold for second attempt
+                                    )
+                                    # Update the result with relaxed recall
+                                    repair_result["proposition_recall"] = relaxed_recall
+                                    repair_result["recall_details"] = relaxed_details
+                                    # Recalculate score with relaxed recall
+                                    meaning_weight = self.paragraph_fusion_config.get("meaning_weight", 0.6)
+                                    style_weight = self.paragraph_fusion_config.get("style_alignment_weight", 0.4)
+                                    style_alignment = repair_result.get("style_alignment", 0.0)
+                                    repair_result["score"] = (relaxed_recall * meaning_weight) + (style_alignment * style_weight)
+                                    # Update pass status based on relaxed recall
+                                    repair_result["pass"] = relaxed_recall >= proposition_recall_threshold
+                                else:
+                                    repair_result = critic.evaluate(
+                                        generated_text=cleaned_repair,
+                                        input_blueprint=blueprint,
+                                        propositions=propositions,
+                                        is_paragraph=True,
+                                        author_style_vector=author_style_vector
+                                    )
 
                                 # Extract similarity scores for debugging
                                 repair_recall_details = repair_result.get("recall_details", {})

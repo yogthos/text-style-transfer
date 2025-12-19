@@ -21,6 +21,8 @@ class StyleExtractor:
         """
         self.llm_provider = LLMProvider(config_path=config_path)
         self.config_path = config_path
+        # Manual cache for style DNA extraction (key: hash of sorted example texts)
+        self._dna_cache = {}
 
     def extract_style_dna(self, examples: List[str]) -> Dict[str, any]:
         """Extract style DNA from example texts.
@@ -46,6 +48,11 @@ class StyleExtractor:
                 "tone": "Neutral",
                 "structure": "Standard sentence structure"
             }
+
+        # Check cache: use hash of sorted example texts as key
+        cache_key = hash(tuple(sorted(examples)))
+        if cache_key in self._dna_cache:
+            return self._dna_cache[cache_key]
 
         # Limit to first 3 examples for analysis (faster, more focused)
         analysis_examples = examples[:3]
@@ -114,15 +121,22 @@ Return ONLY the JSON object, no additional text."""
             else:
                 lexicon = []
 
-            return {
+            result = {
                 "lexicon": lexicon,
                 "tone": str(style_dna.get("tone", "Neutral")).strip(),
                 "structure": str(style_dna.get("structure", "Standard sentence structure")).strip()
             }
 
+            # Store in cache before returning
+            self._dna_cache[cache_key] = result
+            return result
+
         except (json.JSONDecodeError, KeyError, Exception) as e:
             # Fallback: extract basic lexicon using simple frequency analysis
-            return self._fallback_extract(examples)
+            fallback_result = self._fallback_extract(examples)
+            # Cache fallback result too
+            self._dna_cache[cache_key] = fallback_result
+            return fallback_result
 
     def _fallback_extract(self, examples: List[str]) -> Dict[str, any]:
         """Fallback extraction using simple frequency analysis.

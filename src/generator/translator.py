@@ -100,12 +100,12 @@ class StyleTranslator:
         """Get or load spaCy model for noun extraction."""
         if self._nlp_cache is None:
             try:
-                import spacy
-                self._nlp_cache = spacy.load("en_core_web_sm")
-            except (OSError, ImportError):
+                from src.utils.nlp_manager import NLPManager
+                self._nlp_cache = NLPManager.get_nlp()
+            except (OSError, ImportError, RuntimeError):
                 # If spaCy not available, return None (check will be skipped)
                 self._nlp_cache = False
-        return self._nlp_cache if self._nlp_cache else None
+        return self._nlp_cache if self._nlp_cache is not False else None
 
     def _is_blueprint_incomplete(self, blueprint: SemanticBlueprint) -> bool:
         """Check if blueprint is semantically incomplete (missing critical nouns).
@@ -1170,6 +1170,8 @@ Output PURE JSON. A single list of strings:
         examples: List[str],  # 3 examples from atlas
         verbose: bool = False
     ) -> str:
+        # Initialize style_dna_dict at function start to ensure it's always defined
+        style_dna_dict = None
         """Translate blueprint into styled text.
 
         Args:
@@ -1182,12 +1184,24 @@ Output PURE JSON. A single list of strings:
         Returns:
             Generated text in target style.
         """
+        # Initialize style_dna_dict at function start to ensure it's always defined
+        style_dna_dict = None
+
         if not examples:
             # Fallback if no examples provided
             examples = ["Example text in the target style."]
 
         # STRICT FALLBACK RULE: If only 1 example, force fallback unless perfect match
         if len(examples) == 1:
+            # Extract style_dna_dict from single example (needed for standard generation fallback)
+            try:
+                from src.analyzer.style_extractor import StyleExtractor
+                style_extractor = StyleExtractor(config_path=self.config_path)
+                if examples:
+                    style_dna_dict = style_extractor.extract_style_dna(examples)
+            except Exception:
+                style_dna_dict = None
+
             # Check sentence type compatibility
             def _is_sentence_question(text):
                 """Check if sentence is a question."""
@@ -1229,24 +1243,46 @@ Output PURE JSON. A single list of strings:
             except Exception:
                 style_dna_dict = None
 
-            # Phase 1: Smart Skeleton Selection (Pre-Filter)
+            # Phase 1: Smart Skeleton Selection (Pre-Filter) - LAZY EVALUATION
+            # Only extract skeletons if template evolution is enabled and we have sufficient examples
             template_config = self.translator_config.get("template_evolution", {})
-            num_examples = template_config.get("num_examples", 5)
-            candidates_per_template = template_config.get("candidates_per_template", 2)
+            template_evolution_enabled = template_config.get("enabled", True)  # Default to True for backward compatibility
 
-            # Retrieve top N examples (request more to have options after filtering)
-            if len(examples) < num_examples:
-                # Use all available examples
-                candidate_examples = examples
-            else:
-                # Use top N examples
-                candidate_examples = examples[:num_examples]
+            compatible_skeletons = []  # Default: no skeletons (will use standard generation)
 
-            if verbose:
-                print(f"  Parallel Template Evolution: Processing {len(candidate_examples)} examples")
+            if template_evolution_enabled:
+                # Check if rhetorical type actually needs skeleton extraction
+                # Refined: Only skip if sentence is both short AND semantically empty (no SVO triples)
+                # Complete short sentences with semantic structure should still use template evolution
+                input_text = blueprint.original_text
+                word_count = len(input_text.split())
+                has_svo_triples = len(blueprint.svo_triples) > 0
+                has_semantic_content = has_svo_triples or len(blueprint.core_keywords) > 0
 
-            # Extract multiple skeletons with complexity filtering and deduplication
-            compatible_skeletons = self._extract_multiple_skeletons(candidate_examples, blueprint, verbose=verbose)
+                # Only skip if: short (< 10 words) AND no semantic structure (no SVOs, no keywords)
+                is_simple_sentence = word_count < 10 and not has_semantic_content
+
+                # Skip skeleton extraction only for truly simple/fragmentary sentences
+                if is_simple_sentence:
+                    if verbose:
+                        print(f"  Skipping skeleton extraction: simple sentence detected (no semantic structure)")
+                else:
+                    num_examples = template_config.get("num_examples", 5)
+                    candidates_per_template = template_config.get("candidates_per_template", 2)
+
+                    # Retrieve top N examples (request more to have options after filtering)
+                    if len(examples) < num_examples:
+                        # Use all available examples
+                        candidate_examples = examples
+                    else:
+                        # Use top N examples
+                        candidate_examples = examples[:num_examples]
+
+                    if verbose:
+                        print(f"  Parallel Template Evolution: Processing {len(candidate_examples)} examples")
+
+                    # Extract multiple skeletons with complexity filtering and deduplication
+                    compatible_skeletons = self._extract_multiple_skeletons(candidate_examples, blueprint, verbose=verbose)
 
         if verbose:
             print(f"  Skeletons extracted: {len(compatible_skeletons)} compatible (after complexity filtering)")
@@ -2624,8 +2660,10 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         atlas,
         author_name: str,
         style_dna: Optional[Dict] = None,
+        position: str = "BODY",
+        structure_tracker: Optional[object] = None,
         verbose: bool = False
-    ) -> str:
+    ) -> tuple[str, Optional[List[Dict]]]:
         """Translate a paragraph holistically using paragraph fusion.
 
         Extracts atomic propositions from the paragraph, retrieves complex style examples,
@@ -2643,7 +2681,7 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
             Generated paragraph in target style.
         """
         if not paragraph or not paragraph.strip():
-            return paragraph
+            return paragraph, None
 
         # Step 1: Extract atomic propositions (with citations bound to facts)
         if verbose:
@@ -2654,7 +2692,7 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
 
         if not propositions:
             # Fallback: use original paragraph
-            return paragraph
+            return paragraph, None
 
         # Step 1.5: Extract direct quotations separately (for quote preservation)
         quote_pattern = r'["\'](?:[^"\']|(?<=\\)["\'])*["\']'
@@ -2728,38 +2766,140 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         rhythm_map = None
 
         if complex_examples:
-            # Count sentences for each example and find best match
+            # Composite scoring: sentence count + diversity + positional fit
+            # Load weights from config
+            diversity_config = self.paragraph_fusion_config.get("structure_diversity", {})
+            count_weight = diversity_config.get("count_match_weight", 0.3)
+            diversity_weight = diversity_config.get("diversity_weight", 0.4)
+            positional_weight = diversity_config.get("positional_weight", 0.3)
+            enabled = diversity_config.get("enabled", True)
+
+            # Positional keyword sets
+            OPENER_KEYWORDS = {'the', 'in', 'it', 'this', 'a', 'an', 'when', 'how', 'what', 'why', 'where', 'who'}
+            CLOSER_KEYWORDS = {'thus', 'ultimately', 'therefore', 'hence', 'consequently', 'in conclusion', 'finally', 'in the final analysis', 'in sum', 'to conclude'}
+            TRANSITION_KEYWORDS = {'however', 'furthermore', 'moreover', 'additionally', 'nevertheless', 'nonetheless', 'meanwhile', 'alternatively'}
+
             best_match = None
-            best_diff = float('inf')
+            best_score = -1.0
+
+            # Import functions for structure analysis
+            from src.analyzer.structuralizer import extract_paragraph_rhythm, generate_structure_signature
 
             for example in complex_examples:
                 try:
+                    # 1. Sentence count match
                     example_sentences = sent_tokenize(example)
                     sentence_count = len([s for s in example_sentences if s.strip()])
-                    diff = abs(sentence_count - target_sentences)
+                    count_diff = abs(sentence_count - target_sentences)
+                    count_match = 1.0 - (count_diff / max(target_sentences, 5))  # Normalized
+                    count_match = max(0.0, count_match)  # Ensure non-negative
 
-                    if diff < best_diff:
-                        best_diff = diff
+                    # 2. Extract rhythm map and get diversity score
+                    candidate_rhythm_map = extract_paragraph_rhythm(example)
+                    if not candidate_rhythm_map:
+                        continue  # Skip if rhythm extraction fails
+
+                    signature = generate_structure_signature(candidate_rhythm_map)
+                    diversity_score = 1.0  # Default: no penalty
+                    if enabled and structure_tracker:
+                        diversity_score = structure_tracker.get_diversity_score(signature)
+
+                    # 3. Positional fit
+                    opener_val = candidate_rhythm_map[0].get('opener') if candidate_rhythm_map else None
+                    opener = (opener_val or "none").lower()
+                    positional_fit = 0.8  # Default neutral
+
+                    if position == "OPENER":
+                        if opener in OPENER_KEYWORDS:
+                            positional_fit = 1.0  # Good
+                        elif opener in TRANSITION_KEYWORDS:
+                            positional_fit = 0.3  # Bad - don't start with "However"
+                        elif opener in CLOSER_KEYWORDS:
+                            positional_fit = 0.2  # Very bad
+                        elif opener == 'none' or not opener:
+                            positional_fit = 0.9  # Neutral opener is fine
+                        else:
+                            positional_fit = 0.7  # Neutral
+                    elif position == "CLOSER":
+                        if opener in CLOSER_KEYWORDS:
+                            positional_fit = 1.0  # Good
+                        elif opener in OPENER_KEYWORDS:
+                            positional_fit = 0.6  # Acceptable but not ideal
+                        elif opener == 'none' or not opener:
+                            positional_fit = 0.8  # Neutral
+                        else:
+                            positional_fit = 0.7  # Neutral
+                    else:  # BODY
+                        positional_fit = 0.8  # Most structures acceptable
+
+                    # 4. Opener diversity penalty
+                    if enabled and structure_tracker and opener and opener != 'none':
+                        opener_penalty = structure_tracker.get_opener_penalty(opener)
+                        diversity_score *= opener_penalty
+
+                    # 5. Composite score
+                    composite_score = (
+                        count_match * count_weight +
+                        diversity_score * diversity_weight +
+                        positional_fit * positional_weight
+                    )
+
+                    # Track best candidate
+                    if composite_score > best_score:
+                        best_score = composite_score
                         best_match = example
-                except Exception:
-                    # If tokenization fails, skip this example
+                        rhythm_map = candidate_rhythm_map  # Store rhythm map for best match
+
+                except Exception as e:
+                    # If analysis fails, skip this example
+                    if verbose:
+                        print(f"    ⚠ Error analyzing example: {e}")
                     continue
+
+            # Fallback: If composite scoring failed for all examples, use simple length matching
+            if best_match is None and complex_examples:
+                if verbose:
+                    print(f"  ⚠ Composite scoring failed for all examples. Falling back to simple length matching.")
+
+                # Fallback: simple sentence count matching (original behavior)
+                best_match = None
+                best_diff = float('inf')
+
+                for example in complex_examples:
+                    try:
+                        example_sentences = sent_tokenize(example)
+                        sentence_count = len([s for s in example_sentences if s.strip()])
+                        diff = abs(sentence_count - target_sentences)
+
+                        if diff < best_diff:
+                            best_diff = diff
+                            best_match = example
+                    except Exception:
+                        continue
+
+                if best_match:
+                    teacher_example = best_match
+                    from src.analyzer.structuralizer import extract_paragraph_rhythm
+                    rhythm_map = extract_paragraph_rhythm(teacher_example)
+                    if verbose:
+                        sentence_count = len(rhythm_map) if rhythm_map else 0
+                        print(f"  Selected fallback teacher example with {sentence_count} sentences (target: {target_sentences})")
 
             if best_match:
                 teacher_example = best_match
-                # Extract rhythm map from teacher
-                from src.analyzer.structuralizer import extract_paragraph_rhythm
-                rhythm_map = extract_paragraph_rhythm(teacher_example)
+                # rhythm_map already extracted above (or set in fallback)
 
                 if verbose:
-                    sentence_count = len(rhythm_map)
-                    mismatch = abs(sentence_count - target_sentences)
-                    print(f"  Selected teacher example with {sentence_count} sentences (target: {target_sentences})")
-                    if mismatch > 2:
-                        print(f"  ⚠ Warning: Large sentence count mismatch ({mismatch} sentences). Quality may be affected.")
                     if rhythm_map:
+                        sentence_count = len(rhythm_map)
+                        mismatch = abs(sentence_count - target_sentences)
+                        print(f"  Selected teacher example with {sentence_count} sentences (target: {target_sentences})")
+                        if mismatch > 2:
+                            print(f"  ⚠ Warning: Large sentence count mismatch ({mismatch} sentences). Quality may be affected.")
                         rhythm_summary = [f"{r['length']} {r['type']}" for r in rhythm_map[:3]]
                         print(f"  Rhythm map: {rhythm_summary}...")
+                    else:
+                        print(f"  Selected teacher example (no rhythm map extracted)")
 
         # Step 3: Extract style DNA if not provided
         if not style_dna:
@@ -2914,7 +3054,7 @@ These connectors match the author's style and help create flowing, complex sente
             if not variations:
                 if verbose:
                     print(f"  ⚠ No variations generated, using fallback")
-                return paragraph  # Fallback to original
+                return paragraph, rhythm_map  # Fallback to original
 
             # Step 5: Evaluate all variations and select best using tiered selection logic
             if verbose:
@@ -3029,7 +3169,7 @@ These connectors match the author's style and help create flowing, complex sente
                 if verbose:
                     print(f"  ✓ Selected qualified candidate: recall={best_candidate['recall']:.2f}, "
                           f"score={best_candidate['score']:.2f}")
-                return best_candidate["text"]
+                return best_candidate["text"], rhythm_map
             else:
                 # 3. Fallback: No qualified candidates, pick highest recall (salvage meaning)
                 best_candidate = max(evaluated_candidates, key=lambda x: x["recall"])
@@ -3250,7 +3390,7 @@ Generate 3 new variations that include ALL facts from the checklist. Output as a
                 # Return best candidate (either original or after repair attempts)
                 if verbose and current_best["recall"] < proposition_recall_threshold:
                     print(f"  ⚠ Final recall {current_best['recall']:.2f} below threshold {proposition_recall_threshold:.2f}, returning best available")
-                return final_text
+                return final_text, rhythm_map
 
         except Exception as e:
             error_str = str(e)
@@ -3261,7 +3401,7 @@ Generate 3 new variations that include ALL facts from the checklist. Output as a
                     print(f"  ✗ Paragraph fusion failed: Network timeout after {max_retries} retry attempts. Using fallback.")
                 else:
                     print(f"  ✗ Paragraph fusion failed: {error_str[:200]}, using fallback")
-            return paragraph  # Fallback to original
+            return paragraph, None  # Fallback to original
 
     def _repair_missing_artifacts(
         self,

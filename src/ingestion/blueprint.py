@@ -6,8 +6,9 @@ to create a "blueprint" of the content (SVOs, entities, keywords).
 
 from dataclasses import dataclass
 from typing import List, Tuple, Set, Optional
-import spacy
+from functools import lru_cache
 import re
+from src.utils.nlp_manager import NLPManager
 
 
 @dataclass
@@ -41,25 +42,15 @@ class BlueprintExtractor:
     """Extracts semantic blueprint from text using spaCy."""
 
     def __init__(self):
-        """Initialize the extractor with spaCy model."""
-        try:
-            self.nlp = spacy.load("en_core_web_sm")
-        except OSError:
-            # Model not found, try to download it
-            import subprocess
-            import sys
-            try:
-                subprocess.check_call(
-                    [sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
-                    stdout=subprocess.DEVNULL,
-                    stderr=subprocess.DEVNULL
-                )
-                self.nlp = spacy.load("en_core_web_sm")
-            except Exception:
-                raise RuntimeError(
-                    "spaCy model 'en_core_web_sm' not found. "
-                    "Please install it with: python -m spacy download en_core_web_sm"
-                )
+        """Initialize the extractor with shared spaCy model."""
+        # Use shared NLPManager instead of loading model directly
+        self.nlp = None  # Will be loaded lazily via NLPManager
+
+    def _get_nlp(self):
+        """Get the shared spaCy model instance."""
+        if self.nlp is None:
+            self.nlp = NLPManager.get_nlp()
+        return self.nlp
 
     def extract(self, text: str, paragraph_id: int = 0, position: str = "BODY",
                 previous_context: Optional[str] = None) -> SemanticBlueprint:
@@ -87,21 +78,48 @@ class BlueprintExtractor:
                 previous_context=previous_context
             )
 
+        # Use cached extraction for the text processing part
+        # Note: paragraph_id, position, and previous_context are not cached (they're metadata)
+        cached_result = self._extract_from_text(text)
+
+        # Create blueprint with cached extraction results + metadata
+        return SemanticBlueprint(
+            original_text=text,
+            svo_triples=cached_result["svo_triples"],
+            named_entities=cached_result["named_entities"],
+            core_keywords=cached_result["core_keywords"],
+            citations=cached_result["citations"],
+            quotes=cached_result["quotes"],
+            paragraph_id=paragraph_id,
+            position=position,
+            previous_context=previous_context
+        )
+
+    @lru_cache(maxsize=1024)
+    def _extract_from_text(self, text: str) -> dict:
+        """Extract semantic data from text (cacheable version).
+
+        This method is cacheable because it only takes text as input.
+        The doc objects are created internally and not returned.
+
+        Args:
+            text: Input text to analyze.
+
+        Returns:
+            Dictionary with extraction results (svo_triples, named_entities, core_keywords, citations, quotes).
+        """
         try:
-            doc = self.nlp(text)
+            nlp = self._get_nlp()
+            doc = nlp(text)
         except Exception:
-            # If parsing fails, return empty blueprint
-            return SemanticBlueprint(
-                original_text=text,
-                svo_triples=[],
-                named_entities=[],
-                core_keywords=set(),
-                citations=[],
-                quotes=[],
-                paragraph_id=paragraph_id,
-                position=position,
-                previous_context=previous_context
-            )
+            # If parsing fails, return empty results
+            return {
+                "svo_triples": [],
+                "named_entities": [],
+                "core_keywords": set(),
+                "citations": [],
+                "quotes": []
+            }
 
         # Extract SVO triples
         svo_triples = self._extract_svos(doc)
@@ -116,17 +134,13 @@ class BlueprintExtractor:
         citations = self._extract_citations(text)
         quotes = self._extract_quotes(text)
 
-        return SemanticBlueprint(
-            original_text=text,
-            svo_triples=svo_triples,
-            named_entities=named_entities,
-            core_keywords=core_keywords,
-            citations=citations,
-            quotes=quotes,
-            paragraph_id=paragraph_id,
-            position=position,
-            previous_context=previous_context
-        )
+        return {
+            "svo_triples": svo_triples,
+            "named_entities": named_entities,
+            "core_keywords": core_keywords,
+            "citations": citations,
+            "quotes": quotes
+        }
 
     def _extract_svos(self, doc) -> List[Tuple[str, str, str]]:
         """Extract Subject-Verb-Object triples using dependency parsing."""
@@ -362,7 +376,8 @@ class BlueprintExtractor:
         """
         if isinstance(span, str):
             # If span is already a string, parse it
-            doc = self.nlp(span)
+            nlp = self._get_nlp()
+            doc = nlp(str(span))
             tokens = [t for t in doc if t.pos_ not in ["DET", "PUNCT", "SPACE"]]
         else:
             # If span is a token or list of tokens

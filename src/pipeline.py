@@ -20,6 +20,7 @@ from src.atlas.builder import StyleAtlas, load_atlas
 from src.atlas.style_registry import StyleRegistry
 from src.analyzer.style_extractor import StyleExtractor
 from src.analysis.semantic_analyzer import PropositionExtractor
+from src.utils.structure_tracker import StructureTracker
 
 
 def _split_into_paragraphs(text: str) -> List[str]:
@@ -158,6 +159,10 @@ def process_text(
     # Track used examples to prevent repetition
     used_examples = set()
 
+    # Structure tracking for paragraph diversity
+    structure_tracker = StructureTracker()
+    total_paragraphs = len(paragraphs)
+
     # Context tracking for contextual anchoring
     previous_generated_text = ""
     previous_paragraph_id = -1
@@ -217,13 +222,23 @@ def process_text(
             except Exception:
                 pass
 
+            # Determine paragraph position (OPENER, BODY, CLOSER)
+            if para_idx == 0:
+                position = "OPENER"
+            elif para_idx == total_paragraphs - 1:
+                position = "CLOSER"
+            else:
+                position = "BODY"
+
             # Translate paragraph holistically
             try:
-                generated_paragraph = translator.translate_paragraph(
+                generated_paragraph, teacher_rhythm_map = translator.translate_paragraph(
                     paragraph,
                     atlas,
                     author_name,
                     style_dna=style_dna_dict,
+                    position=position,
+                    structure_tracker=structure_tracker,
                     verbose=verbose
                 )
 
@@ -238,12 +253,23 @@ def process_text(
                 )
 
                 if verbose:
-                    print(f"  Paragraph fusion result: pass={critic_result.get('pass', False)}, "
+                    pass_value = critic_result.get('pass', False)
+                    # Color codes: green for True, red for False
+                    pass_color = '\033[92m' if pass_value else '\033[91m'  # Green or Red
+                    reset_color = '\033[0m'
+                    pass_str = f"{pass_color}{pass_value}{reset_color}"
+                    print(f"  Paragraph fusion result: pass={pass_str}, "
                           f"score={critic_result.get('score', 0.0):.2f}, "
                           f"proposition_recall={critic_result.get('proposition_recall', 0.0):.2f}")
 
                 # Use generated paragraph if it passes, otherwise fall back to sentence-by-sentence
                 if critic_result.get('pass', False):
+                    # Record structure for diversity tracking
+                    if teacher_rhythm_map:
+                        from src.analyzer.structuralizer import generate_structure_signature
+                        signature = generate_structure_signature(teacher_rhythm_map)
+                        structure_tracker.add_structure(signature, teacher_rhythm_map)
+
                     generated_paragraphs.append(generated_paragraph)
                     if write_callback:
                         # Each paragraph is a new paragraph (except we track is_first_paragraph separately)

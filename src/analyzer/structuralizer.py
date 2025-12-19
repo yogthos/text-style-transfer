@@ -304,3 +304,53 @@ def extract_paragraph_rhythm(text: str) -> List[Dict]:
 
         return rhythm_map
 
+
+def generate_structure_signature(rhythm_map: List[Dict]) -> str:
+    """Generate normalized signature for a rhythm map.
+
+    Creates a string representation that captures:
+    - Sentence count
+    - First sentence opener (if any)
+    - Pattern type (conditional, declarative, question, mixed)
+    - Length distribution pattern (short-heavy, long-heavy, balanced)
+
+    Args:
+        rhythm_map: List of sentence specifications from extract_paragraph_rhythm()
+
+    Returns:
+        Normalized signature string, e.g., "3_sent_if_conditional_long-heavy"
+    """
+    if not rhythm_map:
+        return "0_sent_none_none_none"
+
+    count = len(rhythm_map)
+    opener = rhythm_map[0].get('opener', 'none') or 'none'
+    opener = opener.lower() if opener else 'none'
+
+    # Determine pattern type
+    conditional_count = sum(1 for r in rhythm_map if r.get('type') == 'conditional')
+    question_count = sum(1 for r in rhythm_map if r.get('type') == 'question')
+
+    if conditional_count > len(rhythm_map) * 0.5:
+        pattern_type = "conditional"
+    elif question_count > 0:
+        pattern_type = "question"
+    elif all(r.get('type') == 'standard' for r in rhythm_map):
+        pattern_type = "declarative"
+    else:
+        pattern_type = "mixed"
+
+    # Determine length pattern
+    lengths = [r.get('length', 'medium') for r in rhythm_map]
+    short_count = lengths.count('short')
+    long_count = lengths.count('long')
+
+    if short_count > len(rhythm_map) * 0.5:
+        length_pattern = "short-heavy"
+    elif long_count > len(rhythm_map) * 0.5:
+        length_pattern = "long-heavy"
+    else:
+        length_pattern = "balanced"
+
+    return f"{count}_sent_{opener}_{pattern_type}_{length_pattern}"
+

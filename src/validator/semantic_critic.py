@@ -26,26 +26,15 @@ except ImportError:
     util = None
     torch = None
 
-# Initialize spaCy for stop word filtering
-try:
-    import spacy
-    # Load lightweight model (exclude parser/ner for speed)
-    _spacy_nlp = spacy.load("en_core_web_sm", exclude=["parser", "ner"])
+# Domain-specific glue words
+DOMAIN_GLUE_WORDS = {
+    "process", "act", "state", "nature", "way", "manner", "form", "condition",
+    "method", "means", "approach", "system", "structure", "framework",
+    "eventually", "typically", "fundamentally"
+}
 
-    # Domain-specific glue words
-    DOMAIN_GLUE_WORDS = {
-        "process", "act", "state", "nature", "way", "manner", "form", "condition",
-        "method", "means", "approach", "system", "structure", "framework",
-        "eventually", "typically", "fundamentally"
-    }
-
-    # Add to spaCy's stop words
-    for word in DOMAIN_GLUE_WORDS:
-        _spacy_nlp.Defaults.stop_words.add(word)
-        _spacy_nlp.vocab[word].is_stop = True
-except (ImportError, OSError):
-    _spacy_nlp = None
-    DOMAIN_GLUE_WORDS = set()
+# Use NLPManager for shared spaCy model (lazy loading)
+_spacy_nlp = None
 
 
 def _get_significant_tokens(text: str) -> Set[str]:
@@ -57,7 +46,21 @@ def _get_significant_tokens(text: str) -> Set[str]:
     Returns:
         Set of lemmatized significant tokens (non-stop, non-punct).
     """
-    if not _spacy_nlp:
+    global _spacy_nlp
+
+    # Lazy load spaCy model via NLPManager
+    if _spacy_nlp is None:
+        try:
+            from src.utils.nlp_manager import NLPManager
+            _spacy_nlp = NLPManager.get_nlp()
+            # Add domain-specific glue words to stop words
+            for word in DOMAIN_GLUE_WORDS:
+                _spacy_nlp.Defaults.stop_words.add(word)
+                _spacy_nlp.vocab[word].is_stop = True
+        except (OSError, ImportError, RuntimeError):
+            _spacy_nlp = False  # Mark as unavailable
+
+    if not _spacy_nlp or _spacy_nlp is False:
         # Fallback to simple split if spaCy not available
         return set(text.lower().split())
 
@@ -273,15 +276,11 @@ class SemanticCritic:
             # Extract concrete nouns from original and ensure they appear in output
             if original_text:
                 try:
-                    import spacy
-                    try:
-                        # Load spaCy with full pipeline for noun extraction
-                        if _spacy_nlp:
-                            nlp = _spacy_nlp
-                        else:
-                            nlp = spacy.load("en_core_web_sm")
-                    except (OSError, ImportError):
-                        nlp = None
+                    # Use shared NLPManager for spaCy model
+                    from src.utils.nlp_manager import NLPManager
+                    nlp = NLPManager.get_nlp()
+                except (OSError, ImportError, RuntimeError):
+                    nlp = None
 
                     if nlp:
                         # Extract nouns from original text
@@ -318,18 +317,9 @@ class SemanticCritic:
         # Semantic similarity check above should catch fragments, but keep this as backup
         if not self.semantic_model:
             try:
-                # Load spaCy with parser for dependency checking
-                import spacy
-                try:
-                    # Try to use existing nlp if parser is available, otherwise load with parser
-                    if _spacy_nlp and hasattr(_spacy_nlp, 'parser') and _spacy_nlp.parser is not None:
-                        nlp = _spacy_nlp
-                    else:
-                        # Load with parser for this check
-                        nlp = spacy.load("en_core_web_sm")
-                except (OSError, ImportError):
-                    # If spaCy not available, skip fragment check
-                    nlp = None
+                # Use shared NLPManager for spaCy model
+                from src.utils.nlp_manager import NLPManager
+                nlp = NLPManager.get_nlp()
 
                 if nlp:
                     doc = nlp(generated_text)
@@ -354,6 +344,9 @@ class SemanticCritic:
                             "score": 0.0,
                             "feedback": "CRITICAL: Sentence fragment detected (missing Subject or Verb). Complete the thought with a proper main clause."
                         }
+            except (OSError, ImportError, RuntimeError):
+                # If spaCy not available, skip fragment check
+                pass
             except Exception:
                 # If fragment check fails, continue (don't block on spaCy errors)
                 pass
@@ -361,24 +354,10 @@ class SemanticCritic:
         # HARD GATE 3: Logic Contradiction Check (The Oxymoron Killer)
         # Use spaCy's dependency parsing and word vectors to detect semantic contradictions
         try:
-            import spacy
-            try:
-                # Try to load model with word vectors for semantic analysis
-                if _spacy_nlp and hasattr(_spacy_nlp.vocab, 'vectors') and len(_spacy_nlp.vocab.vectors) > 0:
-                    nlp = _spacy_nlp
-                    has_vectors = True
-                else:
-                    # Try medium model with vectors first
-                    try:
-                        nlp = spacy.load("en_core_web_md")
-                        has_vectors = True
-                    except OSError:
-                        # Fallback to small model
-                        nlp = spacy.load("en_core_web_sm")
-                        has_vectors = hasattr(nlp.vocab, 'vectors') and len(nlp.vocab.vectors) > 0
-            except (OSError, ImportError):
-                nlp = None
-                has_vectors = False
+            # Use shared NLPManager for spaCy model
+            from src.utils.nlp_manager import NLPManager
+            nlp = NLPManager.get_nlp()
+            has_vectors = hasattr(nlp.vocab, 'vectors') and len(nlp.vocab.vectors) > 0
 
             if nlp:
                 doc = nlp(generated_text)
@@ -486,6 +465,9 @@ class SemanticCritic:
                         "score": 0.0,
                         "feedback": f"CRITICAL: Logical contradiction detected: {', '.join(contradiction_pairs)}. Use modifiers that align with the noun's definition."
                     }
+        except (OSError, ImportError, RuntimeError):
+            # If spaCy not available, skip logic check
+            pass
         except Exception:
             # If logic check fails, continue (don't block on spaCy errors)
             pass

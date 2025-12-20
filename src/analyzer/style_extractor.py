@@ -6,8 +6,25 @@ to enable author-agnostic style transfer without hardcoding.
 
 import json
 import re
+from pathlib import Path
 from typing import List, Dict, Optional
 from src.generator.llm_provider import LLMProvider
+
+
+def _load_prompt_template(template_name: str) -> str:
+    """Load a prompt template from the prompts directory.
+
+    Args:
+        template_name: Name of the template file (e.g., 'style_extractor_system.md')
+
+    Returns:
+        Template content as string.
+    """
+    prompts_dir = Path(__file__).parent.parent.parent / "prompts"
+    template_path = prompts_dir / template_name
+    if not template_path.exists():
+        raise FileNotFoundError(f"Prompt template not found: {template_path}")
+    return template_path.read_text().strip()
 
 
 class StyleExtractor:
@@ -58,29 +75,12 @@ class StyleExtractor:
         analysis_examples = examples[:3]
         examples_text = "\n\n".join([f"Example {i+1}: \"{ex}\"" for i, ex in enumerate(analysis_examples)])
 
-        system_prompt = """You are a literary style analyst. Your task is to analyze writing samples and extract the distinctive style characteristics.
-
-Be precise and specific. Focus on what makes this author's voice unique."""
-
-        user_prompt = f"""Analyze these {len(analysis_examples)} text samples. Extract the following style characteristics:
-
-1. **Lexicon:** List 5-10 distinct words or phrases this author uses frequently (e.g., 'dialectical', 'manifestation', 'objective', 'struggle', 'contradiction'). Include both single words and short phrases (2-3 words max). Focus on distinctive vocabulary, not common words.
-
-2. **Tone:** One adjective describing the voice (e.g., 'Didactic', 'Minimalist', 'Authoritative', 'Poetic', 'Technical').
-
-3. **Structure:** One rule about sentence structure (e.g., 'Uses passive voice frequently', 'Starts sentences with conjunctions', 'Prefers short, declarative sentences', 'Uses complex subordinate clauses').
-
-Text samples:
-{examples_text}
-
-Output your analysis as a JSON object with exactly these keys:
-{{
-  "lexicon": ["word1", "word2", "phrase1", ...],
-  "tone": "Adjective",
-  "structure": "One structural rule"
-}}
-
-Return ONLY the JSON object, no additional text."""
+        system_prompt = _load_prompt_template("style_extractor_system.md")
+        user_template = _load_prompt_template("style_extractor_user.md")
+        user_prompt = user_template.format(
+            num_examples=len(analysis_examples),
+            examples_text=examples_text
+        )
 
         try:
             response = self.llm_provider.call(

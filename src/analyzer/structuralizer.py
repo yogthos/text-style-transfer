@@ -8,8 +8,25 @@ Also provides paragraph rhythm extraction for structural cloning.
 """
 
 import re
+from pathlib import Path
 from typing import Optional, List, Dict
 from src.generator.llm_provider import LLMProvider
+
+
+def _load_prompt_template(template_name: str) -> str:
+    """Load a prompt template from the prompts directory.
+
+    Args:
+        template_name: Name of the template file (e.g., 'structuralizer_skeleton_system.md')
+
+    Returns:
+        Template content as string.
+    """
+    prompts_dir = Path(__file__).parent.parent.parent / "prompts"
+    template_path = prompts_dir / template_name
+    if not template_path.exists():
+        raise FileNotFoundError(f"Prompt template not found: {template_path}")
+    return template_path.read_text().strip()
 
 # Rhetorical connectors that define sentence flow (case-insensitive matching)
 RHETORICAL_OPENERS = {
@@ -50,41 +67,9 @@ class Structuralizer:
         if not text or not text.strip():
             return ""
 
-        system_prompt = """You are a linguistic structure analyzer. Your task is to extract the syntactic skeleton of a sentence by replacing ALL content words with placeholders while preserving ONLY functional grammar words."""
-
-        user_prompt = f"""Extract the structural skeleton by replacing ALL specific nouns, verbs, and adjectives with generic placeholders.
-
-**CRITICAL RULES (GHOST WORD BAN):**
-- You MUST replace ALL specific nouns, verbs, and adjectives with placeholders ([NP], [VP], [ADJ])
-- Do NOT leave any specific content words like 'theory', 'knowledge', 'standpoint', 'practice', 'ideas', 'skies', 'mind', etc.
-- Replace EVERY content word, no exceptions
-- If you see words like 'ideas', 'skies', 'mind', 'theory', 'knowledge', 'correct', 'innate', they MUST become [NP] or [ADJ] or [VP]
-- Only keep strictly rhetorical connectors (but, however, thus, therefore, yet, etc.) and functional grammar words
-
-**KEEP (Functional Grammar Only):**
-- Prepositions: of, in, to, for, with, by, from, at, on, etc.
-- Conjunctions: and, but, or, if, when, while, etc.
-- Determiners: the, a, an, this, that, these, those
-- Auxiliary verbs: is, are, was, were, has, have, had, will, would, could, should, may, might, must, can
-- Rhetorical connectors: but, however, thus, therefore, yet, conversely, nevertheless, nonetheless, moreover, furthermore, consequently, hence, accordingly, indeed, in fact, specifically, notably, significantly, importantly, crucially, meanwhile, alternatively, additionally, similarly, likewise, instead
-
-**REPLACE (ALL Content Words - NO EXCEPTIONS):**
-- ALL Nouns → [NP] (e.g., 'theory', 'knowledge', 'standpoint', 'practice', 'ideas', 'skies', 'mind' → [NP])
-- ALL Verbs → [VP] (e.g., 'reinforce', 'affirm', 'serve', 'come', 'drop' → [VP])
-- ALL Adjectives → [ADJ] (e.g., 'primary', 'objective', 'dialectical', 'correct', 'innate' → [ADJ])
-
-**Example:**
-Input: "The standpoint of practice is the primary standpoint."
-Output: "The [NP] of [NP] is the [ADJ] [NP]."
-(NOT "The [NP] of practice..." - you must replace ALL content words)
-
-Input: "Where do correct ideas come from? Do they drop from the skies? Are they innate in the mind?"
-Output: "Where [VP] [ADJ] [NP] [VP] from? [VP] [NP] [VP] from the [NP]? [VP] [NP] [ADJ] in the [NP]?"
-(NOT "Where do correct ideas come from? Do they drop from the skies?" - replace ALL content words including 'ideas', 'skies', 'mind', 'correct', 'innate')
-
-Input: "{text}"
-
-Output ONLY the skeleton with placeholders, no explanations:"""
+        system_prompt = _load_prompt_template("structuralizer_skeleton_system.md")
+        user_template = _load_prompt_template("structuralizer_skeleton_user.md")
+        user_prompt = user_template.format(text=text)
 
         try:
             response = self.llm_provider.call(
@@ -181,34 +166,24 @@ Output ONLY the skeleton with placeholders, no explanations:"""
         if 0.5 * target_word_count <= current_slots <= 2.0 * target_word_count:
             return skeleton
 
-        system_prompt = """You are a linguistic structure adapter. Your task is to modify sentence skeletons to match target complexity while preserving the author's distinctive voice and structural connectors."""
+        system_prompt = _load_prompt_template("structuralizer_adapt_system.md")
 
         if current_slots > target_word_count * 2:
             # Too long: compress
-            user_prompt = f"""This sentence structure is too long ({current_slots} slots). Simplify it to approximately {target_word_count} slots while keeping the author's voice and connectors.
-
-**Original Skeleton:** "{skeleton}"
-
-**Instructions:**
-- Reduce the number of [NP], [VP], and [ADJ] placeholders to approximately {target_word_count}
-- Keep ALL prepositions, conjunctions, articles, and structural words exactly as they are
-- Preserve the author's distinctive voice and connector style
-- Simplify complex clauses but maintain the core structure
-
-**Output:** Return ONLY the simplified skeleton with placeholders, no explanations:"""
+            user_template = _load_prompt_template("structuralizer_adapt_compress_user.md")
+            user_prompt = user_template.format(
+                current_slots=current_slots,
+                target_word_count=target_word_count,
+                skeleton=skeleton
+            )
         else:
             # Too short: expand
-            user_prompt = f"""This sentence structure is too short ({current_slots} slots). Expand it to approximately {target_word_count} slots using the author's typical elaboration style.
-
-**Original Skeleton:** "{skeleton}"
-
-**Instructions:**
-- Increase the number of [NP], [VP], and [ADJ] placeholders to approximately {target_word_count}
-- Keep ALL existing prepositions, conjunctions, articles, and structural words
-- Add elaboration in the author's typical style (e.g., additional clauses, descriptive phrases)
-- Maintain the core structure while expanding complexity
-
-**Output:** Return ONLY the expanded skeleton with placeholders, no explanations:"""
+            user_template = _load_prompt_template("structuralizer_adapt_expand_user.md")
+            user_prompt = user_template.format(
+                current_slots=current_slots,
+                target_word_count=target_word_count,
+                skeleton=skeleton
+            )
 
         try:
             response = self.llm_provider.call(

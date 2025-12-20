@@ -106,9 +106,7 @@ class LLMJudge:
         )
 
         # System prompt for judge
-        system_prompt = """You are an Expert Editor specializing in translation quality assessment.
-Your task is to rank translation candidates based on accuracy, fluency, and style.
-Be decisive and consistent in your judgments."""
+        system_prompt = _load_prompt_template("judge_ranking_system.md")
 
         try:
             # Call LLM for ranking

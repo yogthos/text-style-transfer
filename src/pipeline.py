@@ -21,6 +21,7 @@ from src.atlas.style_registry import StyleRegistry
 from src.analyzer.style_extractor import StyleExtractor
 from src.analysis.semantic_analyzer import PropositionExtractor
 from src.utils.structure_tracker import StructureTracker
+from src.analyzer.global_context import GlobalContextAnalyzer
 
 
 def _split_into_paragraphs(text: str) -> List[str]:
@@ -190,6 +191,30 @@ def process_text(
     if not paragraphs:
         return []
 
+    # Extract global context if enabled (Read First step)
+    global_context = None
+    try:
+        with open(config_path, 'r') as f:
+            config = json.load(f)
+        global_context_config = config.get("global_context", {})
+        if global_context_config.get("enabled", True):
+            if verbose:
+                print("  Extracting Global Context...")
+            analyzer = GlobalContextAnalyzer(config_path=config_path)
+            global_context = analyzer.analyze_document(input_text, verbose=verbose)
+            if verbose:
+                thesis_preview = global_context.get('thesis', '')[:100] if global_context.get('thesis') else ''
+                if thesis_preview:
+                    print(f"  Context Thesis: {thesis_preview}...")
+                print(f"  Context Intent: {global_context.get('intent', 'informing')}")
+                keywords = global_context.get('keywords', [])[:5]
+                if keywords:
+                    print(f"  Context Keywords: {', '.join(keywords)}")
+    except Exception as e:
+        if verbose:
+            print(f"  ⚠ Global context extraction failed: {e}, continuing without context")
+        global_context = None
+
     generated_paragraphs = []
     current_paragraph_sentences = []  # Track sentences for current paragraph
     is_first_paragraph = True
@@ -280,7 +305,8 @@ def process_text(
                     used_examples=used_examples,
                     secondary_author=secondary_author,
                     blend_ratio=blend_ratio,
-                    verbose=verbose
+                    verbose=verbose,
+                    global_context=global_context
                 )
 
                 # Evaluate with paragraph mode
@@ -303,7 +329,8 @@ def process_text(
                     is_paragraph=True,
                     author_style_vector=author_style_vector,
                     secondary_author_vector=secondary_author_vector,
-                    blend_ratio=blend_ratio
+                    blend_ratio=blend_ratio,
+                    global_context=global_context
                 )
 
                 # Load thresholds from config for tiered evaluation

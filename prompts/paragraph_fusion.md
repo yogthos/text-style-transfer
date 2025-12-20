@@ -10,6 +10,8 @@ You are a ghostwriter. Your goal is to write a single cohesive paragraph in the 
 
 {mandatory_vocabulary}
 
+{global_context}
+
 {rhetorical_connectors}
 
 ### REQUIREMENTS:

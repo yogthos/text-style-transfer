@@ -201,7 +201,8 @@ class SemanticCritic:
         author_style_vector: Optional[np.ndarray] = None,
         style_lexicon: Optional[List[str]] = None,
         secondary_author_vector: Optional[np.ndarray] = None,
-        blend_ratio: float = 0.5
+        blend_ratio: float = 0.5,
+        global_context: Optional[Dict] = None
     ) -> Dict[str, any]:
         """Evaluate generated text against input blueprint.
 
@@ -576,7 +577,7 @@ class SemanticCritic:
         logic_fail = False
         if self.use_llm_verification and self.llm_provider:
             llm_meaning_preserved, llm_confidence, llm_explanation = self._verify_meaning_with_llm(
-                original_text, generated_text
+                original_text, generated_text, global_context=global_context
             )
             # If LLM detects meaning loss with high confidence, override pass status
             if not llm_meaning_preserved and llm_confidence > 0.7:
@@ -589,7 +590,7 @@ class SemanticCritic:
                 inferred_skeleton_type = self._infer_skeleton_type(skeleton, generated_text)
 
             logic_fail, logic_reason = self._verify_logic(
-                original_text, generated_text, inferred_skeleton_type or "DECLARATIVE"
+                original_text, generated_text, inferred_skeleton_type or "DECLARATIVE", global_context=global_context
             )
             if logic_fail:
                 # HARD CAP: Force score to 0.45 if logic is wrong, regardless of Recall
@@ -621,7 +622,7 @@ class SemanticCritic:
             "feedback": " ".join(feedback_parts) if feedback_parts else "Passed semantic validation."
         }
 
-    def _verify_meaning_with_llm(self, original_text: str, generated_text: str) -> Tuple[bool, float, str]:
+    def _verify_meaning_with_llm(self, original_text: str, generated_text: str, global_context: Optional[Dict] = None) -> Tuple[bool, float, str]:
         """Verify meaning preservation using LLM (Final Heuristic).
 
         Uses LLM to compare original and generated text, confirming core meaning is unchanged.
@@ -647,7 +648,14 @@ Generated: "{generated_text}"
 Does the generated text preserve the core meaning of the original? Pay attention to:
 - Logical relationships: Does it add conditions (e.g., "only when", "if... then") that weren't in the original?
 - Meaning shifts: Does it change a universal statement into a conditional, or vice versa?
-- Contradictions: Does it imply something that contradicts the original meaning?
+- Contradictions: Does it imply something that contradicts the original meaning?"""
+
+        # Add global context if available
+        if global_context and global_context.get('thesis'):
+            context_note = f"\n\nCONTEXT: The document is about {global_context['thesis']}. Verify that the generated text aligns with this context and doesn't introduce off-topic content."
+            user_prompt += context_note
+
+        user_prompt += """
 
 Respond with JSON:
 {{
@@ -718,7 +726,8 @@ Respond with JSON:
         self,
         original_text: str,
         generated_text: str,
-        skeleton_type: str = "DECLARATIVE"
+        skeleton_type: str = "DECLARATIVE",
+        global_context: Optional[Dict] = None
     ) -> Tuple[bool, str]:
         """Verify logic preservation with rhetorical context awareness.
 
@@ -769,6 +778,11 @@ Return JSON:
                 generated_text=generated_text,
                 skeleton_type=skeleton_type
             )
+
+            # Add global context if available
+            if global_context and global_context.get('thesis'):
+                context_note = f"\n\nCONTEXT: The document is about {global_context['thesis']}. Verify that the generated text aligns with this context."
+                prompt += context_note
 
             response = self.llm_provider.call(
                 system_prompt="You are a precision logic validator. Output ONLY valid JSON.",

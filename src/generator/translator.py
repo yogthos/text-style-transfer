@@ -2711,7 +2711,8 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         used_examples: Optional[Set[str]] = None,
         secondary_author: Optional[str] = None,
         blend_ratio: float = 0.5,
-        verbose: bool = False
+        verbose: bool = False,
+        global_context: Optional[Dict] = None
     ) -> tuple[str, Optional[List[Dict]], Optional[str]]:
         """Translate a paragraph holistically using paragraph fusion.
 
@@ -3150,11 +3151,25 @@ These connectors match the author's style and help create flowing, complex sente
             # Fallback: no structural blueprint
             structural_blueprint = ""
 
+        # Build global context section if available
+        global_context_section = ""
+        if global_context and global_context.get('thesis'):
+            keywords_text = ', '.join(global_context.get('keywords', [])[:5])
+            global_context_section = f"""
+### DOCUMENT CONTEXT:
+The overall text is about: {global_context['thesis']}
+The author's intent is: {global_context['intent']}
+Keep these key terms consistent: {keywords_text}
+
+Use this context to resolve ambiguities in the propositions. If a proposition is vague, interpret it in light of this overall document theme.
+"""
+
         prompt = PARAGRAPH_FUSION_PROMPT.format(
             propositions_list=propositions_list,
             proposition_count=len(propositions),
             style_examples=style_examples_text,
             mandatory_vocabulary=mandatory_vocabulary,
+            global_context=global_context_section,
             rhetorical_connectors=rhetorical_connectors,
             citation_instruction=citation_instruction,
             citation_output_instruction=citation_output_instruction,
@@ -3219,6 +3234,40 @@ These connectors match the author's style and help create flowing, complex sente
             variations = self._extract_json_list(response)
             num_variations = self.paragraph_fusion_config.get("num_variations", 5)
             variations = variations[:num_variations]
+
+            # NEW: Log what we actually received
+            if verbose:
+                print(f"  Parsed {len(variations)} variations from LLM response:")
+                for i, v in enumerate(variations):
+                    preview = v.strip()[:80] if v else "(empty)"
+                    print(f"    Candidate {i+1} preview: {preview}...")
+
+            # NEW: Deduplicate variations to save compute
+            unique_variations = []
+            seen_hashes = set()
+
+            for v in variations:
+                if not v or not v.strip():
+                    continue  # Skip empty variations
+
+                # Normalize for comparison (ignore whitespace/case differences)
+                v_clean = " ".join(v.split()).lower()
+                v_hash = hash(v_clean)
+
+                if v_hash not in seen_hashes:
+                    seen_hashes.add(v_hash)
+                    unique_variations.append(v)
+                elif verbose:
+                    print(f"    ⚠ Skipped duplicate variation (hash: {v_hash})")
+
+            # Update the list
+            variations = unique_variations
+
+            # Safety fallback: if deduplication removed everything, use raw response
+            if not variations:
+                if verbose:
+                    print(f"  ⚠ All variations were duplicates or empty. Using raw response as single variation.")
+                variations = [response.strip()] if response else []
 
             if not variations:
                 if verbose:

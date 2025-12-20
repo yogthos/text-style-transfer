@@ -3345,7 +3345,8 @@ Use this context to resolve ambiguities in the propositions. If a proposition is
                     "result": critic_result,
                     "missing_citations": missing_citations,
                     "missing_quotes": missing_quotes,
-                    "needs_artifact_repair": needs_artifact_repair
+                    "needs_artifact_repair": needs_artifact_repair,
+                    "index": i + 1  # Track original variation number (1-based)
                 })
 
                 if verbose:
@@ -3385,7 +3386,8 @@ Use this context to resolve ambiguities in the propositions. If a proposition is
                             print(f"  ✓ Repaired missing citations/quotes")
 
                 if verbose:
-                    print(f"  ✓ Selected qualified candidate: recall={best_candidate['recall']:.2f}, "
+                    candidate_num = best_candidate.get("index", "?")
+                    print(f"  ✓ Selected qualified candidate #{candidate_num}: recall={best_candidate['recall']:.2f}, "
                           f"score={best_candidate['score']:.2f}")
 
                 # Remove phantom citations before returning
@@ -3401,8 +3403,9 @@ Use this context to resolve ambiguities in the propositions. If a proposition is
                 # 3. Fallback: No qualified candidates, pick highest recall (salvage meaning)
                 best_candidate = max(evaluated_candidates, key=lambda x: x["recall"])
                 if verbose:
+                    candidate_num = best_candidate.get("index", "?")
                     print(f"  ⚠ No qualified candidates (recall >= {proposition_recall_threshold}), "
-                          f"using best recall: {best_candidate['recall']:.2f}")
+                          f"using best recall from candidate #{candidate_num}: {best_candidate['recall']:.2f}")
 
                 # Task 3: "Delta" Repair Loop - if recall < threshold, attempt repair
                 repair_threshold = 0.7

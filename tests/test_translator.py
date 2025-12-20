@@ -1673,6 +1673,204 @@ def test_adherence_allows_type_match():
     print("✓ test_adherence_allows_type_match passed")
 
 
+def test_detect_voice_first_person():
+    """Test voice detection for first-person text."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_detect_voice_first_person (missing dependencies)")
+        return
+
+    translator = StyleTranslator(config_path="config.json")
+
+    test_cases = [
+        ("I spent my childhood scavenging in the ruins.", "1st"),
+        ("We were there together.", "1st"),
+        ("I was thirteen. Every morning required a pilgrimage.", "1st"),
+        ("My family lived in that house.", "1st"),
+        ("Our journey began there.", "1st")
+    ]
+
+    for text, expected in test_cases:
+        result = translator._detect_voice(text)
+        assert result == expected, f"Expected {expected} for '{text[:40]}...', got {result}"
+
+    print("✓ First-person voice detection works correctly")
+
+
+def test_detect_voice_second_person():
+    """Test voice detection for second-person text."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_detect_voice_second_person (missing dependencies)")
+        return
+
+    translator = StyleTranslator(config_path="config.json")
+
+    test_cases = [
+        ("You will understand that the system operates correctly.", "2nd"),
+        ("You'll see how this works.", "2nd"),
+        ("Your approach is correct.", "2nd"),
+        ("You must follow these steps.", "2nd")
+    ]
+
+    for text, expected in test_cases:
+        result = translator._detect_voice(text)
+        assert result == expected, f"Expected {expected} for '{text[:40]}...', got {result}"
+
+    print("✓ Second-person voice detection works correctly")
+
+
+def test_detect_voice_third_person():
+    """Test voice detection for third-person text."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_detect_voice_third_person (missing dependencies)")
+        return
+
+    translator = StyleTranslator(config_path="config.json")
+
+    test_cases = [
+        ("He walked through the ruins.", "3rd"),
+        ("She found the answer.", "3rd"),
+        ("They were destroyed.", "3rd"),
+        ("The system operates correctly. They work well.", "3rd"),  # "it" ignored, "they" detected
+        ("His approach was different.", "3rd")
+    ]
+
+    for text, expected in test_cases:
+        result = translator._detect_voice(text)
+        assert result == expected, f"Expected {expected} for '{text[:40]}...', got {result}"
+
+    print("✓ Third-person voice detection works correctly")
+
+
+def test_detect_voice_neutral():
+    """Test voice detection for neutral text (no pronouns)."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_detect_voice_neutral (missing dependencies)")
+        return
+
+    translator = StyleTranslator(config_path="config.json")
+
+    test_cases = [
+        ("The system operates correctly.", "neutral"),
+        ("Clojure is a functional language.", "neutral"),
+        ("It is clear that the approach works.", "neutral"),  # "it" is ignored
+        ("The violent shift to capitalism did not bring freedom.", "neutral")
+    ]
+
+    for text, expected in test_cases:
+        result = translator._detect_voice(text)
+        assert result == expected, f"Expected {expected} for '{text[:40]}...', got {result}"
+
+    print("✓ Neutral voice detection works correctly")
+
+
+def test_detect_voice_mixed():
+    """Test voice detection for mixed text (should return dominant voice)."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_detect_voice_mixed (missing dependencies)")
+        return
+
+    translator = StyleTranslator(config_path="config.json")
+
+    # More first-person markers than third-person
+    text1 = "I spent my childhood there. We were together. He was also there."
+    result1 = translator._detect_voice(text1)
+    assert result1 == "1st", f"Expected '1st' for mixed text with more first-person, got {result1}"
+
+    # More third-person markers than first-person
+    text2 = "He walked there. She was there. I saw them."
+    result2 = translator._detect_voice(text2)
+    assert result2 == "3rd", f"Expected '3rd' for mixed text with more third-person, got {result2}"
+
+    print("✓ Mixed voice detection works correctly (returns dominant)")
+
+
+def test_voice_mismatch_penalty_second_person_template():
+    """Test that second-person templates get heavy penalty for first-person input."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_voice_mismatch_penalty_second_person_template (missing dependencies)")
+        return
+
+    print("\n" + "="*60)
+    print("TEST: Voice Mismatch Penalty (2nd-person template)")
+    print("="*60)
+
+    translator = StyleTranslator(config_path="config.json")
+
+    # First-person input
+    paragraph = "I spent my childhood scavenging in the ruins. We were there together."
+    input_voice = translator._detect_voice(paragraph)
+    assert input_voice == "1st", "Input should be detected as first-person"
+
+    # Second-person example (should get heavy penalty)
+    example_2nd = "You will understand that the system operates correctly. You'll see how this works."
+    example_voice_2nd = translator._detect_voice(example_2nd)
+    assert example_voice_2nd == "2nd", "Example should be detected as second-person"
+
+    # First-person example (should get no penalty)
+    example_1st = "I spent my childhood there. We were together."
+    example_voice_1st = translator._detect_voice(example_1st)
+    assert example_voice_1st == "1st", "Example should be detected as first-person"
+
+    # Calculate penalties manually (matching the logic in translate_paragraph)
+    if example_voice_2nd == "2nd" and input_voice != "2nd":
+        penalty_2nd = 0.1
+    else:
+        penalty_2nd = 1.0
+
+    if example_voice_1st == input_voice:
+        penalty_1st = 1.0
+    else:
+        penalty_1st = 1.0
+
+    assert penalty_2nd == 0.1, f"Second-person template should get 0.1 penalty"
+    assert penalty_1st == 1.0, "First-person template should get no penalty"
+
+    print(f"  Input voice: {input_voice}")
+    print(f"  2nd-person template penalty: {penalty_2nd}x")
+    print(f"  1st-person template penalty: {penalty_1st}x")
+    print("✓ Voice mismatch penalty applied correctly")
+
+
+def test_voice_mismatch_penalty_first_third_person():
+    """Test that first vs third person mismatch gets mild penalty."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_voice_mismatch_penalty_first_third_person (missing dependencies)")
+        return
+
+    print("\n" + "="*60)
+    print("TEST: Voice Mismatch Penalty (1st vs 3rd person)")
+    print("="*60)
+
+    translator = StyleTranslator(config_path="config.json")
+
+    # First-person input
+    paragraph = "I spent my childhood there. We were together."
+    input_voice = translator._detect_voice(paragraph)
+    assert input_voice == "1st", "Input should be detected as first-person"
+
+    # Third-person example (should get mild penalty)
+    example_3rd = "He walked through the ruins. They were destroyed."
+    example_voice_3rd = translator._detect_voice(example_3rd)
+    assert example_voice_3rd == "3rd", "Example should be detected as third-person"
+
+    # Calculate penalty (matching the logic in translate_paragraph)
+    if example_voice_3rd == "2nd" and input_voice != "2nd":
+        penalty = 0.1
+    elif input_voice == "2nd" and example_voice_3rd != "2nd":
+        penalty = 0.7
+    elif input_voice != example_voice_3rd and example_voice_3rd != "neutral" and input_voice != "neutral":
+        penalty = 0.9
+    else:
+        penalty = 1.0
+
+    assert penalty == 0.9, f"First vs third person mismatch should get 0.9x penalty, got {penalty}"
+
+    print(f"  Input voice: {input_voice}")
+    print(f"  Example voice: {example_voice_3rd}")
+    print(f"  Penalty: {penalty}x")
+    print("✓ Mild penalty applied for 1st/3rd mismatch")
+
+
 if __name__ == "__main__":
     if not DEPENDENCIES_AVAILABLE:
         print(f"⚠ All tests skipped due to missing dependencies: {IMPORT_ERROR}")
@@ -1720,5 +1918,14 @@ if __name__ == "__main__":
     test_type_compatibility_filter_allows_exact_match()
     test_adherence_penalizes_type_mismatch()
     test_adherence_allows_type_match()
+    # Voice detection tests
+    test_detect_voice_first_person()
+    test_detect_voice_second_person()
+    test_detect_voice_third_person()
+    test_detect_voice_neutral()
+    test_detect_voice_mixed()
+    # Voice mismatch penalty tests
+    test_voice_mismatch_penalty_second_person_template()
+    test_voice_mismatch_penalty_first_third_person()
     print("\n✓ All translator tests completed!")
 

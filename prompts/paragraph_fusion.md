@@ -5,8 +5,7 @@ You are a ghostwriter. Your goal is to write a single cohesive paragraph in the 
 
 **CRITICAL CHECKLIST:** You have {proposition_count} propositions. You MUST include every single one. Count them as you write. Missing even one proposition will cause the generation to fail.
 
-### STYLE EXAMPLES:
-{style_examples}
+{style_section}
 
 {mandatory_vocabulary}
 

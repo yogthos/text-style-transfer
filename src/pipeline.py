@@ -346,7 +346,7 @@ def process_text(
                 )
 
                 # Use internal_recall from translator (includes repair loop context and relaxed thresholds)
-                # No need to re-evaluate - the translator has already done comprehensive evaluation
+                # Re-evaluate to get coherence and topic similarity scores for sanity gate
                 # Load thresholds from config for tiered evaluation
                 try:
                     with open(config_path, 'r') as f:
@@ -354,22 +354,56 @@ def process_text(
                     paragraph_fusion_config = config.get("paragraph_fusion", {})
                     ideal_threshold = paragraph_fusion_config.get("proposition_recall_threshold", 0.85)
                     min_viable = paragraph_fusion_config.get("min_viable_recall_threshold", 0.70)
+                    coherence_threshold = paragraph_fusion_config.get("coherence_threshold", 0.8)
+                    topic_similarity_threshold = paragraph_fusion_config.get("topic_similarity_threshold", 0.6)
                 except Exception:
                     # Fallback to defaults if config read fails
                     ideal_threshold = 0.85
                     min_viable = 0.70
+                    coherence_threshold = 0.8
+                    topic_similarity_threshold = 0.6
+
+                # Re-evaluate final paragraph to get coherence and topic similarity
+                # (These are expensive checks that only run on promising candidates)
+                # Note: critic and proposition_extractor are already initialized at function start
+                propositions = proposition_extractor.extract_atomic_propositions(paragraph)
+
+                # Create blueprint for evaluation
+                blueprint = extractor.extract(paragraph)
+
+                # Re-evaluate to get coherence and topic similarity
+                critic_result = critic.evaluate(
+                    generated_text=generated_paragraph,
+                    input_blueprint=blueprint,
+                    propositions=propositions,
+                    is_paragraph=True,
+                    author_style_vector=None,  # Not needed for coherence check
+                    style_lexicon=None
+                )
+
+                # Get coherence and topic similarity from critic result
+                coherence_score = critic_result.get('coherence_score', 1.0)
+                topic_similarity = critic_result.get('topic_similarity', 1.0)
 
                 # internal_recall is already available from translate_paragraph return value
                 # This is the best recall achieved during the repair loop, with proper context
 
-                # Tiered evaluation logic
-                if internal_recall >= ideal_threshold:
-                    # Scenario A: Perfect Pass
+                # Tiered evaluation logic with sanity gate
+                if internal_recall >= ideal_threshold and coherence_score >= coherence_threshold and topic_similarity >= topic_similarity_threshold:
+                    # Scenario A: Perfect Pass (high recall, coherent, and preserves topic)
                     if verbose:
-                        print(f"  ✓ Fusion Success: Recall {internal_recall:.2f} >= {ideal_threshold}")
-                    # Create critic_result for perfect pass
-                    critic_result = {"pass": True, "score": 1.0, "proposition_recall": internal_recall}
+                        print(f"  ✓ Fusion Success: Recall {internal_recall:.2f} >= {ideal_threshold}, Coherence {coherence_score:.2f} >= {coherence_threshold}, Topic similarity {topic_similarity:.2f} >= {topic_similarity_threshold}")
+                    # Override critic_result to ensure pass=True
+                    critic_result["pass"] = True
+                    critic_result["score"] = 1.0  # Perfect score
                     pass_status = "PERFECT PASS"
+                elif internal_recall >= ideal_threshold:
+                    # High recall but low coherence/similarity = gibberish
+                    if verbose:
+                        print(f"  ⚠ High recall ({internal_recall:.2f}) but coherence ({coherence_score:.2f}) or topic similarity ({topic_similarity:.2f}) too low")
+                    pass_status = "COHERENCE FAIL"
+                    critic_result["pass"] = False
+                    # Don't override score - let it reflect the failure
 
                 elif internal_recall >= min_viable:
                     # Scenario B: Soft Pass (The Fix)

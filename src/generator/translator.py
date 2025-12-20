@@ -91,6 +91,9 @@ class StyleTranslator:
         self.structuralizer = Structuralizer(config_path=config_path)
         # Initialize proposition extractor for paragraph fusion
         self.proposition_extractor = PropositionExtractor(config_path=config_path)
+        # Initialize structure extractor for template bleaching
+        from src.analyzer.structure_extractor import StructureExtractor
+        self.structure_extractor = StructureExtractor(config_path=config_path)
         # Load paragraph fusion config
         self.paragraph_fusion_config = self.config.get("paragraph_fusion", {})
         # Load LLM provider config (for retry settings)
@@ -387,6 +390,60 @@ class StyleTranslator:
         union = len(tokens1 | tokens2)
 
         return intersection / union if union > 0 else 0.0
+
+    def _detect_voice(self, text: str) -> str:
+        """Detect the voice/perspective of a text (1st, 2nd, 3rd person, or neutral).
+
+        Args:
+            text: Input text to analyze.
+
+        Returns:
+            "1st", "2nd", "3rd", or "neutral" based on pronoun usage.
+        """
+        if not text or not text.strip():
+            return "neutral"
+
+        import re
+        text_lower = text.lower()
+
+        # First-person markers (use word boundaries to avoid false matches)
+        first_person_patterns = [
+            r'\bi\b', r'\bme\b', r'\bmy\b', r'\bmine\b',
+            r'\bwe\b', r'\bus\b', r'\bour\b', r'\bours\b'
+        ]
+        first_count = sum(len(re.findall(pattern, text_lower)) for pattern in first_person_patterns)
+
+        # Second-person markers
+        second_person_patterns = [
+            r'\byou\b', r'\byour\b', r'\byours\b'
+        ]
+        second_count = sum(len(re.findall(pattern, text_lower)) for pattern in second_person_patterns)
+
+        # Third-person markers (explicitly ignore "it" to avoid noise)
+        third_person_patterns = [
+            r'\bhe\b', r'\bhim\b', r'\bhis\b',
+            r'\bshe\b', r'\bher\b', r'\bhers\b',
+            r'\bthey\b', r'\bthem\b', r'\btheir\b', r'\btheirs\b'
+        ]
+        third_count = sum(len(re.findall(pattern, text_lower)) for pattern in third_person_patterns)
+
+        # Return the category with the highest count
+        counts = {
+            "1st": first_count,
+            "2nd": second_count,
+            "3rd": third_count
+        }
+
+        max_count = max(counts.values())
+        if max_count == 0:
+            return "neutral"
+
+        # Return the category with the highest count
+        for voice, count in counts.items():
+            if count == max_count:
+                return voice
+
+        return "neutral"
 
     def _detect_sentence_type(self, text: str) -> str:
         """Robustly detects if a sentence/skeleton is QUESTION, CONDITIONAL, or DECLARATIVE.
@@ -3072,13 +3129,34 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                     is_used = used_examples and (example in used_examples)
                     freshness_score = 0.0 if is_used else 1.0
 
-                    # 6. Composite score
+                    # 6. Voice compatibility check (asymmetric penalties)
+                    input_voice = self._detect_voice(paragraph)
+                    example_voice = self._detect_voice(example)
+
+                    voice_penalty = 1.0  # Default: no penalty
+                    if example_voice == "2nd" and input_voice != "2nd":
+                        # "You" templates are toxic for narrative. Heavy penalty.
+                        voice_penalty = 0.1
+                        if verbose:
+                            print(f"    Voice Clash: Rejecting 2nd-person template for {input_voice}-person input (penalty: 0.1x)")
+                    elif input_voice == "2nd" and example_voice != "2nd":
+                        # Input is 2nd person, template is not - moderate penalty
+                        voice_penalty = 0.7
+                        if verbose:
+                            print(f"    Voice Mismatch: 2nd-person input with {example_voice}-person template (penalty: 0.7x)")
+                    elif input_voice != example_voice and example_voice != "neutral" and input_voice != "neutral":
+                        # 1st vs 3rd mismatch is usually fine (they adapt well), mild penalty
+                        voice_penalty = 0.9
+                        if verbose:
+                            print(f"    Voice Mismatch: {input_voice}-person input with {example_voice}-person template (penalty: 0.9x)")
+
+                    # 7. Composite score (apply voice penalty)
                     composite_score = (
                         count_match * count_weight +
                         diversity_score * diversity_weight +
                         positional_fit * positional_weight +
                         freshness_score * freshness_weight
-                    )
+                    ) * voice_penalty
 
                     # Track best candidate
                     if composite_score > best_score:
@@ -3216,6 +3294,37 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         propositions_list = "\n".join([f"- {prop}" for prop in propositions])
         style_examples_text = "\n\n".join([f"Example {i+1}: \"{ex}\"" for i, ex in enumerate(complex_examples[:3])])
 
+        # Step 4.5: Build style section dynamically (structural template or raw examples)
+        use_structural_templates = self.paragraph_fusion_config.get("use_structural_templates", False)
+        style_section = ""
+
+        if use_structural_templates and teacher_example:
+            try:
+                if verbose:
+                    print(f"  Bleaching semantic content from teacher example...")
+                structural_template = self.structure_extractor.extract_template(teacher_example)
+                if structural_template and structural_template.strip():
+                    style_section = f"""### STRUCTURAL BLUEPRINT:
+I have provided a 'Structural Template' below. It contains the **Rhythm** and **Syntax** you must use, but with the content removed (marked as `[NP]`, `[VP]`, etc.).
+
+**Template:** {structural_template}
+
+**Task:** Inject the input propositions into this template structure. **Adapt pronouns** to match the Input's voice (e.g., if template has '[NP] will observe', and input is 'I', write 'I observed'). You must preserve the sentence rhythm and connector logic, but you may change pronouns and subject-verb agreement to match the Input's perspective. Replace the `[NP]`/`[VP]` placeholders with the specific details from the input story. Do NOT use the placeholders in the final output."""
+                    if verbose:
+                        print(f"  Template: {structural_template[:100]}{'...' if len(structural_template) > 100 else ''}")
+                else:
+                    raise ValueError("Template extraction returned empty string")
+            except Exception as e:
+                if verbose:
+                    print(f"  ⚠ Template extraction failed: {e}, falling back to raw text")
+                # Safety fallback: use raw example
+                style_section = f"""### STYLE EXAMPLES:
+Example 1: "{teacher_example}\""""
+        else:
+            # Standard behavior: use style examples
+            style_section = f"""### STYLE EXAMPLES:
+{style_examples_text}"""
+
         # Extract lexicon and format mandatory vocabulary section
         mandatory_vocabulary = ""
         if style_dna and isinstance(style_dna, dict):
@@ -3329,7 +3438,7 @@ Use this context to resolve ambiguities in the propositions. If a proposition is
         prompt = PARAGRAPH_FUSION_PROMPT.format(
             propositions_list=propositions_list,
             proposition_count=len(propositions),
-            style_examples=style_examples_text,
+            style_section=style_section,
             mandatory_vocabulary=mandatory_vocabulary,
             global_context=global_context_section,
             rhetorical_connectors=rhetorical_connectors,
@@ -3508,7 +3617,8 @@ Use this context to resolve ambiguities in the propositions. If a proposition is
                     propositions=propositions,
                     is_paragraph=True,
                     author_style_vector=author_style_vector,
-                    style_lexicon=style_lexicon
+                    style_lexicon=style_lexicon,
+                    verbose=verbose
                 )
 
                 evaluated_candidates.append({

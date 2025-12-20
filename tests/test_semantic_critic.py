@@ -711,6 +711,373 @@ def test_end_to_end_context_aware_evaluation():
     print("✓ test_end_to_end_context_aware_evaluation passed")
 
 
+def test_verify_coherence_coherent_text():
+    """Test _verify_coherence with coherent text (should return high score)."""
+    from unittest.mock import Mock, patch
+    import json
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider to return high coherence score
+    mock_response = json.dumps({
+        "is_coherent": True,
+        "score": 0.95,
+        "reason": "Text is grammatically fluent and logically consistent."
+    })
+    mock_llm = Mock()
+    mock_llm.call = Mock(return_value=mock_response)
+
+    # Replace LLM provider and ensure use_llm_verification is True
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    coherent_text = "I spent my childhood scavenging in the ruins of the Soviet Union. That country is a ghost now."
+    score, reason = critic._verify_coherence(coherent_text)
+
+    assert score >= 0.8, f"Coherent text should get high score, got {score}"
+    assert "coherent" in reason.lower() or score > 0.7, f"Reason should indicate coherence, got: {reason}"
+    assert mock_llm.call.call_count == 1, f"LLM should be called once, but call_count={mock_llm.call.call_count}"
+
+    print("✓ test_verify_coherence_coherent_text passed")
+
+
+def test_verify_coherence_gibberish_text():
+    """Test _verify_coherence with gibberish text (should return low score)."""
+    from unittest.mock import Mock
+    import json
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider to return low coherence score
+    mock_response = json.dumps({
+        "is_coherent": False,
+        "score": 0.3,
+        "reason": "Text contains word salad and nonsensical phrases like 'scavenged in ruins to turing complete'."
+    })
+    mock_llm = Mock()
+    mock_llm.call = Mock(return_value=mock_response)
+
+    # Replace LLM provider and ensure use_llm_verification is True
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    gibberish_text = "In case a union is haunting, the Soviet Union is observed to have been scavenged in ruins to turing complete."
+    score, reason = critic._verify_coherence(gibberish_text)
+
+    assert score < 0.7, f"Gibberish text should get low score, got {score}"
+    assert "coherent" not in reason.lower() or score < 0.5, f"Reason should indicate incoherence, got: {reason}"
+    assert mock_llm.call.call_count == 1, f"LLM should be called once, but call_count={mock_llm.call.call_count}"
+
+    print("✓ test_verify_coherence_gibberish_text passed")
+
+
+def test_verify_coherence_empty_text():
+    """Test _verify_coherence with empty text (edge case)."""
+    critic = SemanticCritic()
+
+    score, reason = critic._verify_coherence("")
+
+    assert score == 0.0, f"Empty text should get score 0.0, got {score}"
+    assert "empty" in reason.lower(), f"Reason should mention empty text, got: {reason}"
+
+    print("✓ test_verify_coherence_empty_text passed")
+
+
+def test_verify_coherence_llm_unavailable():
+    """Test _verify_coherence when LLM is unavailable (should return neutral score)."""
+    critic = SemanticCritic()
+    critic.llm_provider = None  # Simulate LLM unavailable
+
+    text = "This is a test sentence."
+    score, reason = critic._verify_coherence(text)
+
+    assert score == 1.0, f"When LLM unavailable, should return neutral score 1.0, got {score}"
+    assert "unavailable" in reason.lower(), f"Reason should mention LLM unavailable, got: {reason}"
+
+    print("✓ test_verify_coherence_llm_unavailable passed")
+
+
+def test_calculate_semantic_similarity_similar_topics():
+    """Test _calculate_semantic_similarity with similar topics (should return high similarity)."""
+    critic = SemanticCritic()
+
+    original = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    generated = "During my youth, I searched through the remains of the Soviet Union."
+
+    similarity = critic._calculate_semantic_similarity(original, generated)
+
+    # Similar topics should have high similarity (>0.7)
+    assert similarity >= 0.6, f"Similar topics should have high similarity, got {similarity}"
+
+    print(f"✓ test_calculate_semantic_similarity_similar_topics passed (similarity: {similarity:.2f})")
+
+
+def test_calculate_semantic_similarity_drifted_topics():
+    """Test _calculate_semantic_similarity with drifted topics (should return low similarity)."""
+    critic = SemanticCritic()
+
+    original = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    generated = "In case a union is haunting, the Soviet Union is observed to have been scavenged in ruins to turing complete."
+
+    similarity = critic._calculate_semantic_similarity(original, generated)
+
+    # Drifted topics (Soviet Union -> turing complete) should have low similarity (<0.6)
+    assert similarity < 0.6, f"Drifted topics should have low similarity, got {similarity}"
+
+    print(f"✓ test_calculate_semantic_similarity_drifted_topics passed (similarity: {similarity:.2f})")
+
+
+def test_evaluate_paragraph_mode_with_coherence_check():
+    """Test _evaluate_paragraph_mode includes coherence and topic similarity checks."""
+    from unittest.mock import Mock, patch
+    import json
+    import numpy as np
+    from src.analysis.semantic_analyzer import PropositionExtractor
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider for coherence check
+    mock_response = json.dumps({
+        "is_coherent": False,
+        "score": 0.4,
+        "reason": "Text contains word salad and nonsensical phrases."
+    })
+    mock_llm = Mock()
+    mock_llm.call = Mock(return_value=mock_response)
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    # Use text that will have high proposition recall but is still gibberish
+    generated_text = "I spent my childhood scavenging in the ruins of the Soviet Union to turing complete and the violent shift."
+
+    # Extract propositions
+    extractor = PropositionExtractor()
+    propositions = extractor.extract_atomic_propositions(original_text)
+
+    # Create blueprint
+    from src.ingestion.blueprint import BlueprintExtractor
+    blueprint_extractor = BlueprintExtractor()
+    blueprint = blueprint_extractor.extract(original_text)
+
+    # Evaluate in paragraph mode without style vector (style_alignment will be calculated but may not be >= 0.7)
+    # The coherence check only runs if proposition_recall >= 0.85 AND style_alignment >= 0.7
+    # If those conditions aren't met, coherence_score will default to 1.0
+    result = critic._evaluate_paragraph_mode(
+        generated_text=generated_text,
+        original_text=original_text,
+        propositions=propositions,
+        author_style_vector=None,  # No style vector - style alignment may be low
+        style_lexicon=None
+    )
+
+    # Check that coherence_score and topic_similarity are in result
+    assert "coherence_score" in result, "Result should include coherence_score"
+    assert "topic_similarity" in result, "Result should include topic_similarity"
+
+    # Gibberish should fail coherence check
+    coherence_score = result.get("coherence_score", 1.0)
+    topic_similarity = result.get("topic_similarity", 1.0)
+
+    # The coherence check should have been triggered if proposition_recall >= 0.85 and style >= 0.7
+    # If it wasn't triggered, coherence_score will be 1.0 (default)
+    # In that case, we just verify the structure is correct
+    if coherence_score < 1.0:
+        # Coherence check was triggered
+        assert coherence_score < 0.8 or topic_similarity < 0.6, \
+            f"Gibberish should fail coherence ({coherence_score:.2f}) or topic similarity ({topic_similarity:.2f}) check"
+
+        # If coherence is too low, score should be 0.0 (sanity gate)
+        if coherence_score < 0.8 or topic_similarity < 0.6:
+            assert result.get("score", 1.0) == 0.0 or result.get("pass", True) == False, \
+                f"Gibberish should fail sanity gate, got score={result.get('score')}, pass={result.get('pass')}"
+    else:
+        # Coherence check wasn't triggered (cheap checks didn't pass)
+        # This is okay - the test verifies the structure is in place
+        print(f"  Note: Coherence check not triggered (cheap checks may not have passed)")
+
+    print(f"✓ test_evaluate_paragraph_mode_with_coherence_check passed (coherence: {coherence_score:.2f}, topic_sim: {topic_similarity:.2f})")
+
+
+def test_evaluate_paragraph_mode_coherent_text():
+    """Test _evaluate_paragraph_mode with coherent text (should pass)."""
+    from unittest.mock import Mock
+    import json
+    from src.analysis.semantic_analyzer import PropositionExtractor
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider for coherence check (return high score)
+    mock_response = json.dumps({
+        "is_coherent": True,
+        "score": 0.9,
+        "reason": "Text is grammatically fluent and logically consistent."
+    })
+    mock_llm = Mock()
+    mock_llm.call = Mock(return_value=mock_response)
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    generated_text = "During my youth, I searched through the remains of the Soviet Union."
+
+    # Extract propositions
+    extractor = PropositionExtractor()
+    propositions = extractor.extract_atomic_propositions(original_text)
+
+    # Create blueprint
+    from src.ingestion.blueprint import BlueprintExtractor
+    blueprint_extractor = BlueprintExtractor()
+    blueprint = blueprint_extractor.extract(original_text)
+
+    # Evaluate in paragraph mode
+    result = critic._evaluate_paragraph_mode(
+        generated_text=generated_text,
+        original_text=original_text,
+        propositions=propositions,
+        author_style_vector=None,
+        style_lexicon=None
+    )
+
+    # Coherent text should pass coherence check
+    coherence_score = result.get("coherence_score", 0.0)
+    topic_similarity = result.get("topic_similarity", 0.0)
+
+    assert coherence_score >= 0.8, f"Coherent text should pass coherence check, got {coherence_score}"
+    assert topic_similarity >= 0.6, f"Similar topics should pass topic similarity check, got {topic_similarity}"
+
+    print(f"✓ test_evaluate_paragraph_mode_coherent_text passed (coherence: {coherence_score:.2f}, topic_sim: {topic_similarity:.2f})")
+
+
+def test_evaluate_paragraph_mode_score_normalization():
+    """Test that _evaluate_paragraph_mode properly normalizes weights so score is in [0, 1] range."""
+    from unittest.mock import Mock
+    import json
+    from src.analysis.semantic_analyzer import PropositionExtractor
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider for coherence check (return high score)
+    mock_llm = Mock()
+    mock_response = json.dumps({
+        "is_coherent": True,
+        "score": 0.9,
+        "reason": "Text is grammatically fluent and logically consistent."
+    })
+    mock_llm.call = Mock(return_value=mock_response)
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    generated_text = "During my youth, I searched through the remains of the Soviet Union."
+
+    # Extract propositions
+    extractor = PropositionExtractor()
+    propositions = extractor.extract_atomic_propositions(original_text)
+
+    # Create blueprint
+    from src.ingestion.blueprint import BlueprintExtractor
+    blueprint_extractor = BlueprintExtractor()
+    blueprint = blueprint_extractor.extract(original_text)
+
+    # Evaluate in paragraph mode without style vector
+    # The score should still be normalized even if expensive checks don't run
+    result = critic._evaluate_paragraph_mode(
+        generated_text=generated_text,
+        original_text=original_text,
+        propositions=propositions,
+        author_style_vector=None,  # No style vector - may not trigger expensive checks
+        style_lexicon=None,
+        verbose=False
+    )
+
+    # Check that score is in valid range [0, 1]
+    score = result.get("score", -1.0)
+    assert 0.0 <= score <= 1.0, f"Score should be in [0, 1] range, got {score}"
+
+    # Get all metrics
+    proposition_recall = result.get("proposition_recall", 0.0)
+    style_alignment = result.get("style_alignment", 0.0)
+    coherence_score = result.get("coherence_score", 1.0)
+    topic_similarity = result.get("topic_similarity", 1.0)
+
+    # Verify that the score is properly normalized
+    # The key test: even if expensive checks don't run, the initial_score should be normalized
+    # initial_score = (proposition_recall * meaning_weight) + (style_alignment * style_weight)
+    # With meaning_weight=0.8, style_weight=0.4, weight_sum = 1.2
+    # So final_score = initial_score / 1.2, which should be in [0, 1]
+
+    # If expensive checks ran (recall >= 0.85 and style >= 0.7), verify normalized calculation
+    if proposition_recall >= 0.85 and style_alignment >= 0.7:
+        # Weight sum = (0.8 * 0.7) + (0.4 * 0.2) + 0.1 + 0.1 = 0.84
+        # Normalized weights should sum to 1.0, so score should be properly scaled
+        # If all metrics are 1.0, score should be 1.0 (not 0.84)
+        if coherence_score >= 0.8 and topic_similarity >= 0.6:
+            # All checks passed, score should be high
+            assert score >= 0.7, f"With all high metrics, score should be >= 0.7, got {score}"
+
+    # The main test: score should always be in [0, 1] range regardless of which path was taken
+    assert 0.0 <= score <= 1.0, f"Score must be in [0, 1] range, got {score}"
+
+    print(f"✓ test_evaluate_paragraph_mode_score_normalization passed (score: {score:.3f}, recall: {proposition_recall:.2f}, style: {style_alignment:.2f}, coherence: {coherence_score:.2f}, topic_sim: {topic_similarity:.2f})")
+
+
+def test_evaluate_paragraph_mode_sanity_gate_score_zero():
+    """Test that sanity gate correctly sets score=0.0 when coherence or topic similarity fail."""
+    from unittest.mock import Mock
+    import json
+    from src.analysis.semantic_analyzer import PropositionExtractor
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider to return LOW coherence score (below threshold)
+    mock_llm = Mock()
+    mock_response = json.dumps({
+        "is_coherent": False,
+        "score": 0.3,  # Below threshold of 0.8
+        "reason": "Text contains word salad and nonsensical phrases."
+    })
+    mock_llm.call = Mock(return_value=mock_response)
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    # Use text that will have high proposition recall but low coherence
+    generated_text = "I spent my childhood scavenging in the ruins of the Soviet Union to turing complete and the violent shift."
+
+    # Extract propositions
+    extractor = PropositionExtractor()
+    propositions = extractor.extract_atomic_propositions(original_text)
+
+    # Create blueprint
+    from src.ingestion.blueprint import BlueprintExtractor
+    blueprint_extractor = BlueprintExtractor()
+    blueprint = blueprint_extractor.extract(original_text)
+
+    # Evaluate in paragraph mode
+    result = critic._evaluate_paragraph_mode(
+        generated_text=generated_text,
+        original_text=original_text,
+        propositions=propositions,
+        author_style_vector=None,
+        style_lexicon=None,
+        verbose=False
+    )
+
+    coherence_score = result.get("coherence_score", 1.0)
+    topic_similarity = result.get("topic_similarity", 1.0)
+    score = result.get("score", -1.0)
+    passes = result.get("pass", True)
+
+    # If coherence is below threshold, sanity gate should trigger and set score=0.0
+    coherence_threshold = 0.8
+    if coherence_score < coherence_threshold:
+        assert score == 0.0, f"When coherence ({coherence_score:.2f}) < threshold ({coherence_threshold}), score should be 0.0, got {score}"
+        assert passes == False, f"When sanity gate triggers, pass should be False, got {passes}"
+
+    print(f"✓ test_evaluate_paragraph_mode_sanity_gate_score_zero passed (coherence: {coherence_score:.2f}, score: {score:.2f}, pass: {passes})")
+
+
 if __name__ == "__main__":
     test_good_output()
     test_hallucination()

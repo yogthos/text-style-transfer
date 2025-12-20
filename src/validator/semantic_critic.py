@@ -286,6 +286,75 @@ class SemanticCritic:
         coverage = found_count / len(keywords) if keywords else 1.0
         return min(1.0, max(0.0, coverage))
 
+    def _verify_coherence(self, text: str) -> Tuple[float, str]:
+        """Verify text coherence using LLM-based evaluation.
+
+        Checks for:
+        1. Grammatical fluency
+        2. Logical consistency (detects "word salad")
+        3. Jargon hallucinations (technical terms that don't fit the narrative)
+
+        Args:
+            text: Text to evaluate for coherence.
+
+        Returns:
+            Tuple of (coherence_score: float, reason: str).
+            Returns (1.0, "Coherent") if LLM unavailable (neutral score).
+        """
+        if not self.llm_provider:
+            # Fallback: return neutral score if LLM unavailable
+            return 1.0, "LLM unavailable, assuming coherent"
+
+        if not text or not text.strip():
+            return 0.0, "Empty text"
+
+        system_prompt = """You are a strict copy editor. Analyze the text below for **Coherence** and **Hallucinations**.
+
+1. Is the text grammatically fluent?
+2. Does it make logical sense, or is it 'word salad'?
+3. Does it contain random technical jargon (e.g., 'turing complete', 'namespace', 'dependency injection') that doesn't fit the narrative?
+
+**Output JSON:** {'is_coherent': bool, 'score': float (0.0-1.0), 'reason': '...'}"""
+
+        user_prompt = f"Analyze this text for coherence:\n\n{text}"
+
+        try:
+            response = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_type="critic",
+                require_json=True,
+                temperature=0.2,  # Low temperature for consistent evaluation
+                max_tokens=200,
+                timeout=30
+            )
+
+            # Parse JSON response
+            try:
+                result = json.loads(response)
+            except json.JSONDecodeError:
+                # Try to extract JSON from response
+                json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    # Fallback: assume coherent if parsing fails
+                    return 0.5, "Could not parse LLM response, assuming partial coherence"
+
+            # Extract score and reason
+            is_coherent = result.get('is_coherent', True)
+            score = float(result.get('score', 0.5))
+            reason = result.get('reason', 'No reason provided')
+
+            # Ensure score is in valid range
+            score = max(0.0, min(1.0, score))
+
+            return score, reason
+
+        except Exception as e:
+            # On any error, return neutral score
+            return 0.5, f"Coherence check failed: {str(e)}"
+
     def _calculate_semantic_similarity(self, original: str, generated: str) -> float:
         """Calculate semantic similarity between original and generated text.
 
@@ -336,7 +405,8 @@ class SemanticCritic:
         style_lexicon: Optional[List[str]] = None,
         secondary_author_vector: Optional[np.ndarray] = None,
         blend_ratio: float = 0.5,
-        global_context: Optional[Dict] = None
+        global_context: Optional[Dict] = None,
+        verbose: bool = False
     ) -> Dict[str, any]:
         """Evaluate generated text against input blueprint.
 
@@ -408,7 +478,8 @@ class SemanticCritic:
                 generated_text, original_text, propositions, author_style_vector,
                 style_lexicon=style_lexicon,
                 secondary_author_vector=secondary_author_vector,
-                blend_ratio=blend_ratio
+                blend_ratio=blend_ratio,
+                verbose=verbose
             )
 
         # SENTENCE MODE: Continue with existing sentence-level logic
@@ -1786,7 +1857,8 @@ Return JSON:
         author_style_vector: Optional[np.ndarray] = None,
         style_lexicon: Optional[List[str]] = None,
         secondary_author_vector: Optional[np.ndarray] = None,
-        blend_ratio: float = 0.5
+        blend_ratio: float = 0.5,
+        verbose: bool = False
     ) -> Dict[str, any]:
         """Evaluate paragraph in paragraph mode using proposition recall and style alignment.
 
@@ -1824,11 +1896,70 @@ Return JSON:
             blend_ratio=blend_ratio
         )
 
-        # Final score: (Meaning * 0.6) + (Style * 0.4)
-        final_score = (proposition_recall * meaning_weight) + (style_alignment * style_weight)
+        # Initial score from cheap checks
+        initial_score = (proposition_recall * meaning_weight) + (style_alignment * style_weight)
 
-        # Pass threshold: proposition_recall > 0.8
-        passes = proposition_recall >= proposition_recall_threshold
+        # Get thresholds from config
+        coherence_threshold = paragraph_config.get("coherence_threshold", 0.8)
+        topic_similarity_threshold = paragraph_config.get("topic_similarity_threshold", 0.6)
+
+        # Initialize coherence and topic similarity (default to passing if checks not run)
+        coherence_score = 1.0
+        coherence_reason = "Not checked"
+        topic_similarity = 1.0
+
+        # Sanity Gate: Only run expensive checks if cheap checks pass
+        if proposition_recall >= 0.85 and style_alignment >= 0.7:
+            # Expensive checks only on promising candidates
+            coherence_score, coherence_reason = self._verify_coherence(generated_text)
+            topic_similarity = self._calculate_semantic_similarity(original_text, generated_text)
+
+            if verbose:
+                print(f"      Coherence: {coherence_score:.2f} (threshold: {coherence_threshold:.2f}), Topic similarity: {topic_similarity:.2f} (threshold: {topic_similarity_threshold:.2f})")
+
+            # Sanity Gate: Fail immediately if coherence or topic similarity is too low
+            if coherence_score < coherence_threshold or topic_similarity < topic_similarity_threshold:
+                # Gibberish detected - kill it immediately
+                if verbose:
+                    print(f"      ⚠ Sanity gate triggered: coherence {coherence_score:.2f} < {coherence_threshold:.2f} OR topic_sim {topic_similarity:.2f} < {topic_similarity_threshold:.2f} → score=0.0")
+                final_score = 0.0
+                passes = False
+            else:
+                # Update composite score to include coherence and topic similarity
+                # Use _calculate_composite_score for proper weight normalization
+                # Map paragraph mode metrics to composite score format
+                paragraph_metrics = {
+                    "proposition_recall": proposition_recall,
+                    "style_alignment": style_alignment,
+                    "coherence": coherence_score,
+                    "topic_similarity": topic_similarity
+                }
+
+                # Calculate weighted score with proper normalization
+                # Weights: meaning_weight*0.7, style_weight*0.2, coherence*0.1, topic_sim*0.1
+                # Normalize to ensure they sum to 1.0
+                weight_sum = (meaning_weight * 0.7) + (style_weight * 0.2) + 0.1 + 0.1
+                if weight_sum > 0:
+                    final_score = (
+                        proposition_recall * (meaning_weight * 0.7 / weight_sum) +
+                        style_alignment * (style_weight * 0.2 / weight_sum) +
+                        coherence_score * (0.1 / weight_sum) +
+                        topic_similarity * (0.1 / weight_sum)
+                    )
+                else:
+                    # Fallback: simple average if weights are invalid
+                    final_score = sum(paragraph_metrics.values()) / len(paragraph_metrics)
+
+                passes = proposition_recall >= proposition_recall_threshold
+        else:
+            # Cheap checks failed, use original scoring
+            # Normalize initial_score to ensure it's in [0, 1] range
+            weight_sum = meaning_weight + style_weight
+            if weight_sum > 0:
+                final_score = initial_score / weight_sum
+            else:
+                final_score = initial_score
+            passes = proposition_recall >= proposition_recall_threshold
 
         # Build feedback
         feedback_parts = []
@@ -1846,6 +1977,17 @@ Return JSON:
         if style_alignment < 0.7:
             feedback_parts.append(
                 f"Style alignment low ({style_alignment:.2f}). Average sentence length: {style_details.get('avg_sentence_length', 0):.1f} words."
+            )
+
+        # Add coherence and topic similarity feedback
+        if coherence_score < coherence_threshold:
+            feedback_parts.append(
+                f"Coherence too low ({coherence_score:.2f} < {coherence_threshold}): {coherence_reason}"
+            )
+
+        if topic_similarity < topic_similarity_threshold:
+            feedback_parts.append(
+                f"Topic similarity too low ({topic_similarity:.2f} < {topic_similarity_threshold}): Topic has drifted from original"
             )
 
         # Optional: Verify structural blueprint match (soft check)
@@ -1870,12 +2012,15 @@ Return JSON:
             "pass": passes,
             "proposition_recall": proposition_recall,
             "style_alignment": style_alignment,
+            "coherence_score": coherence_score,
+            "topic_similarity": topic_similarity,
             "recall_score": proposition_recall,  # For compatibility
             "precision_score": 1.0,  # Not used in paragraph mode
             "adherence_score": 1.0,  # Not used in paragraph mode
             "score": final_score,
             "feedback": " ".join(feedback_parts) if feedback_parts else "Passed paragraph validation.",
             "recall_details": recall_details,
-            "style_details": style_details
+            "style_details": style_details,
+            "coherence_reason": coherence_reason
         }
 

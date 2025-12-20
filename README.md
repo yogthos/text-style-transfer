@@ -150,25 +150,67 @@ The first author in the list is used. Style DNA is loaded from the Style Registr
   "paragraph_fusion": {
     "enabled": true,
     "min_sentences_for_fusion": 2,
-    "proposition_recall_threshold": 0.8,
-    "meaning_weight": 0.6,
-    "style_alignment_weight": 0.4,
-    "num_variations": 5
+    "min_sentence_ratio": 0.6,
+    "style_lexicon_ratio": 0.1,
+    "transcribe_headings_as_is": true,
+    "use_structural_templates": false,
+    "proposition_recall_threshold": 0.85,
+    "min_viable_recall_threshold": 0.70,
+    "style_alignment_weight": 0.2,
+    "meaning_weight": 0.9,
+    "complexity_filter_min_length": 10,
+    "min_word_count": 10,
+    "min_sentence_count": 2,
+    "num_style_examples": 50,
+    "num_variations": 20,
+    "retrieval_pool_size": 50,
+    "structure_diversity": {
+      "enabled": true,
+      "count_match_weight": 0.7,
+      "diversity_weight": 0.4,
+      "positional_weight": 0.8,
+      "freshness_weight": 2.0,
+      "opener_penalty_threshold": 0.3,
+      "similarity_threshold": 0.7
+    }
   }
 }
 ```
 
-**Semantic Critic** (validation thresholds):
+Key options:
+- `use_structural_templates` (default: `false`): When enabled, "bleaches" style examples by replacing content words with placeholders (`[NP]`, `[VP]`, `[ADJ]`, `[ADV]`) while preserving functional words and syntax. This prevents domain-specific vocabulary from leaking into narrative generation.
+- `transcribe_headings_as_is` (default: `true`): Detects and transcribes single-sentence paragraphs that look like headings without restyling.
+- `min_sentence_ratio` (default: `0.6`): Minimum ratio of sentences in teacher example relative to target sentence count.
+- `style_lexicon_ratio` (default: `0.1`): Ratio of style lexicon words to include in mandatory vocabulary.
+- `structure_diversity`: Controls how diverse structural templates are selected (sentence count matching, positional variety, freshness).
+
+**Semantic Critic** (validation thresholds and scoring weights):
 ```json
 {
   "semantic_critic": {
     "recall_threshold": 0.85,
-    "precision_threshold": 0.50,
+    "precision_threshold": 0.60,
     "similarity_threshold": 0.7,
-    "fluency_threshold": 0.8
+    "fluency_threshold": 0.8,
+    "weights": {
+      "accuracy": 0.5,
+      "fluency": 0.1,
+      "style": 0.1,
+      "thesis_alignment": 0.15,
+      "intent_compliance": 0.1,
+      "keyword_coverage": 0.05
+    }
   }
 }
 ```
+
+The `weights` section controls how different metrics contribute to the composite score:
+- `accuracy`: Semantic accuracy (proposition recall/precision)
+- `fluency`: Grammatical fluency
+- `style`: Style alignment with target author
+- `thesis_alignment`: Alignment with document thesis (when global context is available)
+- `intent_compliance`: Compliance with document intent (when global context is available)
+- `keyword_coverage`: Coverage of document keywords (when global context is available)
 
 **Atlas** (Style Atlas settings):
 ```json
@@ -204,6 +246,40 @@ The first author in the list is used. Style DNA is loaded from the Style Registr
 }
 ```
 
+**Global Context** (document-level context for style transfer):
+```json
+{
+  "global_context": {
+    "enabled": true,
+    "max_summary_tokens": 500
+  }
+}
+```
+
+When enabled, the system uses document-level context (thesis, intent, keywords) to improve style transfer quality. This is particularly useful for maintaining consistency across long documents.
+
+**Evolutionary** (evolutionary generation parameters):
+```json
+{
+  "evolutionary": {
+    "batch_size": 40,
+    "variants_per_skeleton": {
+      "strict_adherence": 10,
+      "high_style": 10,
+      "experimental": 10,
+      "simplified": 10
+    },
+    "max_generations": 3,
+    "convergence_threshold": 0.95,
+    "top_k_parents": 10,
+    "breeding_children": 10,
+    "min_keyword_presence": 0.5
+  }
+}
+```
+
+Controls the evolutionary generation process for sentence-level style transfer.
+
 ## Project Structure
 
 ```
@@ -221,7 +297,8 @@ text-style-transfer/
 │   │   └── semantic_critic.py  # Validation
 │   ├── analyzer/
 │   │   ├── style_extractor.py  # Style DNA extraction
-│   │   └── structuralizer.py   # Rhythm extraction
+│   │   ├── structuralizer.py   # Rhythm extraction
+│   │   └── structure_extractor.py # Structural template extraction
 │   └── analysis/
 │       └── semantic_analyzer.py # Proposition extraction
 ├── prompts/                     # LLM prompt templates (markdown)
@@ -280,11 +357,12 @@ flowchart TD
 
 1. Extract atomic propositions from input paragraph
 2. Retrieve complex style examples from atlas
-3. Select "teacher example" with sentence count matching `ceil(n_props * 0.6)`
-4. Extract rhythm map (sentence length, type, opener) from teacher
-5. Generate variations using structural blueprint
-6. Evaluate with semantic critic (proposition recall + style alignment)
-7. Select best candidate or trigger repair loop if recall is low
+3. Select "teacher example" with sentence count matching `ceil(n_props * min_sentence_ratio)`
+4. If `use_structural_templates` is enabled, "bleach" the teacher example by replacing content words with placeholders (`[NP]`, `[VP]`, `[ADJ]`, `[ADV]`) while preserving functional words
+5. Extract rhythm map (sentence length, type, opener) from teacher
+6. Generate variations using structural blueprint (or structural template if enabled)
+7. Evaluate with semantic critic (proposition recall + style alignment + context metrics)
+8. Select best candidate or trigger repair loop if recall is low
 
 ### Sentence-by-Sentence Fallback
 

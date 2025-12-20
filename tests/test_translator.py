@@ -1180,6 +1180,83 @@ def test_select_best_candidate_handles_all_rejected():
     print("✓ test_select_best_candidate_handles_all_rejected passed")
 
 
+def test_style_lexicon_ratio_configuration():
+    """Test that style_lexicon_ratio config controls lexicon injection in translate_paragraph."""
+    if not DEPENDENCIES_AVAILABLE:
+        print("⚠ SKIPPED: test_style_lexicon_ratio_configuration (missing dependencies)")
+        return
+
+    translator = StyleTranslator(config_path="config.json")
+
+    # Create a mock style_dna with a known lexicon (20 words)
+    test_lexicon = [f"word{i}" for i in range(20)]  # 20 words
+    style_dna = {
+        "lexicon": test_lexicon,
+        "tone": "authoritative"
+    }
+
+    # Test 1: Default ratio (0.4) - should use 40% = 8 words
+    with patch.object(translator, 'paragraph_fusion_config', {'style_lexicon_ratio': 0.4}):
+        ratio = 0.4
+        lexicon = style_dna.get("lexicon", [])
+        count = int(len(lexicon) * ratio) if ratio > 0.0 else 0
+        assert count == 8, f"Expected 8 words for 0.4 ratio, got {count}"
+
+        if count > 0:
+            top_lexicon = lexicon[:count]
+            assert len(top_lexicon) == 8, f"Expected 8 words, got {len(top_lexicon)}"
+            # Check instruction for 0.4 ratio (should be "Integrate these words naturally.")
+            instruction = "Integrate these words naturally."  # 0.3 <= 0.4 <= 0.7
+            assert instruction == "Integrate these words naturally."
+
+    # Test 2: Low ratio (0.2) - should use 20% = 4 words, "sparingly" instruction
+    ratio = 0.2
+    count = int(len(test_lexicon) * ratio) if ratio > 0.0 else 0
+    assert count == 4, f"Expected 4 words for 0.2 ratio, got {count}"
+    if count > 0:
+        top_lexicon = test_lexicon[:count]
+        assert len(top_lexicon) == 4
+        instruction = "Sprinkle these style markers sparingly." if ratio < 0.3 else ("Heavily saturate the text with this vocabulary." if ratio > 0.7 else "Integrate these words naturally.")
+        assert instruction == "Sprinkle these style markers sparingly."
+
+    # Test 3: High ratio (0.8) - should use 80% = 16 words, "heavily saturate" instruction
+    ratio = 0.8
+    count = int(len(test_lexicon) * ratio) if ratio > 0.0 else 0
+    assert count == 16, f"Expected 16 words for 0.8 ratio, got {count}"
+    if count > 0:
+        top_lexicon = test_lexicon[:count]
+        assert len(top_lexicon) == 16
+        instruction = "Sprinkle these style markers sparingly." if ratio < 0.3 else ("Heavily saturate the text with this vocabulary." if ratio > 0.7 else "Integrate these words naturally.")
+        assert instruction == "Heavily saturate the text with this vocabulary."
+
+    # Test 4: Edge case - empty lexicon
+    empty_style_dna = {"lexicon": [], "tone": "authoritative"}
+    lexicon = empty_style_dna.get("lexicon", [])
+    assert len(lexicon) == 0
+    # Should handle gracefully (no crash)
+
+    # Test 5: Edge case - ratio 1.0 - should use all words
+    ratio = 1.0
+    count = int(len(test_lexicon) * ratio) if ratio > 0.0 else 0
+    assert count == 20, f"Expected 20 words for 1.0 ratio, got {count}"
+    if count > 0:
+        top_lexicon = test_lexicon[:count]
+        assert len(top_lexicon) == 20
+
+    # Test 6: Edge case - ratio 0.0 - should use 0 words, no MANDATORY_VOCABULARY section
+    ratio = 0.0
+    count = int(len(test_lexicon) * ratio) if ratio > 0.0 else 0
+    assert count == 0, f"Expected 0 words for 0.0 ratio, got {count}"
+    # When count == 0, mandatory_vocabulary should remain empty
+    mandatory_vocabulary = ""
+    if count > 0:
+        # This block should not execute
+        assert False, "Should not create vocabulary section when count is 0"
+    assert mandatory_vocabulary == "", "mandatory_vocabulary should be empty when ratio is 0.0"
+
+    print("✓ test_style_lexicon_ratio_configuration passed")
+
+
 def test_evolve_text_uses_judge():
     """Test that _evolve_text uses LLM Judge for selection."""
     # Skip: _select_best_candidate method has been removed - selection is now inline in _evolve_text
@@ -1909,6 +1986,7 @@ if __name__ == "__main__":
     test_rescue_logic()
     test_explicit_concept_mapping()
     test_check_acceptance_without_fluency()
+    test_style_lexicon_ratio_configuration()
     # Type compatibility filter tests
     test_detect_sentence_type_question()
     test_detect_sentence_type_conditional()

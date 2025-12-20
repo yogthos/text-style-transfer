@@ -1023,18 +1023,18 @@ def test_evaluate_paragraph_mode_score_normalization():
 
 
 def test_evaluate_paragraph_mode_sanity_gate_score_zero():
-    """Test that sanity gate correctly sets score=0.0 when coherence or topic similarity fail."""
+    """Test that sanity gate correctly sets score=0.0 when coherence < 0.6, and applies penalty for 0.6-0.8 range."""
     from unittest.mock import Mock
     import json
     from src.analysis.semantic_analyzer import PropositionExtractor
 
     critic = SemanticCritic()
 
-    # Mock LLM provider to return LOW coherence score (below threshold)
+    # Mock LLM provider to return LOW coherence score (below strict kill threshold of 0.6)
     mock_llm = Mock()
     mock_response = json.dumps({
         "is_coherent": False,
-        "score": 0.3,  # Below threshold of 0.8
+        "score": 0.3,  # Below strict kill threshold of 0.6
         "reason": "Text contains word salad and nonsensical phrases."
     })
     mock_llm.call = Mock(return_value=mock_response)
@@ -1069,13 +1069,71 @@ def test_evaluate_paragraph_mode_sanity_gate_score_zero():
     score = result.get("score", -1.0)
     passes = result.get("pass", True)
 
-    # If coherence is below threshold, sanity gate should trigger and set score=0.0
-    coherence_threshold = 0.8
-    if coherence_score < coherence_threshold:
-        assert score == 0.0, f"When coherence ({coherence_score:.2f}) < threshold ({coherence_threshold}), score should be 0.0, got {score}"
+    # If coherence is below strict kill threshold (0.6), sanity gate should trigger and set score=0.0
+    strict_kill_threshold = 0.6
+    if coherence_score < strict_kill_threshold:
+        assert score == 0.0, f"When coherence ({coherence_score:.2f}) < strict kill threshold ({strict_kill_threshold}), score should be 0.0, got {score}"
         assert passes == False, f"When sanity gate triggers, pass should be False, got {passes}"
 
     print(f"✓ test_evaluate_paragraph_mode_sanity_gate_score_zero passed (coherence: {coherence_score:.2f}, score: {score:.2f}, pass: {passes})")
+
+
+def test_evaluate_paragraph_mode_coherence_penalty():
+    """Test that coherence in 0.6-0.8 range applies penalty (score *= 0.5) but doesn't kill."""
+    from unittest.mock import Mock
+    import json
+    from src.analysis.semantic_analyzer import PropositionExtractor
+
+    critic = SemanticCritic()
+
+    # Mock LLM provider to return coherence score in penalty range (0.6-0.8)
+    mock_llm = Mock()
+    mock_response = json.dumps({
+        "is_coherent": True,
+        "score": 0.7,  # In penalty range (0.6-0.8), above strict kill (0.6)
+        "reason": "Text is mostly coherent but has some issues."
+    })
+    mock_llm.call = Mock(return_value=mock_response)
+    critic.llm_provider = mock_llm
+    critic.use_llm_verification = True
+
+    original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
+    generated_text = "During my youth, I searched through the remains of the Soviet Union, though the phrasing is somewhat awkward."
+
+    # Extract propositions
+    extractor = PropositionExtractor()
+    propositions = extractor.extract_atomic_propositions(original_text)
+
+    # Create blueprint
+    from src.ingestion.blueprint import BlueprintExtractor
+    blueprint_extractor = BlueprintExtractor()
+    blueprint = blueprint_extractor.extract(original_text)
+
+    # Evaluate in paragraph mode
+    result = critic._evaluate_paragraph_mode(
+        generated_text=generated_text,
+        original_text=original_text,
+        propositions=propositions,
+        author_style_vector=None,
+        style_lexicon=None,
+        verbose=False
+    )
+
+    coherence_score = result.get("coherence_score", 1.0)
+    score = result.get("score", -1.0)
+
+    # If coherence is in penalty range (0.6-0.8), score should be penalized (multiplied by 0.5)
+    # but not killed (not 0.0)
+    penalty_threshold = 0.8
+    strict_kill_threshold = 0.6
+
+    if strict_kill_threshold <= coherence_score < penalty_threshold:
+        # Score should be penalized (reduced) but not zero
+        assert score > 0.0, f"When coherence ({coherence_score:.2f}) is in penalty range, score should be > 0.0, got {score}"
+        # Score should be lower than it would be without penalty
+        # (We can't easily calculate expected score without penalty, but we can verify it's not zero)
+
+    print(f"✓ test_evaluate_paragraph_mode_coherence_penalty passed (coherence: {coherence_score:.2f}, score: {score:.2f})")
 
 
 if __name__ == "__main__":

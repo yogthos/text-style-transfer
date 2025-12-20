@@ -1918,29 +1918,21 @@ Return JSON:
                 print(f"      Coherence: {coherence_score:.2f} (threshold: {coherence_threshold:.2f}), Topic similarity: {topic_similarity:.2f} (threshold: {topic_similarity_threshold:.2f})")
 
             # Sanity Gate: Fail immediately if coherence or topic similarity is too low
-            if coherence_score < coherence_threshold or topic_similarity < topic_similarity_threshold:
-                # Gibberish detected - kill it immediately
+            # Use lower threshold (0.6) for strict kill, but penalize (0.6-0.8) range
+            strict_kill_threshold = 0.6  # Lowered from coherence_threshold (0.8) for local LLM
+            penalty_threshold = coherence_threshold  # 0.8 - penalize but don't kill
+
+            if coherence_score < strict_kill_threshold or topic_similarity < topic_similarity_threshold:
+                # Strictly bad text - kill it immediately
                 if verbose:
-                    print(f"      ⚠ Sanity gate triggered: coherence {coherence_score:.2f} < {coherence_threshold:.2f} OR topic_sim {topic_similarity:.2f} < {topic_similarity_threshold:.2f} → score=0.0")
+                    print(f"      ⚠ Sanity gate triggered (strict kill): coherence {coherence_score:.2f} < {strict_kill_threshold:.2f} OR topic_sim {topic_similarity:.2f} < {topic_similarity_threshold:.2f} → score=0.0")
                 final_score = 0.0
                 passes = False
             else:
-                # Update composite score to include coherence and topic similarity
-                # Use _calculate_composite_score for proper weight normalization
-                # Map paragraph mode metrics to composite score format
-                paragraph_metrics = {
-                    "proposition_recall": proposition_recall,
-                    "style_alignment": style_alignment,
-                    "coherence": coherence_score,
-                    "topic_similarity": topic_similarity
-                }
-
-                # Calculate weighted score with proper normalization
-                # Weights: meaning_weight*0.7, style_weight*0.2, coherence*0.1, topic_sim*0.1
-                # Normalize to ensure they sum to 1.0
+                # Calculate base score with coherence and topic similarity
                 weight_sum = (meaning_weight * 0.7) + (style_weight * 0.2) + 0.1 + 0.1
                 if weight_sum > 0:
-                    final_score = (
+                    base_score = (
                         proposition_recall * (meaning_weight * 0.7 / weight_sum) +
                         style_alignment * (style_weight * 0.2 / weight_sum) +
                         coherence_score * (0.1 / weight_sum) +
@@ -1948,7 +1940,18 @@ Return JSON:
                     )
                 else:
                     # Fallback: simple average if weights are invalid
-                    final_score = sum(paragraph_metrics.values()) / len(paragraph_metrics)
+                    base_score = (
+                        proposition_recall + style_alignment + coherence_score + topic_similarity
+                    ) / 4.0
+
+                # Apply penalty if coherence is in warning range (0.6-0.8)
+                if coherence_score < penalty_threshold:
+                    # Penalize but don't kill - text has coherence issues but might be salvageable
+                    if verbose:
+                        print(f"      ⚠ Coherence penalty: coherence {coherence_score:.2f} < {penalty_threshold:.2f} → score *= 0.5")
+                    final_score = base_score * 0.5
+                else:
+                    final_score = base_score
 
                 passes = proposition_recall >= proposition_recall_threshold
         else:

@@ -94,6 +94,9 @@ class StyleTranslator:
         # Initialize structure extractor for template bleaching
         from src.analyzer.structure_extractor import StructureExtractor
         self.structure_extractor = StructureExtractor(config_path=config_path)
+        # Initialize rhetorical classifier for mode matching
+        from src.analyzer.rhetorical_classifier import RhetoricalClassifier
+        self.rhetorical_classifier = RhetoricalClassifier(config_path=config_path)
         # Load paragraph fusion config
         self.paragraph_fusion_config = self.config.get("paragraph_fusion", {})
         # Load LLM provider config (for retry settings)
@@ -2892,7 +2895,8 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         secondary_author: Optional[str] = None,
         blend_ratio: float = 0.5,
         verbose: bool = False,
-        global_context: Optional[Dict] = None
+        global_context: Optional[Dict] = None,
+        is_opener: bool = False
     ) -> tuple[str, Optional[List[Dict]], Optional[str], float]:
         """Translate a paragraph holistically using paragraph fusion.
 
@@ -3040,8 +3044,20 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
         n_props = len(propositions)
         target_sentences = math.ceil(n_props * 0.6)  # Target ratio: ~1.5 props per sentence
 
+        # Classify input rhetorical mode ONCE (before loop)
+        input_mode = self.rhetorical_classifier.classify_mode(paragraph)
+        if verbose:
+            print(f"  Input rhetorical mode: {input_mode}")
+
+        # Load rhetorical mode penalties from config
+        mode_penalties_config = self.paragraph_fusion_config.get("rhetorical_mode_penalties", {})
+        narrative_vs_argumentative = mode_penalties_config.get("narrative_vs_argumentative", 0.1)
+        argumentative_vs_narrative = mode_penalties_config.get("argumentative_vs_narrative", 0.5)
+        descriptive_mismatch = mode_penalties_config.get("descriptive_mismatch", 0.8)
+
         teacher_example = None  # Will be set when best_match is selected
         rhythm_map = None
+        selected_template_mode = None  # Will store the selected example's mode for prompt construction
 
         if complex_examples:
             # Composite scoring: sentence count + diversity + positional fit + freshness
@@ -3150,13 +3166,31 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                         if verbose:
                             print(f"    Voice Mismatch: {input_voice}-person input with {example_voice}-person template (penalty: 0.9x)")
 
-                    # 7. Composite score (apply voice penalty)
+                    # 7. Rhetorical mode compatibility check
+                    example_mode = self.rhetorical_classifier.classify_mode(example)
+                    mode_penalty = 1.0  # Default: no penalty
+                    if input_mode != example_mode:
+                        if input_mode == "NARRATIVE" and example_mode == "ARGUMENTATIVE":
+                            mode_penalty = narrative_vs_argumentative  # Severe penalty - can't tell story using logical proof
+                            if verbose:
+                                print(f"    Rhetorical Mismatch: {input_mode} vs {example_mode} (penalty: {narrative_vs_argumentative}x)")
+                        elif input_mode == "ARGUMENTATIVE" and example_mode == "NARRATIVE":
+                            mode_penalty = argumentative_vs_narrative  # Less severe but still bad
+                            if verbose:
+                                print(f"    Rhetorical Mismatch: {input_mode} vs {example_mode} (penalty: {argumentative_vs_narrative}x)")
+                        else:
+                            # DESCRIPTIVE mismatches are less critical
+                            mode_penalty = descriptive_mismatch
+                            if verbose:
+                                print(f"    Rhetorical Mismatch: {input_mode} vs {example_mode} (penalty: {descriptive_mismatch}x)")
+
+                    # 8. Composite score (apply voice and mode penalties)
                     composite_score = (
                         count_match * count_weight +
                         diversity_score * diversity_weight +
                         positional_fit * positional_weight +
                         freshness_score * freshness_weight
-                    ) * voice_penalty
+                    ) * voice_penalty * mode_penalty
 
                     # Track best candidate
                     if composite_score > best_score:
@@ -3164,6 +3198,7 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                         best_match = example
                         rhythm_map = candidate_rhythm_map  # Store rhythm map for best match
                         teacher_example = example  # Store for tracking
+                        selected_template_mode = example_mode  # Store mode for prompt construction
 
                 except Exception as e:
                     # If analysis fails, skip this example
@@ -3209,6 +3244,8 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                     teacher_example = best_match
                     from src.analyzer.structuralizer import extract_paragraph_rhythm
                     rhythm_map = extract_paragraph_rhythm(teacher_example)
+                    # Classify mode for fallback choice
+                    selected_template_mode = self.rhetorical_classifier.classify_mode(teacher_example)
                     if verbose:
                         sentence_count = len(rhythm_map) if rhythm_map else 0
                         print(f"  Selected fallback teacher example with {sentence_count} sentences (target: {target_sentences})")
@@ -3304,12 +3341,50 @@ Do NOT copy the text verbatim. Transform it into the target style while preservi
                     print(f"  Bleaching semantic content from teacher example...")
                 structural_template = self.structure_extractor.extract_template(teacher_example)
                 if structural_template and structural_template.strip():
+                    # Build mode override instruction if there's a mismatch
+                    mode_override_instruction = ""
+                    if input_mode and selected_template_mode and input_mode != selected_template_mode:
+                        if input_mode == "NARRATIVE" and selected_template_mode == "ARGUMENTATIVE":
+                            mode_override_instruction = """
+**MODE OVERRIDE:** The Input is a STORY (Narrative), but the Template is an ARGUMENT.
+You MUST ignore the Template's logical connectors (Therefore, Unless, Because, If...then).
+Keep the sentence *complexity* and *length*, but replace logical connectors with time-based transitions (Then, Later, After, When, As).
+Do NOT force a narrative into a conditional structure."""
+                        elif input_mode == "ARGUMENTATIVE" and selected_template_mode == "NARRATIVE":
+                            mode_override_instruction = """
+**MODE OVERRIDE:** The Input is an ARGUMENT (logical proof), but the Template is a STORY.
+You MUST replace time-based transitions (Then, Later, After) with logical connectors (Therefore, Because, Since, It follows that).
+Keep the sentence complexity, but adapt the connectors to match the argumentative structure."""
+
+                    # Build opener instruction
+                    opener_instruction = ""
+                    if is_opener:
+                        opener_instruction = """
+**OPENER RULE:** This is the first paragraph.
+1. Do NOT use 'Then', 'Therefore', 'However', 'Furthermore' at the start.
+2. Start with the Setting or Subject immediately.
+3. If the template starts with a connector, DELETE IT.
+4. Begin directly with the main subject or action."""
+
                     style_section = f"""### STRUCTURAL BLUEPRINT:
 I have provided a 'Structural Template' below. It contains the **Rhythm** and **Syntax** you must use, but with the content removed (marked as `[NP]`, `[VP]`, etc.).
 
 **Template:** {structural_template}
 
-**Task:** Inject the input propositions into this template structure. **Adapt pronouns** to match the Input's voice (e.g., if template has '[NP] will observe', and input is 'I', write 'I observed'). You must preserve the sentence rhythm and connector logic, but you may change pronouns and subject-verb agreement to match the Input's perspective. Replace the `[NP]`/`[VP]` placeholders with the specific details from the input story. Do NOT use the placeholders in the final output."""
+**Task:** Inject the input propositions into this template structure.
+
+**CRITICAL:** Use the Template's **Sentence Rhythm** (length, complexity), but use the Input's **Logical Flow**.
+* If the template says 'For example' but your input is a sequence of events, CHANGE 'For example' to 'Then' or 'Consequently'.
+* Do NOT force a narrative into a list format.
+* You MUST preserve the specific verbs and nouns from the Input.
+* **Adapt pronouns** to match the Input's voice (e.g., if template has '[NP] will observe', and input is 'I', write 'I observed').
+* You may change pronouns and subject-verb agreement to match the Input's perspective.
+* Replace the `[NP]`/`[VP]` placeholders with the specific details from the input story.
+* Do NOT use the placeholders in the final output."""
+                    if mode_override_instruction:
+                        style_section += mode_override_instruction
+                    if opener_instruction:
+                        style_section += opener_instruction
                     if verbose:
                         print(f"  Template: {structural_template[:100]}{'...' if len(structural_template) > 100 else ''}")
                 else:
@@ -3330,12 +3405,29 @@ Example 1: "{teacher_example}\""""
         if style_dna and isinstance(style_dna, dict):
             lexicon = style_dna.get("lexicon", [])
             if lexicon:
-                # Limit to top 15 most frequent words to avoid overwhelming prompt context
-                top_lexicon = lexicon[:15]
-                lexicon_text = ", ".join(top_lexicon)
-                mandatory_vocabulary = f"""### MANDATORY VOCABULARY:
+                # Get ratio from config (default to 1.0 if missing for backward compatibility)
+                ratio = self.paragraph_fusion_config.get("style_lexicon_ratio", 1.0)
+
+                # Calculate count based on ratio (allow 0 if ratio is 0.0 to disable style injection)
+                count = int(len(lexicon) * ratio) if ratio > 0.0 else 0
+
+                # Only include MANDATORY_VOCABULARY section if count > 0
+                if count > 0:
+                    top_lexicon = lexicon[:count]
+                    lexicon_text = ", ".join(top_lexicon)
+
+                    # Dynamic instruction based on ratio
+                    if ratio < 0.3:
+                        instruction = "Sprinkle these style markers sparingly."
+                    elif ratio > 0.7:
+                        instruction = "Heavily saturate the text with this vocabulary."
+                    else:
+                        instruction = "Integrate these words naturally."
+
+                    mandatory_vocabulary = f"""### MANDATORY VOCABULARY:
 You MUST use at least 3-5 distinct words from this list in your paragraph: {lexicon_text}
-These words are characteristic of the target author's voice. Integrate them naturally into your writing."""
+These words are characteristic of the target author's voice. {instruction}"""
+                # If count == 0, mandatory_vocabulary remains empty string (no section added)
 
         # Extract rhetorical connectors from examples
         rhetorical_connectors = ""

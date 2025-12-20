@@ -342,7 +342,8 @@ def process_text(
                     secondary_author=secondary_author,
                     blend_ratio=blend_ratio,
                     verbose=verbose,
-                    global_context=global_context
+                    global_context=global_context,
+                    is_opener=(para_idx == 0)
                 )
 
                 # Use internal_recall from translator (includes repair loop context and relaxed thresholds)

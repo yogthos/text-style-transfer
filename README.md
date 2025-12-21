@@ -12,6 +12,8 @@ Transform text to match a target author's style while preserving semantic meanin
 
 ## Dependencies
 
+**Python Version:** Python 3.11 or higher is required (due to `jsonrepair>=0.19.0` requirement).
+
 This project requires the following Python packages (see `requirements.txt` for versions):
 - **spacy** (>=3.7.0) - Natural language processing and grammatical validation
 - **nltk** (>=3.8.0) - Text tokenization and linguistic analysis
@@ -36,9 +38,12 @@ Additional setup required:
 ### Installation
 
 ```bash
-# Create virtual environment
+# Create virtual environment (requires Python 3.11+)
 python3 -m venv venv
 source venv/bin/activate  # On Windows: venv\Scripts\activate
+
+# Verify Python version
+python3 --version  # Should be 3.11 or higher
 
 # Install dependencies
 pip install -r requirements.txt

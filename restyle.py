@@ -76,6 +76,14 @@ Note: Author styles must be loaded into ChromaDB first using:
     )
 
     parser.add_argument(
+        '--perspective',
+        type=str,
+        default=None,
+        choices=['first_person_singular', 'first_person_plural', 'third_person'],
+        help='Force specific perspective (overrides author profile and input detection). Options: first_person_singular, first_person_plural, third_person'
+    )
+
+    parser.add_argument(
         '--verbose', '-v',
         action='store_true',
         help='Enable verbose output'
@@ -133,6 +141,7 @@ Note: Author styles must be loaded into ChromaDB first using:
             max_retries=args.max_retries,
             atlas_cache_path=atlas_cache_path,
             blend_ratio=args.blend_ratio,
+            perspective=args.perspective,
             verbose=args.verbose
         )
 

@@ -23,6 +23,11 @@ class LLMProvider:
             self.config = json.load(f)
 
         self.provider = provider or self.config.get("provider", "deepseek")
+        # Get default timeout and context window from config
+        llm_provider_config = self.config.get("llm_provider", {})
+        self.default_timeout = llm_provider_config.get("timeout", 120)  # Default 120 seconds
+        self.context_window = llm_provider_config.get("context_window", 128000)  # Default 128k for modern models
+        self.max_output_tokens = llm_provider_config.get("max_output_tokens", 4000)  # Default 4k for output
         self._initialize_provider()
 
     def _initialize_provider(self):
@@ -91,6 +96,33 @@ class LLMProvider:
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
 
+    def _estimate_tokens(self, text: str) -> int:
+        """Estimate token count using tiktoken.
+
+        Uses model-specific tokenizer for accurate counting.
+        Falls back to rough estimate if tiktoken unavailable.
+
+        Args:
+            text: Text to estimate tokens for.
+
+        Returns:
+            Estimated token count.
+        """
+        if not text:
+            return 0
+
+        try:
+            import tiktoken
+            # Use cl100k_base (GPT-4/DeepSeek compatible)
+            encoding = tiktoken.get_encoding("cl100k_base")
+            return len(encoding.encode(text))
+        except ImportError:
+            # Fallback to rough estimate if tiktoken not available
+            return len(text) // 4
+        except Exception:
+            # Fallback on any error
+            return len(text) // 4
+
     def call(
         self,
         system_prompt: str,
@@ -100,7 +132,8 @@ class LLMProvider:
         temperature: Optional[float] = None,
         max_tokens: Optional[int] = None,
         top_p: Optional[float] = None,
-        timeout: Optional[int] = None
+        timeout: Optional[int] = None,
+        verbose_context: bool = False
     ) -> str:
         """Call LLM API with unified interface.
 
@@ -110,30 +143,47 @@ class LLMProvider:
             model_type: Which model to use ("editor" or "critic"). Default: "editor".
             require_json: If True, request JSON format (for critic). If False, plain text.
             temperature: Optional temperature override. Default: provider-specific.
-            max_tokens: Optional max_tokens override. Default: provider-specific.
+            max_tokens: Optional max_tokens override. Default: max_output_tokens from config.
             top_p: Optional top_p override. Default: provider-specific.
             timeout: Optional timeout in seconds. Default: provider-specific (30s for DeepSeek, 60s for Ollama/GLM).
+            verbose_context: If True, log context window utilization. Default: False.
 
         Returns:
             LLM response text.
         """
+        # Use max_output_tokens as default if max_tokens not provided
+        output_tokens = max_tokens if max_tokens is not None else self.max_output_tokens
+
+        # Estimate input tokens and check context window
+        input_tokens = self._estimate_tokens(system_prompt) + self._estimate_tokens(user_prompt)
+        utilization = (input_tokens / self.context_window) * 100 if self.context_window > 0 else 0
+
+        # Log context usage if verbose or approaching limits
+        if verbose_context or utilization > 80:
+            print(f"  📊 Context Usage: {input_tokens:,} input tokens / {self.context_window:,} context window ({utilization:.1f}% utilized)")
+            if utilization > 80:
+                print(f"  ⚠ Warning: Context window utilization is {utilization:.1f}% - approaching limit")
+            if input_tokens > self.context_window:
+                print(f"  ❌ Error: Input tokens ({input_tokens:,}) exceed context window ({self.context_window:,})")
+                # Don't crash, but log the issue - let the API handle it
+
         model = self.critic_model if model_type == "critic" else self.editor_model
 
         if self.provider == "deepseek":
             return self._call_deepseek_api(
-                system_prompt, user_prompt, model, require_json, temperature, max_tokens, top_p, timeout
+                system_prompt, user_prompt, model, require_json, temperature, output_tokens, top_p, timeout
             )
         elif self.provider == "ollama":
             return self._call_ollama_api(
-                system_prompt, user_prompt, model, require_json, temperature, max_tokens, top_p, timeout
+                system_prompt, user_prompt, model, require_json, temperature, output_tokens, top_p, timeout
             )
         elif self.provider == "glm":
             return self._call_glm_api(
-                system_prompt, user_prompt, model, require_json, temperature, max_tokens, top_p, timeout
+                system_prompt, user_prompt, model, require_json, temperature, output_tokens, top_p, timeout
             )
         elif self.provider == "gemini":
             return self._call_gemini_api(
-                system_prompt, user_prompt, model, require_json, temperature, max_tokens, top_p, timeout
+                system_prompt, user_prompt, model, require_json, temperature, output_tokens, top_p, timeout
             )
         else:
             raise ValueError(f"Unsupported provider: {self.provider}")
@@ -179,8 +229,8 @@ class LLMProvider:
         if model not in valid_deepseek_models:
             print(f"    ⚠ Warning: Model '{model}' may not be valid for DeepSeek API. Valid models: {valid_deepseek_models}")
 
-        # Use provided timeout or default to 30 seconds
-        api_timeout = timeout if timeout is not None else 30
+        # Use provided timeout or default from config (or 30 seconds as fallback)
+        api_timeout = timeout if timeout is not None else (getattr(self, 'default_timeout', None) or 30)
 
         try:
             response = requests.post(self.api_url, headers=headers, json=payload, timeout=api_timeout)
@@ -243,8 +293,8 @@ class LLMProvider:
         if options:
             data["options"] = options
 
-        # Use provided timeout or default to 60 seconds for Ollama
-        api_timeout = timeout if timeout is not None else 60
+        # Use provided timeout or default from config (or 60 seconds as fallback)
+        api_timeout = timeout if timeout is not None else (getattr(self, 'default_timeout', None) or 60)
 
         try:
             response = requests.post(api_url, json=data, timeout=api_timeout)
@@ -307,8 +357,8 @@ class LLMProvider:
             # For text generation/editing, add max_tokens instead
             payload["max_tokens"] = max_tokens if max_tokens is not None else 200
 
-        # Use provided timeout or default to 60 seconds for GLM
-        api_timeout = timeout if timeout is not None else 60
+        # Use provided timeout or default from config (or 60 seconds as fallback)
+        api_timeout = timeout if timeout is not None else (getattr(self, 'default_timeout', None) or 60)
 
         try:
             response = requests.post(self.api_url, headers=headers, json=payload, timeout=api_timeout)
@@ -389,8 +439,8 @@ class LLMProvider:
         }
 
         try:
-            # Use provided timeout or default to 60 seconds for Gemini
-            api_timeout = timeout if timeout is not None else 60
+            # Use provided timeout or default from config (or 60 seconds as fallback)
+            api_timeout = timeout if timeout is not None else (getattr(self, 'default_timeout', None) or 60)
             response = requests.post(api_url, headers=headers, json=payload, timeout=api_timeout)
             response.raise_for_status()
 

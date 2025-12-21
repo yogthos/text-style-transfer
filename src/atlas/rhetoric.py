@@ -31,6 +31,7 @@ class RhetoricalType(Enum):
     ARGUMENT = "ARGUMENT"  # Makes a claim/logic
     OBSERVATION = "OBSERVATION"  # Describes a state
     IMPERATIVE = "IMPERATIVE"  # Commands/instructions
+    NARRATIVE = "NARRATIVE"  # Tells a story or recounts events
     UNKNOWN = "UNKNOWN"  # Fallback for unclassifiable text
 
 

@@ -77,12 +77,12 @@ def is_valid_structural_template(text: str) -> bool:
     if text.strip() and text.strip()[-1] not in ".!?\"'":
         return False
 
-    # Try to load spaCy (optional)
+    # Try to load spaCy via NLPManager (optional)
     nlp = None
     try:
-        import spacy
-        nlp = spacy.load("en_core_web_sm")
-    except (ImportError, OSError):
+        from src.utils.nlp_manager import NLPManager
+        nlp = NLPManager.get_nlp()
+    except (ImportError, OSError, RuntimeError):
         pass  # Graceful fallback - spaCy not available
 
     # 1. Citation Killer (enhanced regex)
@@ -140,10 +140,39 @@ def is_valid_structural_template(text: str) -> bool:
             return False
 
     # 2. Metadata/Navigation Rejection
+    # Use spaCy to detect metadata-like patterns dynamically
     lower = text.lower()
-    bad_keywords = ["chapter", "section", "part", "index", "bibliography", "return to", "continued on"]
-    if any(k in lower for k in bad_keywords):
-        if len(words) < 12: # Strict on short lines with these words
+    is_metadata = False
+
+    try:
+        from src.utils.nlp_manager import NLPManager
+        nlp = NLPManager.get_nlp()
+        doc = nlp(lower)
+
+        # Check if text contains words semantically similar to metadata terms
+        metadata_seeds = ["chapter", "section", "index", "bibliography"]
+        metadata_score = 0.0
+
+        for token in doc:
+            if token.has_vector:
+                for seed_word in metadata_seeds:
+                    seed_token = nlp.vocab.get(seed_word)
+                    if seed_token and seed_token.has_vector:
+                        sim = token.similarity(seed_token)
+                        metadata_score = max(metadata_score, sim)
+
+        # Also check for navigation phrases
+        navigation_phrases = ["return to", "continued on", "see page", "refer to"]
+        has_navigation = any(phrase in lower for phrase in navigation_phrases)
+
+        is_metadata = metadata_score > 0.6 or has_navigation
+    except (ImportError, OSError, KeyError, AttributeError):
+        # Fallback: check for common metadata patterns
+        navigation_phrases = ["return to", "continued on", "see page", "refer to"]
+        is_metadata = any(phrase in lower for phrase in navigation_phrases)
+
+    if is_metadata:
+        if len(words) < 12: # Strict on short lines with metadata-like content
             return False
 
     # 3. "Dotty" Line Rejection (Table of Contents)

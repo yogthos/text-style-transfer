@@ -232,11 +232,43 @@ def _detect_sentiment(sentence: str) -> str:
         else:
             return 'Neutral'
     except LookupError:
-        # Fallback: simple keyword-based sentiment
-        positive_words = ['good', 'great', 'excellent', 'wonderful', 'happy', 'love', 'like']
-        negative_words = ['bad', 'terrible', 'awful', 'hate', 'sad', 'angry', 'dislike']
-
+        # Fallback: use spaCy semantic similarity for sentiment
         sentence_lower = sentence.lower()
+
+        # Use spaCy to determine sentiment dynamically
+        try:
+            from src.utils.nlp_manager import NLPManager
+            nlp = NLPManager.get_nlp()
+            doc = nlp(sentence_lower)
+
+            positive_score = 0.0
+            negative_score = 0.0
+
+            positive_seed = nlp.vocab.get("good")
+            negative_seed = nlp.vocab.get("bad")
+
+            for token in doc:
+                if token.has_vector:
+                    if positive_seed and positive_seed.has_vector:
+                        positive_score += token.similarity(positive_seed)
+                    if negative_seed and negative_seed.has_vector:
+                        negative_score += token.similarity(negative_seed)
+
+            # Normalize by token count
+            token_count = len([t for t in doc if t.has_vector])
+            if token_count > 0:
+                positive_score /= token_count
+                negative_score /= token_count
+
+            if positive_score > negative_score + 0.1:
+                return 'Positive'
+            elif negative_score > positive_score + 0.1:
+                return 'Negative'
+            else:
+                return 'Neutral'
+        except (ImportError, OSError, KeyError, AttributeError):
+            # If spaCy unavailable, return neutral
+            return 'Neutral'
         pos_count = sum(1 for word in positive_words if word in sentence_lower)
         neg_count = sum(1 for word in negative_words if word in sentence_lower)
 
@@ -262,8 +294,8 @@ def extract_keywords(text: str) -> List[str]:
 
     # Try to use spaCy for better lemmatization
     try:
-        import spacy
-        nlp = spacy.load("en_core_web_sm")
+        from src.utils.nlp_manager import NLPManager
+        nlp = NLPManager.get_nlp()
         doc = nlp(text)
         keywords = []
         for token in doc:
@@ -356,8 +388,8 @@ def extract_critical_nouns(text: str) -> List[Tuple[str, str]]:
 
     # Try to use spaCy for better noun extraction
     try:
-        import spacy
-        nlp = spacy.load("en_core_web_sm")
+        from src.utils.nlp_manager import NLPManager
+        nlp = NLPManager.get_nlp()
         doc = nlp(text)
         critical_nouns = []
 
@@ -365,15 +397,35 @@ def extract_critical_nouns(text: str) -> List[Tuple[str, str]]:
             if token.pos_ == 'NOUN' and not token.is_stop:
                 lemma = token.lemma_.lower()
                 if lemma and len(lemma) > 2:
-                    # Determine noun type
+                    # Determine noun type using spaCy's linguistic features
                     noun_type = "CONCRETE"
                     # Check if proper noun (capitalized mid-sentence)
                     if token.is_upper or (token.text[0].isupper() and token.i > 0):
                         # Capitalized mid-sentence = proper noun
                         noun_type = "PROPER"
-                    elif lemma in ["experience", "finitude", "paradox", "concept", "theory", "model", "cycle", "reality", "universe", "cosmos", "information", "structure", "hierarchy", "pattern", "complexity"]:
-                        # Abstract/concept nouns
-                        noun_type = "ABSTRACT"
+                    elif token.has_vector:
+                        # Use semantic properties to identify abstract nouns
+                        # Abstract nouns tend to have specific semantic properties
+                        # Check similarity to known abstract concept vectors
+                        abstract_score = 0.0
+                        try:
+                            # Abstract nouns are often less concrete, have higher semantic centrality
+                            # Use word frequency and vector properties
+                            if hasattr(token, 'prob'):
+                                # Very common words are often abstract concepts
+                                freq_score = -token.prob if token.prob < 0 else 0.0
+                                abstract_score += freq_score * 0.5
+
+                            # Check vector magnitude (abstract concepts often have different vector properties)
+                            # Calculate magnitude without numpy dependency
+                            vector_magnitude = sum(x * x for x in token.vector) ** 0.5
+                            abstract_score += min(vector_magnitude / 10.0, 1.0) * 0.5
+
+                            # If score suggests abstractness, classify as ABSTRACT
+                            if abstract_score > 0.3:
+                                noun_type = "ABSTRACT"
+                        except (AttributeError, RuntimeError):
+                            pass
 
                     critical_nouns.append((lemma, noun_type))
 
@@ -397,8 +449,6 @@ def extract_critical_nouns(text: str) -> List[Tuple[str, str]]:
             pos_tags = pos_tag(tokens)
             critical_nouns = []
 
-            abstract_nouns = {"experience", "finitude", "paradox", "concept", "theory", "model", "cycle", "reality", "universe", "cosmos", "information", "structure", "hierarchy", "pattern", "complexity"}
-
             for idx, (word, pos) in enumerate(pos_tags):
                 if pos.startswith('NN') and word.lower() not in stop_words:
                     if len(word) > 2:
@@ -410,8 +460,8 @@ def extract_critical_nouns(text: str) -> List[Tuple[str, str]]:
                             # Check if proper noun (NNP or capitalized mid-sentence)
                             if pos == 'NNP' or (word[0].isupper() and idx > 0):
                                 noun_type = "PROPER"
-                            elif lemma in abstract_nouns:
-                                noun_type = "ABSTRACT"
+                            # For NLTK fallback, we can't easily determine abstractness without spaCy
+                            # So we'll mark as CONCRETE and let spaCy path handle abstract detection
 
                             critical_nouns.append((lemma, noun_type))
 

@@ -19,7 +19,8 @@ You are checking for **Factual Contradictions**, not just differences.
 5. **CRITICAL - Logical Category Errors:** Check for Logical Category Errors.
    - Example: 'The silence is a practice.' → FAIL (Silence is a state, not an action).
    - Example: 'The economy is a ghost.' → PASS (Metaphor is okay).
-   - Rule: If the text forces a Subject into a Definition that is logically impossible (not just metaphorical), mark it as Incoherent.
+   - **IMPORTANT:** Be lenient with Metaphorical Language. If the author's style is abstract/philosophical (e.g., Mao, Hegel), allow abstract subjects to take abstract actions. For example, "Silence defines the era" or "Memory forces an action" are acceptable in philosophical contexts. Only fail if the text is completely unintelligible or nonsensical.
+   - Rule: If the text forces a Subject into a Definition that is logically impossible (not just metaphorical), mark it as Incoherent. However, distinguish between "stylistically complex" (acceptable for philosophical authors) and "genuinely incoherent" (reject).
 
 **Output JSON:** {'is_coherent': bool, 'score': float (0.0-1.0), 'reason': '...'}
 

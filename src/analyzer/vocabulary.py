@@ -194,17 +194,37 @@ def extract_global_vocabulary(sample_text: str, top_n: int = 200) -> Dict[str, L
             else:
                 neutral_words.append(word)
         else:
-            # Fallback: keyword-based sentiment
-            positive_keywords = ['good', 'great', 'excellent', 'wonderful', 'happy', 'love', 'like',
-                               'beautiful', 'amazing', 'brilliant', 'perfect', 'fantastic']
-            negative_keywords = ['bad', 'terrible', 'awful', 'hate', 'sad', 'angry', 'dislike',
-                               'horrible', 'worst', 'ugly', 'disgusting', 'hateful']
+            # Fallback: use spaCy semantic similarity to determine sentiment
+            # Use seed words and semantic similarity instead of hardcoded lists
+            try:
+                from src.utils.nlp_manager import NLPManager
+                nlp = NLPManager.get_nlp()
 
-            if word in positive_keywords:
-                positive_words.append(word)
-            elif word in negative_keywords:
-                negative_words.append(word)
-            else:
+                word_token = nlp.vocab[word] if word in nlp.vocab else None
+                if word_token and word_token.has_vector:
+                    # Use seed words for sentiment
+                    positive_seed = nlp.vocab.get("good")
+                    negative_seed = nlp.vocab.get("bad")
+
+                    positive_score = 0.0
+                    negative_score = 0.0
+
+                    if positive_seed and positive_seed.has_vector:
+                        positive_score = word_token.similarity(positive_seed)
+
+                    if negative_seed and negative_seed.has_vector:
+                        negative_score = word_token.similarity(negative_seed)
+
+                    if positive_score > 0.4 and positive_score > negative_score:
+                        positive_words.append(word)
+                    elif negative_score > 0.4 and negative_score > positive_score:
+                        negative_words.append(word)
+                    else:
+                        neutral_words.append(word)
+                else:
+                    neutral_words.append(word)
+            except (ImportError, OSError, KeyError, AttributeError):
+                # If spaCy unavailable, treat as neutral
                 neutral_words.append(word)
 
     # Limit to top_n per category

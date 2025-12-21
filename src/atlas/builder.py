@@ -472,8 +472,20 @@ def extract_characteristic_vocabulary(
             words = all_text.lower().split()
             from collections import Counter
             word_counts = Counter(words)
-            # Filter out very short words and common stop words
-            stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can'}
+            # Filter out very short words and common stop words using spaCy if available
+            stop_words = set()
+            try:
+                # Try to use spaCy for stop words
+                if nlp:
+                    doc = nlp(all_text)
+                    from src.utils.spacy_linguistics import get_stop_words
+                    stop_words = get_stop_words(doc)
+                else:
+                    # Fallback to hardcoded list if spaCy not available
+                    stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can'}
+            except Exception:
+                # Fallback to hardcoded list on error
+                stop_words = {'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by', 'is', 'are', 'was', 'were', 'be', 'been', 'being', 'have', 'has', 'had', 'do', 'does', 'did', 'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can'}
             for word, count in word_counts.items():
                 if word not in stop_words and len(word) > 2:
                     word_frequencies[word] = count

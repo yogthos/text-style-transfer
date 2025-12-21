@@ -55,19 +55,42 @@ def _detect_sentiment(sentence: str) -> str:
         else:
             return 'Neutral'
     except LookupError:
-        # Fallback: simple keyword-based sentiment
-        positive_words = ['good', 'great', 'excellent', 'wonderful', 'happy', 'love', 'like']
-        negative_words = ['bad', 'terrible', 'awful', 'hate', 'sad', 'angry', 'dislike']
-
+        # Fallback: use spaCy semantic similarity for sentiment
         sentence_lower = sentence.lower()
-        pos_count = sum(1 for word in positive_words if word in sentence_lower)
-        neg_count = sum(1 for word in negative_words if word in sentence_lower)
 
-        if pos_count > neg_count:
-            return 'Positive'
-        elif neg_count > pos_count:
-            return 'Negative'
-        else:
+        # Use spaCy to determine sentiment dynamically
+        try:
+            from src.utils.nlp_manager import NLPManager
+            nlp = NLPManager.get_nlp()
+            doc = nlp(sentence_lower)
+
+            positive_score = 0.0
+            negative_score = 0.0
+
+            positive_seed = nlp.vocab.get("good")
+            negative_seed = nlp.vocab.get("bad")
+
+            for token in doc:
+                if token.has_vector:
+                    if positive_seed and positive_seed.has_vector:
+                        positive_score += token.similarity(positive_seed)
+                    if negative_seed and negative_seed.has_vector:
+                        negative_score += token.similarity(negative_seed)
+
+            # Normalize by token count
+            token_count = len([t for t in doc if t.has_vector])
+            if token_count > 0:
+                positive_score /= token_count
+                negative_score /= token_count
+
+            if positive_score > negative_score + 0.1:
+                return 'Positive'
+            elif negative_score > positive_score + 0.1:
+                return 'Negative'
+            else:
+                return 'Neutral'
+        except (ImportError, OSError, KeyError, AttributeError):
+            # If spaCy unavailable, return neutral
             return 'Neutral'
 
 

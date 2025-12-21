@@ -12,22 +12,29 @@
       "editor_model": "deepseek-chat",
       "critic_model": "deepseek-chat"
     },
-    "llm_provider": {
-    "max_retries": 3,
-    "retry_delay": 2
+  "llm_provider": {
+    "max_retries": 5,
+    "retry_delay": 2,
+    "timeout": 120,
+    "batch_timeout": 180,
+    "context_window": 128000,
+    "max_output_tokens": 4000,
+    "models_list_timeout": 5
   },
   "atlas": {
     "persist_path": "atlas_cache/",
     "num_clusters": 5,
     "min_structure_words": 4,
-    "max_length_ratio": 1.8,
-    "min_length_ratio": 0.6
+    "max_length_ratio": 5.0,
+    "min_length_ratio": 0.2,
+    "early_exit_threshold": 0.1,
+    "length_tolerance": 0.3
   },
   "length_gate": {
     "default_min_ratio": 0.6,
     "default_max_ratio": 2.0,
-    "lenient_min_ratio": 0.2,
-    "lenient_max_ratio": 3.0,
+    "lenient_min_ratio": 0.1,
+    "lenient_max_ratio": 6.0,
     "very_different_threshold_low": 0.5,
     "very_different_threshold_high": 2.0,
     "moderate_different_threshold_low": 0.67,
@@ -35,117 +42,147 @@
     "skip_gate_when_very_different": true
   },
   "critic": {
+    "stat_tolerance": 0.25,
     "min_score": 0.6,
     "max_retries": 5,
     "fallback_pass_threshold": 0.75,
-    "good_enough_threshold": 0.8
+    "good_enough_threshold": 0.90,
+    "evaluation_temperature": 0.3,
+    "edit_temperature": 0.3,
+    "evaluation_max_tokens": 300,
+    "edit_max_tokens": 200,
+    "synonym_threshold": 0.6,
+    "coverage_threshold": 0.8,
+    "similarity_threshold": 0.7,
+    "semantic_similarity_threshold": 0.65,
+    "high_semantic_similarity_threshold": 0.8
   },
   "scorer": {
     "meaning_threshold": 0.80,
-    "style_threshold": 0.75,
+    "style_threshold": 0.70,
     "hallucination_threshold": 0.1,
-    "llm_style_threshold": 0.80
+    "llm_style_threshold": 0.75,
+    "evaluation_temperature": 0.2,
+    "evaluation_max_tokens": 300
   },
   "blend": {
     "authors": ["Mao"],
     "ratio": 0.6
   },
   "translator": {
-    "temperature": 0.7,
-    "max_tokens": 400,
+    "temperature": 0.8,
+    "max_tokens": 3000,
     "literal_temperature": 0.3,
     "literal_max_tokens": 200,
-    "template_evolution": {
-      "num_examples": 15,
-      "candidates_per_template": 20,
-      "adherence_threshold": 0.8,
-      "semantic_threshold": 0.7
-    }
-  },
-  "weights": {
-    "semantic": 0.75,
-    "structure_adherence": 0.65,
-    "style_density": 0.45
+    "batch_temperature": 0.8,
+    "breeding_temperature": 0.7,
+    "repair_temperature": 0.2,
+    "classification_temperature": 0.3,
+    "smoothing_temperature": 0.2,
+    "fallback_temperature": 0.5,
+    "fallback_max_tokens": 200
   },
   "semantic_critic": {
     "recall_threshold": 0.85,
     "precision_threshold": 0.60,
-    "similarity_threshold": 0.7,
-    "fluency_threshold": 0.8,
+    "similarity_threshold": 0.5,
+    "fluency_threshold": 0.75,
     "accuracy_weight": 0.8,
-    "fluency_weight": 0.6,
+    "fluency_weight": 0.2,
     "weights": {
-      "accuracy": 0.7,
+      "accuracy": 0.8,
       "fluency": 0.1,
       "style": 0.1,
       "thesis_alignment": 0.05,
       "intent_compliance": 0.05,
       "keyword_coverage": 0.05
-    }
-  },
-  "paragraph_fusion": {
-    "enabled": true,
-    "min_sentences_for_fusion": 2,
-    "min_sentence_ratio": 0.9,
-    "style_lexicon_ratio": 0.25,
-    "transcribe_headings_as_is": true,
-    "use_structural_templates": true,
-    "coherence_threshold": 0.8,
-    "topic_similarity_threshold": 0.6,
-    "proposition_recall_threshold": 0.85,
-    "min_viable_recall_threshold": 0.85,
-    "style_alignment_weight": 0.1,
-    "meaning_weight": 0.9,
-    "complexity_filter_min_length": 10,
-    "min_word_count": 10,
-    "min_sentence_count": 2,
-    "num_style_examples": 20,
-    "num_variations": 20,
-    "retrieval_pool_size": 20,
-    "structure_diversity": {
-      "enabled": true,
-      "count_match_weight": 0.6,
-      "diversity_weight": 0.8,
-      "positional_weight": 0.9,
-      "freshness_weight": 2.0,
-      "opener_penalty_threshold": 0.3,
-      "similarity_threshold": 0.7
     },
-    "rhetorical_mode_penalties": {
-      "narrative_vs_argumentative": 0.1,
-      "argumentative_vs_narrative": 0.5,
-      "descriptive_mismatch": 0.8
-    }
+    "evaluation_temperature": 0.2,
+    "batch_evaluation_temperature": 0.1,
+    "evaluation_max_tokens": 200,
+    "entailment_max_tokens": 150,
+    "meaning_preservation_max_tokens": 300,
+    "evaluation_timeout": 30,
+    "entailment_timeout": 20,
+    "meaning_preservation_timeout": 20,
+    "paragraph_mode_similarity_threshold": 0.30
+  },
+  "paragraph_atlas": {
+    "path": "atlas_cache/paragraph_atlas"
+  },
+  "semantic_translation": {
+    "temperature": 0.3,
+    "max_tokens": 1000
+  },
+  "generation": {
+    "temperature": 0.85,
+    "max_tokens": 1500,
+    "num_candidates": 6,
+    "max_retries": 10,
+    "compliance_threshold": 0.85,
+    "compliance_fuzziness": 0.05,
+    "sentence_variants_per_attempt": 5,
+    "default_perspective": "first_person_singular"
   },
   "global_context": {
     "enabled": true,
-    "max_summary_tokens": 600
+    "max_summary_tokens": 600,
+    "analysis_temperature": 0.3
   },
   "refinement": {
     "max_generations": 10,
     "pass_threshold": 0.9,
-    "patience_threshold": 3,
+    "patience_threshold": 5,
     "patience_min_score": 0.80,
-    "initial_temperature": 0.3,
-    "temperature_increment": 0.2,
-    "max_temperature": 0.9,
-    "refinement_temperature": 0.5
+    "initial_temperature": 0.4,
+    "temperature_increment": 0.1,
+    "max_temperature": 0.95,
+    "refinement_temperature": 0.6,
+    "repair_plan_temperature": 0.3,
+    "repair_execution_temperature": 0.5,
+    "repair_plan_max_tokens": 1000,
+    "repair_execution_max_tokens": 500,
+    "repair_variants_per_attempt": 5
   },
   "evolutionary": {
     "batch_size": 40,
-    "variants_per_skeleton": {
-      "strict_adherence": 10,
-      "high_style": 10,
-      "experimental": 10,
-      "simplified": 10
-    },
-    "max_generations": 3,
+    "max_generations": 10,
     "convergence_threshold": 0.95,
     "top_k_parents": 10,
     "breeding_children": 10,
-    "min_keyword_presence": 0.35,
-    "min_viable_recall": 0.85,
-    "hallucination_penalty": 1.0
+    "fresh_generation_ratio": 0.33,
+    "min_keyword_presence": 0.4,
+    "min_viable_recall": 0.85
+  },
+  "style_rag": {
+    "num_fragments": 5,
+    "window_size": 3,
+    "overlap": 1,
+    "embedding_model": "all-mpnet-base-v2"
+  },
+  "content_planner": {
+    "temperature": 0.3,
+    "max_tokens": 1000
+  },
+  "structure_extractor": {
+    "temperature": 0.3,
+    "max_tokens": 500,
+    "timeout": 30
+  },
+  "style_extractor": {
+    "temperature": 0.3,
+    "max_tokens": 300
+  },
+  "prompt_builder": {
+    "temperature": 0.3,
+    "max_tokens": 100
+  },
+  "rhetoric": {
+    "classification_max_tokens": 10
+  },
+  "structure_tracker": {
+    "opener_penalty_threshold": 0.3
   }
 }
+
 

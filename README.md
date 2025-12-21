@@ -12,7 +12,7 @@ Transform text to match a target author's style while preserving semantic meanin
 
 ## Dependencies
 
-**Python Version:** Python 3.11 or higher is required (due to `jsonrepair>=0.19.0` requirement).
+**Python Version:** Python 3.11 or higher is recommended.
 
 This project requires the following Python packages (see `requirements.txt` for versions):
 - **spacy** (>=3.7.0) - Natural language processing and grammatical validation
@@ -24,7 +24,7 @@ This project requires the following Python packages (see `requirements.txt` for 
 - **torch** (>=2.0.0) - PyTorch (required by sentence-transformers for neural network operations)
 - **requests** (>=2.31.0) - HTTP requests for LLM API calls
 - **chromadb** (>=0.4.0) - Vector database for style atlas storage
-- **jsonrepair** (>=0.19.0) - JSON repair utilities
+- **jsonrepair** (>=0.19.0) - JSON repair utilities (optional - code handles its absence gracefully)
 - **tiktoken** (>=0.5.0) - Token counting for LLM APIs
 - **pytest** (>=7.0.0) - Testing framework
 

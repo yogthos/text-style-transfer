@@ -9,7 +9,7 @@ import json
 import hashlib
 from pathlib import Path
 from typing import Optional
-from src.generator.llm_interface import LLMProvider
+from src.generator.llm_provider import LLMProvider
 
 
 def _load_prompt_template(template_name: str) -> str:

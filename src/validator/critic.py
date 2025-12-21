@@ -25,38 +25,31 @@ except ImportError:
     # NLTK not available, will use fallback logic
     nltk = None
 
-# Initialize Spacy for grammatical coherence checking
-try:
-    import spacy
-    try:
-        _spacy_nlp = spacy.load("en_core_web_sm")
-    except OSError:
-        # Model not downloaded, will download on first use
-        _spacy_nlp = None
-except ImportError:
-    # Spacy not available, will use fallback logic
-    spacy = None
-    _spacy_nlp = None
+# Use NLPManager for shared spaCy model (lazy loading)
+_spacy_nlp = None
+_grammar_nlp = None
 
-# Load spaCy model for grammatical completeness checking
-try:
-    if spacy is not None:
+def _get_spacy_nlp():
+    """Get shared spaCy model via NLPManager."""
+    global _spacy_nlp
+    if _spacy_nlp is None:
         try:
-            _grammar_nlp = spacy.load("en_core_web_sm")
-        except (OSError, IOError):
-            # Try to download if not available
-            try:
-                import subprocess
-                import sys
-                subprocess.check_call([sys.executable, "-m", "spacy", "download", "en_core_web_sm"],
-                                    stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
-                _grammar_nlp = spacy.load("en_core_web_sm")
-            except:
-                _grammar_nlp = None
-    else:
-        _grammar_nlp = None
-except Exception:
-    _grammar_nlp = None
+            from src.utils.nlp_manager import NLPManager
+            _spacy_nlp = NLPManager.get_nlp()
+        except (ImportError, OSError, RuntimeError):
+            _spacy_nlp = False  # Mark as unavailable
+    return _spacy_nlp if _spacy_nlp is not False else None
+
+def _get_grammar_nlp():
+    """Get shared spaCy model for grammar checking via NLPManager."""
+    global _grammar_nlp
+    if _grammar_nlp is None:
+        try:
+            from src.utils.nlp_manager import NLPManager
+            _grammar_nlp = NLPManager.get_nlp()
+        except (ImportError, OSError, RuntimeError):
+            _grammar_nlp = False  # Mark as unavailable
+    return _grammar_nlp if _grammar_nlp is not False else None
 
 # Initialize sentence-transformers for semantic similarity
 try:
@@ -155,6 +148,7 @@ def _detect_hallucinated_words(generated_text: str, original_text: str) -> Tuple
             # while still catching proper nouns (e.g., "Schneider")
             # We check this BEFORE sentence start exemption to catch proper nouns at sentence start
             is_synonym = False
+            _spacy_nlp = _get_spacy_nlp()
             if _spacy_nlp is not None:
                 try:
                     # Get the word's vector representation
@@ -433,13 +427,8 @@ def is_grammatically_coherent(text: str) -> bool:
 
     global _spacy_nlp
 
-    # Try to load Spacy if not already loaded
-    if _spacy_nlp is None and spacy is not None:
-        try:
-            _spacy_nlp = spacy.load("en_core_web_sm")
-        except (OSError, IOError):
-            # Model not available, use fallback
-            pass
+    # Get shared spaCy model via NLPManager
+    _spacy_nlp = _get_spacy_nlp()
 
     words = text.split()
 
@@ -539,6 +528,7 @@ def is_grammatically_complete(text: str) -> bool:
         return False
 
     # Use spaCy if available
+    _grammar_nlp = _get_grammar_nlp()
     if _grammar_nlp is None:
         # Fallback: basic check (rely on is_text_complete for basic validation)
         return True
@@ -712,10 +702,9 @@ def check_critical_nouns_coverage(
         }
 
     # Check 2: Critical abstract nouns must be present
-    critical_abstract = {"experience", "finitude", "paradox", "universe", "cosmos", "information", "structure", "hierarchy"}
+    # All abstract nouns are critical - no hardcoded list
     missing_critical = []
     for abstract_noun in original_abstract:
-        if abstract_noun in critical_abstract:
             # Try WordNet synonyms first
             abstract_synonyms = get_wordnet_synonyms(abstract_noun)
             found_match = bool(abstract_synonyms & generated_all)
@@ -2062,8 +2051,6 @@ def generate_with_critic(
             print(f"    DEBUG: Generated text (attempt {generation_attempts + 1}): '{current_text}'")
             is_edited = False
             generation_attempts += 1
-            # FIX 1: Don't reset edit_attempts - track cumulative edits across regenerations
-            # edit_attempts = 0  # REMOVED - preserve counter to prevent infinite edit/regenerate ping-pong
             should_regenerate = False
 
         # Phase 2: Critique
@@ -2335,8 +2322,6 @@ def generate_with_critic(
             if edit_attempts > 0 and not edit_improved and last_score_before_edit is not None:
                 # Editing didn't help, regenerate
                 should_regenerate = True
-                # FIX 1: Don't reset edit_attempts - preserve counter to track cumulative edits
-                # edit_attempts = 0  # REMOVED
                 last_score_before_edit = None
                 is_edited = False
                 if feedback:
@@ -2386,8 +2371,6 @@ def generate_with_critic(
                 break
 
             should_regenerate = True
-            # FIX 1: Don't reset edit_attempts - preserve counter to track cumulative edits
-            # edit_attempts = 0  # REMOVED - prevents infinite edit/regenerate ping-pong
             last_score_before_edit = None
             is_edited = False
             if feedback:

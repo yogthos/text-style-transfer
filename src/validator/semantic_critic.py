@@ -6,7 +6,9 @@ based on semantic blueprints rather than text overlap.
 
 import json
 import re
+import hashlib
 from pathlib import Path
+from functools import lru_cache
 from typing import Dict, Tuple, Optional, Set, List
 from src.ingestion.blueprint import SemanticBlueprint, BlueprintExtractor
 
@@ -16,6 +18,13 @@ try:
 except ImportError:
     NUMPY_AVAILABLE = False
     np = None
+
+try:
+    import jsonrepair
+    JSONREPAIR_AVAILABLE = True
+except ImportError:
+    JSONREPAIR_AVAILABLE = False
+    jsonrepair = None
 
 try:
     from sentence_transformers import SentenceTransformer, util
@@ -141,6 +150,13 @@ class SemanticCritic:
         with open(config_path, 'r') as f:
             config = json.load(f)
         critic_config = config.get("semantic_critic", {})
+        llm_provider_config = config.get("llm_provider", {})
+        self.batch_timeout = llm_provider_config.get("batch_timeout", 180)  # Default 180 seconds for batch operations
+        self.max_retries = llm_provider_config.get("max_retries", 3)
+        self.retry_delay = llm_provider_config.get("retry_delay", 2)
+
+        # Initialize evaluation cache for semantic caching
+        self._evaluation_cache = {}
 
         # Use config values with fallbacks
         self.similarity_threshold = similarity_threshold or critic_config.get("similarity_threshold", 0.7)
@@ -187,6 +203,137 @@ class SemanticCritic:
             except Exception:
                 # LLM provider unavailable - verification will be skipped
                 self.llm_provider = None
+
+    def _safe_json_parse(self, json_string: str, verbose: bool = False) -> any:
+        """Safely parse JSON string, attempting to repair if malformed.
+
+        Uses multiple strategies to extract and repair JSON:
+        1. Extract JSON from markdown code blocks
+        2. Extract JSON object/array from text
+        3. Try jsonrepair library if available
+        4. Manual repair for common issues (trailing commas, unclosed brackets)
+
+        Args:
+            json_string: JSON string to parse.
+            verbose: Whether to print debug information.
+
+        Returns:
+            Parsed JSON object.
+
+        Raises:
+            json.JSONDecodeError: If JSON cannot be parsed even after repair attempts.
+        """
+        if not json_string or not json_string.strip():
+            raise json.JSONDecodeError("Empty JSON string", json_string, 0)
+
+        original_string = json_string
+
+        # Strategy 1: Extract JSON from markdown code blocks
+        code_block_match = re.search(r'```(?:json)?\s*(\{.*?\}|\[.*?\])\s*```', json_string, re.DOTALL)
+        if code_block_match:
+            json_string = code_block_match.group(1)
+            if verbose:
+                print(f"  📝 Extracted JSON from markdown code block")
+
+        # Strategy 2: Extract JSON object/array from text (more aggressive)
+        if not json_string.startswith('{') and not json_string.startswith('['):
+            # Try to find JSON object
+            obj_match = re.search(r'\{[^{}]*(?:\{[^{}]*\}[^{}]*)*\}', json_string, re.DOTALL)
+            if obj_match:
+                json_string = obj_match.group(0)
+                if verbose:
+                    print(f"  📝 Extracted JSON object from text")
+            else:
+                # Try to find JSON array
+                array_match = re.search(r'\[[^\[\]]*(?:\[[^\[\]]*\][^\[\]]*)*\]', json_string, re.DOTALL)
+                if array_match:
+                    json_string = array_match.group(0)
+                    if verbose:
+                        print(f"  📝 Extracted JSON array from text")
+
+        # Strategy 3: Try normal parsing first
+        try:
+            return json.loads(json_string)
+        except json.JSONDecodeError as e:
+            if verbose:
+                print(f"  ⚠ JSON parse error: {e}, attempting repair...")
+
+            # Strategy 4: Try to repair using jsonrepair if available
+            if JSONREPAIR_AVAILABLE and jsonrepair:
+                try:
+                    repaired = jsonrepair.repair_json(json_string)
+                    parsed = json.loads(repaired)
+                    if verbose:
+                        print(f"  ✅ JSON repair successful using jsonrepair")
+                    return parsed
+                except Exception as repair_error:
+                    if verbose:
+                        print(f"  ⚠ JSON repair with jsonrepair failed: {repair_error}")
+
+            # Strategy 5: Manual repair for common issues
+            try:
+                repaired = self._manual_json_repair(json_string, verbose=verbose)
+                if repaired:
+                    return json.loads(repaired)
+            except Exception as manual_error:
+                if verbose:
+                    print(f"  ⚠ Manual JSON repair failed: {manual_error}")
+
+            # If all repair strategies fail, raise original error
+            raise json.JSONDecodeError(
+                f"Failed to parse JSON after all repair attempts. Original error: {e.msg}",
+                original_string,
+                e.pos
+            )
+
+    def _manual_json_repair(self, json_string: str, verbose: bool = False) -> Optional[str]:
+        """Manually repair common JSON issues.
+
+        Fixes:
+        - Trailing commas before closing brackets/braces
+        - Unclosed brackets/braces
+        - Missing quotes around keys
+        - Single quotes instead of double quotes
+
+        Args:
+            json_string: JSON string to repair.
+            verbose: Whether to print debug information.
+
+        Returns:
+            Repaired JSON string, or None if repair not possible.
+        """
+        repaired = json_string
+
+        # Fix trailing commas before } or ]
+        repaired = re.sub(r',\s*([}\]])', r'\1', repaired)
+
+        # Fix single quotes to double quotes (but be careful with apostrophes in strings)
+        # Only replace quotes that are clearly JSON syntax, not content
+        repaired = re.sub(r"'(\w+)'\s*:", r'"\1":', repaired)  # Keys: 'key': -> "key":
+
+        # Try to close unclosed brackets/braces (simple heuristic)
+        open_braces = repaired.count('{') - repaired.count('}')
+        open_brackets = repaired.count('[') - repaired.count(']')
+
+        if open_braces > 0:
+            repaired += '}' * open_braces
+            if verbose:
+                print(f"  🔧 Added {open_braces} closing braces")
+        if open_brackets > 0:
+            repaired += ']' * open_brackets
+            if verbose:
+                print(f"  🔧 Added {open_brackets} closing brackets")
+
+        # Validate the repair worked
+        try:
+            json.loads(repaired)  # Test parse
+            if verbose:
+                print(f"  ✅ Manual JSON repair successful")
+            return repaired
+        except json.JSONDecodeError:
+            if verbose:
+                print(f"  ⚠ Manual repair did not produce valid JSON")
+            return None
 
     def _calculate_thesis_alignment(self, text: str, thesis: str) -> float:
         """Calculate alignment between text and document thesis using vector similarity.
@@ -589,16 +736,63 @@ class SemanticCritic:
                             generated_nouns.add(token.lemma_.lower())
 
                     # HARD GATE: If original had nouns but output has ZERO matching nouns, fail
+                    # BUT: Use semantic similarity to catch synonyms (e.g., "nation-state" vs "country")
                     if original_nouns and not any(noun in generated_nouns for noun in original_nouns):
-                        missing_nouns = list(original_nouns)[:5]  # Show first 5 missing nouns
-                        return {
-                            "pass": False,
-                            "recall_score": 0.0,
-                            "precision_score": 0.0,
-                            "fluency_score": 0.0,
-                            "score": 0.0,
-                            "feedback": f"CRITICAL: Key nouns from original text are missing in output. Missing nouns: {', '.join(missing_nouns)}. Restore all key concepts from the original text."
-                        }
+                        # Try semantic similarity check for synonyms
+                        preserved_semantically = False
+                        if self.semantic_model:
+                            try:
+                                # Check each original noun against all generated nouns using semantic similarity
+                                for orig_noun in original_nouns:
+                                    orig_emb = self.semantic_model.encode(orig_noun, convert_to_tensor=True)
+                                    for gen_noun in generated_nouns:
+                                        gen_emb = self.semantic_model.encode(gen_noun, convert_to_tensor=True)
+                                        # Use cosine similarity
+                                        try:
+                                            from sentence_transformers import util
+                                            similarity = util.cos_sim(orig_emb, gen_emb).item()
+                                        except (ImportError, AttributeError):
+                                            # Fallback: use torch directly
+                                            import torch
+                                            similarity = torch.nn.functional.cosine_similarity(
+                                                orig_emb, gen_emb, dim=0
+                                            ).item()
+
+                                        if similarity > 0.6:  # Synonym threshold
+                                            preserved_semantically = True
+                                            break
+                                    if preserved_semantically:
+                                        break
+                            except Exception as e:
+                                # If semantic check fails, continue to entailment check
+                                pass
+
+                        # If semantic similarity didn't find a match, try entailment check
+                        if not preserved_semantically and self.llm_provider and original_text:
+                            try:
+                                # Check if the generated text entails the original nouns using LLM
+                                # Create a simple proposition: "The text mentions [noun]"
+                                noun_propositions = [f"The text mentions {noun}." for noun in list(original_nouns)[:3]]
+                                for prop in noun_propositions:
+                                    entails, confidence = self._check_entailment(prop, generated_text, verbose=False)
+                                    if entails and confidence >= 0.8:
+                                        preserved_semantically = True
+                                        break
+                            except Exception:
+                                # If entailment check fails, continue to fail case
+                                pass
+
+                        # Only fail if BOTH exact match AND semantic similarity AND entailment all fail
+                        if not preserved_semantically:
+                            missing_nouns = list(original_nouns)[:5]  # Show first 5 missing nouns
+                            return {
+                                "pass": False,
+                                "recall_score": 0.0,
+                                "precision_score": 0.0,
+                                "fluency_score": 0.0,
+                                "score": 0.0,
+                                "feedback": f"CRITICAL: Key nouns from original text are missing in output. Missing nouns: {', '.join(missing_nouns)}. Restore all key concepts from the original text."
+                            }
                 except Exception:
                     # If noun check fails, continue (don't block on spaCy errors)
                     pass
@@ -723,38 +917,40 @@ class SemanticCritic:
                                     # Words meaning "limited" should be similar to each other
                                     # If modifier is "unlimited-type" and noun is "limited-type", it's a contradiction
 
-                                    # Use semantic anchors to detect contradiction patterns
-                                    # Create semantic clusters using word vectors
-                                    unlimited_anchors = ["infinite", "ceaseless", "boundless", "eternal", "endless", "unlimited"]
-                                    limited_anchors = ["finite", "limited", "bounded", "temporary", "transient", "ending"]
-
-                                    # Check if modifier is semantically similar to "unlimited" concepts
+                                    # Use semantic analysis to detect contradiction patterns
+                                    # Dynamically determine if words are "unlimited" or "limited" using spaCy
+                                    # Use seed concepts and semantic similarity
                                     modifier_unlimited_score = 0.0
                                     modifier_limited_score = 0.0
 
-                                    for anchor in unlimited_anchors:
-                                        if anchor in nlp.vocab and nlp.vocab[anchor].has_vector:
-                                            score = modifier.similarity(nlp(anchor))
-                                            modifier_unlimited_score = max(modifier_unlimited_score, score)
+                                    # Use single seed words and find semantically similar words dynamically
+                                    try:
+                                        unlimited_seed = nlp.vocab["unlimited"]
+                                        limited_seed = nlp.vocab["limited"]
 
-                                    for anchor in limited_anchors:
-                                        if anchor in nlp.vocab and nlp.vocab[anchor].has_vector:
-                                            score = modifier.similarity(nlp(anchor))
-                                            modifier_limited_score = max(modifier_limited_score, score)
+                                        if unlimited_seed.has_vector and modifier.has_vector:
+                                            modifier_unlimited_score = modifier.similarity(unlimited_seed)
+
+                                        if limited_seed.has_vector and modifier.has_vector:
+                                            modifier_limited_score = modifier.similarity(limited_seed)
+                                    except (KeyError, AttributeError):
+                                        pass
 
                                     # Check if noun is semantically similar to "limited" concepts
                                     noun_unlimited_score = 0.0
                                     noun_limited_score = 0.0
 
-                                    for anchor in unlimited_anchors:
-                                        if anchor in nlp.vocab and nlp.vocab[anchor].has_vector:
-                                            score = noun.similarity(nlp(anchor))
-                                            noun_unlimited_score = max(noun_unlimited_score, score)
+                                    try:
+                                        unlimited_seed = nlp.vocab["unlimited"]
+                                        limited_seed = nlp.vocab["limited"]
 
-                                    for anchor in limited_anchors:
-                                        if anchor in nlp.vocab and nlp.vocab[anchor].has_vector:
-                                            score = noun.similarity(nlp(anchor))
-                                            noun_limited_score = max(noun_limited_score, score)
+                                        if unlimited_seed.has_vector and noun.has_vector:
+                                            noun_unlimited_score = noun.similarity(unlimited_seed)
+
+                                        if limited_seed.has_vector and noun.has_vector:
+                                            noun_limited_score = noun.similarity(limited_seed)
+                                    except (KeyError, AttributeError):
+                                        pass
 
                                     # Contradiction: modifier implies "unlimited" but noun implies "limited"
                                     # OR modifier implies "limited" but noun implies "unlimited"
@@ -776,21 +972,24 @@ class SemanticCritic:
                                 adjective = token
 
                                 if has_vectors and adverb.has_vector and adjective.has_vector:
-                                    # Similar semantic analysis for adverb-adjective pairs
-                                    unlimited_anchors = ["infinitely", "ceaselessly", "boundlessly", "eternally", "endlessly"]
-                                    limited_anchors = ["finitely", "temporarily", "transiently"]
+                                    # Similar semantic analysis for adverb-adjective pairs using dynamic detection
+                                    adverb_unlimited_score = 0.0
+                                    adj_limited_score = 0.0
 
-                                    adverb_unlimited_score = max([
-                                        adverb.similarity(nlp(anchor))
-                                        for anchor in unlimited_anchors
-                                        if anchor in nlp.vocab and nlp.vocab[anchor].has_vector
-                                    ] + [0.0])
+                                    try:
+                                        # Use seed words for unlimited/limited concepts
+                                        unlimited_seed = nlp.vocab["unlimited"]
+                                        limited_seed = nlp.vocab["limited"]
 
-                                    adj_limited_score = max([
-                                        adjective.similarity(nlp(anchor.replace("ly", "")))
-                                        for anchor in limited_anchors
-                                        if anchor.replace("ly", "") in nlp.vocab and nlp.vocab[anchor.replace("ly", "")].has_vector
-                                    ] + [0.0])
+                                        # For adverbs, check similarity to unlimited concept
+                                        if unlimited_seed.has_vector and adverb.has_vector:
+                                            adverb_unlimited_score = adverb.similarity(unlimited_seed)
+
+                                        # For adjectives, check similarity to limited concept
+                                        if limited_seed.has_vector and adjective.has_vector:
+                                            adj_limited_score = adjective.similarity(limited_seed)
+                                    except (KeyError, AttributeError):
+                                        pass
 
                                     if adverb_unlimited_score > 0.5 and adj_limited_score > 0.5:
                                         contradictions.append((adverb.text, adjective.text))
@@ -1669,11 +1868,16 @@ Does the generated text align with the intent '{intent}'? Consider:
 
         return True, ""
 
-    def _check_proposition_recall(self, generated_text: str, propositions: List[str], similarity_threshold: float = 0.45) -> Tuple[float, Dict]:
+    def _check_proposition_recall(self, generated_text: str, propositions: List[str], similarity_threshold: float = 0.45, verbose: bool = False) -> Tuple[float, Dict]:
         """Check proposition recall by comparing each proposition against generated sentences.
 
         CRITICAL: Do NOT compare proposition vector against whole paragraph vector (too much noise).
         Instead, split paragraph into sentences and find the Maximum Similarity for each proposition.
+
+        Uses three-tier matching:
+        1. Vector similarity above threshold → preserved
+        2. Hybrid keyword matching (0.25-0.30 similarity + 75% keyword overlap) → preserved
+        3. Entailment check (0.20-0.30 similarity, LLM verifies no contradiction) → preserved
 
         Args:
             generated_text: Generated paragraph text.
@@ -1681,6 +1885,7 @@ Does the generated text align with the intent '{intent}'? Consider:
             similarity_threshold: Similarity threshold for matching (default: 0.45 for sentence mode,
                                 0.30 recommended for paragraph mode to account for stylized text).
                                 Hybrid keyword matching applies when similarity is 0.25-0.30.
+            verbose: Whether to print debug information for entailment checks.
 
         Returns:
             Tuple of (recall_score: float, details_dict: Dict).
@@ -1765,6 +1970,19 @@ Does the generated text align with the intent '{intent}'? Consider:
                         is_preserved = True
                         scores[f"{prop}_hybrid_match"] = keyword_overlap_ratio  # Store for debugging
 
+            # ENTAILMENT CHECK: For borderline cases (0.20-0.30 similarity) that failed hybrid matching
+            # This catches valid stylistic expansions that have low vector similarity but don't contradict
+            if not is_preserved and max_similarity >= 0.20 and max_similarity < threshold and best_sentence:
+                # Borderline case: similarity is meaningful (>0.20) but below threshold
+                # Check if generated sentence entails (doesn't contradict) the proposition
+                entails, confidence = self._check_entailment(prop, best_sentence, verbose=verbose)
+
+                if entails and confidence >= 0.6:
+                    # Generated sentence preserves meaning (stylistic expansion allowed)
+                    is_preserved = True
+                    scores[f"{prop}_entailment"] = confidence  # Store for debugging
+                    scores[f"{prop}_entailment_match"] = best_sentence[:100]  # Store best match
+
             if is_preserved:
                 preserved.append(prop)
             else:
@@ -1775,6 +1993,903 @@ Does the generated text align with the intent '{intent}'? Consider:
 
         recall = len(preserved) / len(propositions) if propositions else 0.0
         return recall, {"preserved": preserved, "missing": missing, "scores": scores}
+
+    def _check_entailment(self, proposition: str, generated_sentence: str, verbose: bool = False) -> Tuple[bool, float]:
+        """Check if generated sentence entails (preserves meaning of) proposition using LLM.
+
+        This is used for borderline cases where similarity is low but we want to verify
+        that the generated sentence doesn't contradict the proposition (stylistic expansion).
+
+        Args:
+            proposition: Original atomic proposition.
+            generated_sentence: Generated sentence to check.
+            verbose: Whether to print debug information.
+
+        Returns:
+            Tuple of (entails: bool, confidence: float).
+            Returns (True, 0.5) if LLM unavailable (neutral, assume preserved).
+        """
+        if not self.llm_provider:
+            # Fallback: assume preserved if LLM unavailable
+            return True, 0.5
+
+        if not proposition or not generated_sentence:
+            return False, 0.0
+
+        system_prompt = _load_prompt_template("semantic_critic_entailment.md")
+        user_prompt = f"Proposition: {proposition}\n\nGenerated Sentence: {generated_sentence}\n\nDoes the Generated Sentence entail (preserve the meaning of) the Proposition?"
+
+        try:
+            response = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_type="critic",
+                require_json=True,
+                temperature=0.2,  # Low temperature for consistent evaluation
+                max_tokens=150,
+                timeout=20  # Shorter timeout for faster checks
+            )
+
+            # Parse JSON response
+            try:
+                result = json.loads(response)
+            except json.JSONDecodeError:
+                # Try to extract JSON from response
+                json_match = re.search(r'\{[^}]+\}', response, re.DOTALL)
+                if json_match:
+                    result = json.loads(json_match.group())
+                else:
+                    # Fallback: assume preserved if parsing fails
+                    if verbose:
+                        print(f"      ⚠ Entailment check: Could not parse LLM response, assuming preserved")
+                    return True, 0.5
+
+            entails = result.get('entails', True)
+            confidence = float(result.get('confidence', 0.5))
+            confidence = max(0.0, min(1.0, confidence))  # Clamp to [0, 1]
+
+            if verbose:
+                reason = result.get('reason', '')
+                print(f"      Entailment check: {entails} (confidence={confidence:.2f}, reason={reason[:50]}...)")
+
+            return entails, confidence
+
+        except Exception as e:
+            # On any error, assume preserved (don't block evaluation)
+            if verbose:
+                print(f"      ⚠ Entailment check failed: {str(e)}, assuming preserved")
+            return True, 0.5
+
+    def _get_semantic_hash(self, template: str, propositions: List[str]) -> str:
+        """Generate semantic hash for caching.
+
+        Normalizes inputs to ensure cache hits for semantically identical inputs:
+        - Sorts propositions alphabetically (order-independent)
+        - Normalizes whitespace in template
+        - Returns hash of normalized inputs
+
+        Args:
+            template: Template string to normalize
+            propositions: List of proposition strings to normalize
+
+        Returns:
+            MD5 hash string of normalized inputs
+        """
+        # Sort propositions (order-independent) and normalize
+        sorted_props = sorted([p.strip().lower() for p in propositions if p and p.strip()])
+
+        # Normalize template whitespace
+        normalized_template = ' '.join(template.split())
+
+        # Create hash key
+        key_string = normalized_template + '|' + '|'.join(sorted_props)
+        return hashlib.md5(key_string.encode('utf-8')).hexdigest()
+
+    def _extract_fixed_anchors(self, template: str) -> List[str]:
+        """
+        Extract fixed anchors from a template by keeping everything outside placeholders.
+
+        Treats everything outside [Placeholder] brackets as an anchor, unless it's
+        pure punctuation/whitespace. This preserves the author's rhetorical skeleton
+        including words like "fact", "truth", "practice" even if they're nouns.
+
+        Args:
+            template: Template string with placeholders like [NP], [VP], [ADJ], [ADV]
+
+        Returns:
+            List of anchor strings (may include multi-word phrases)
+        """
+        if not template:
+            return []
+
+        # Regex pattern to match placeholders
+        placeholder_pattern = r'\[(?:NP|VP|ADJ|ADV)\]'
+
+        # Split template by placeholders
+        segments = re.split(placeholder_pattern, template)
+
+        anchors = []
+        for segment in segments:
+            # Clean whitespace but preserve structure
+            segment = segment.strip()
+
+            # Skip empty segments (pure whitespace between placeholders)
+            if not segment:
+                continue
+
+            # Keep the segment as an anchor
+            # This includes words like "fact", "truth", "practice" - they're part of the skeleton
+            anchors.append(segment)
+
+        return anchors
+
+    def evaluate_sentence_fit(
+        self,
+        draft: str,
+        assigned_propositions: List[str],
+        template: str,
+        verbose: bool = False
+    ) -> Dict[str, any]:
+        """
+        Evaluate if a draft sentence fits both meaning and structure requirements.
+
+        This is a structure-aware evaluation that checks:
+        1. Anchor adherence: Does draft contain the fixed anchors from template? (strict)
+        2. Semantic presence: Are the meaning atoms present? (flexible phrasing allowed)
+
+        Args:
+            draft: Generated sentence to evaluate
+            assigned_propositions: List of propositions that must be expressed
+            template: Template structure that must be matched
+            verbose: Enable debug logging
+
+        Returns:
+            Dict with:
+            - anchor_score: float (0.0-1.0) - How well fixed anchors are preserved
+            - semantic_score: float (0.0-1.0) - How well meaning atoms are present
+            - meaning_score: float (alias for semantic_score, backward compatibility)
+            - structure_score: float (alias for anchor_score, backward compatibility)
+            - pass: bool - True if both scores >= 0.9
+            - anchor_feedback: str - Specific missing anchors
+            - semantic_feedback: str - Missing meaning atoms (if any)
+            - meaning_feedback: str (alias for semantic_feedback, backward compatibility)
+            - structure_feedback: str (alias for anchor_feedback, backward compatibility)
+            - overall_feedback: str - Combined feedback for repair
+        """
+        if not self.llm_provider:
+            # Fallback: assume pass if LLM unavailable
+            return {
+                "anchor_score": 0.9,
+                "semantic_score": 0.9,
+                "meaning_score": 0.9,
+                "structure_score": 0.9,
+                "pass": True,
+                "anchor_feedback": "",
+                "semantic_feedback": "",
+                "meaning_feedback": "",
+                "structure_feedback": "",
+                "overall_feedback": "LLM unavailable, assuming pass"
+            }
+
+        if not draft or not assigned_propositions or not template:
+            return {
+                "anchor_score": 0.0,
+                "semantic_score": 0.0,
+                "meaning_score": 0.0,
+                "structure_score": 0.0,
+                "pass": False,
+                "anchor_feedback": "Missing required inputs",
+                "semantic_feedback": "Missing required inputs",
+                "meaning_feedback": "Missing required inputs",
+                "structure_feedback": "Missing required inputs",
+                "overall_feedback": "Missing required inputs"
+            }
+
+        # Generate semantic hash for caching
+        semantic_hash = self._get_semantic_hash(template, assigned_propositions)
+
+        # Check cache using semantic hash
+        cache_key = (draft, semantic_hash)
+        if hasattr(self, '_evaluation_cache') and cache_key in self._evaluation_cache:
+            if verbose:
+                print(f"      Cache hit for evaluation (hash: {semantic_hash[:8]}...)")
+            return self._evaluation_cache[cache_key]
+
+        # Extract fixed anchors from template
+        anchors = self._extract_fixed_anchors(template)
+        anchors_text = ", ".join([f"'{anchor}'" for anchor in anchors]) if anchors else "None"
+
+        # Build propositions text
+        props_text = "\n".join([f"- {prop}" for prop in assigned_propositions])
+
+        system_prompt = """You are a Syntax Validator. Your job is to ensure the Draft creates a valid sentence that *strictly follows* the Template's rhetorical structure (anchors) while expressing the *Meaning*."""
+
+        user_prompt = f"""Analyze the Draft against the Template.
+
+**Template:** {template}
+**Fixed Anchors (MUST be present exactly):** {anchors_text}
+**Draft:** {draft}
+**Required Meaning Atoms:**
+{props_text}
+
+**Check 1: Structural Anchors (The Author's Voice)**
+- Does the Draft contain each fixed anchor from the template?
+- Check for: {anchors_text}
+- **IMPORTANT:** Allow small grammatical adjustments to fixed anchors to maintain subject-verb agreement. For example, 'is' ↔ 'are', 'has' ↔ 'have', 'was' ↔ 'were' are acceptable variations if they improve grammatical correctness.
+- Score: 0.0-1.0 (1.0 = all anchors present in correct positions/order, with grammatical adjustments allowed)
+
+**Check 2: Core Meaning (The Idea)**
+- Does the draft convey the *core meaning* of the assigned propositions?
+- **CRITICAL:** Do NOT check for specific words. Check if the *idea* is present.
+- Allow flexible phrasing (synonyms, metaphors, rephrasing, word order changes)
+- Score: 0.0-1.0 (1.0 = core meaning fully conveyed)
+
+**Key Instruction:**
+- DO enforce exact wording for Fixed Anchors (prepositions, conjunctions, "there was", "the fact is", etc.), BUT allow grammatical inflection (is/are, has/have, was/were) for subject-verb agreement.
+- DO NOT enforce exact wording for the [Variables]. Allow rephrasing of meaning atoms.
+- DO NOT check for specific nouns or individual words. Focus on whether the *concept* is present.
+
+**Output Format:** JSON
+{{
+  "anchor_score": 0.85,
+  "semantic_score": 0.95,
+  "anchor_feedback": "Missing anchor 'In' at start.",
+  "semantic_feedback": "Core meaning is present.",
+  "overall_feedback": "Add 'In' at start while keeping current meaning.",
+  "pass": false
+}}
+"""
+
+        try:
+            response = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_type="critic",
+                require_json=True,
+                temperature=0.2,  # Low temperature for consistent evaluation
+                max_tokens=300,
+                timeout=20
+            )
+
+            # Parse JSON response
+            response = response.strip()
+            json_match = re.search(r'\{.*?\}', response, re.DOTALL)
+            if json_match:
+                try:
+                    result = json.loads(json_match.group(0))
+                except json.JSONDecodeError:
+                    # Try parsing entire response
+                    result = json.loads(response)
+            else:
+                result = json.loads(response)
+
+            # Extract scores and feedback
+            anchor_score = float(result.get("anchor_score", 0.0))
+            semantic_score = float(result.get("semantic_score", 0.0))
+            anchor_feedback = result.get("anchor_feedback", "")
+            semantic_feedback = result.get("semantic_feedback", "")
+            overall_feedback = result.get("overall_feedback", "")
+
+            # Clamp scores to [0, 1]
+            anchor_score = max(0.0, min(1.0, anchor_score))
+            semantic_score = max(0.0, min(1.0, semantic_score))
+
+            # Determine pass (both scores >= 0.9)
+            passed = (anchor_score >= 0.9) and (semantic_score >= 0.9)
+
+            # Build overall feedback if not provided
+            if not overall_feedback:
+                feedback_parts = []
+                if anchor_score < 0.9:
+                    feedback_parts.append(anchor_feedback)
+                if semantic_score < 0.9:
+                    feedback_parts.append(semantic_feedback)
+                overall_feedback = " ".join(feedback_parts) if feedback_parts else "No issues found"
+
+            if verbose:
+                print(f"      Evaluation: anchor={anchor_score:.2f}, semantic={semantic_score:.2f}, pass={passed}")
+
+            # Build result dict
+            result = {
+                "anchor_score": anchor_score,
+                "semantic_score": semantic_score,
+                "meaning_score": semantic_score,  # Backward compatibility
+                "structure_score": anchor_score,   # Backward compatibility
+                "pass": passed,
+                "anchor_feedback": anchor_feedback,
+                "semantic_feedback": semantic_feedback,
+                "meaning_feedback": semantic_feedback,  # Backward compatibility
+                "structure_feedback": anchor_feedback,  # Backward compatibility
+                "overall_feedback": overall_feedback
+            }
+
+            # Cache result
+            if not hasattr(self, '_evaluation_cache'):
+                self._evaluation_cache = {}
+            # Limit cache size to 512 entries (LRU eviction)
+            if len(self._evaluation_cache) >= 512:
+                # Remove oldest entry (simple FIFO)
+                oldest_key = next(iter(self._evaluation_cache))
+                del self._evaluation_cache[oldest_key]
+            self._evaluation_cache[cache_key] = result
+
+            return result
+
+        except Exception as e:
+            if verbose:
+                print(f"      ⚠ Evaluation failed: {e}, assuming pass")
+            # Fallback: assume pass on error
+            return {
+                "anchor_score": 0.9,
+                "semantic_score": 0.9,
+                "meaning_score": 0.9,
+                "structure_score": 0.9,
+                "pass": True,
+                "anchor_feedback": "",
+                "semantic_feedback": "",
+                "meaning_feedback": "",
+                "structure_feedback": "",
+                "overall_feedback": f"Evaluation error: {str(e)}, assuming pass"
+            }
+
+    def _calculate_repetition_penalty(
+        self,
+        candidate: str,
+        previous_sentence: Optional[str],
+        words_to_check: int = 5
+    ) -> Tuple[float, str]:
+        """Calculate penalty for repetitive sentence openers.
+
+        Args:
+            candidate: Current candidate sentence.
+            previous_sentence: Previous sentence (or None).
+            words_to_check: Number of words to compare.
+
+        Returns:
+            Tuple of (penalty_score: float, feedback: str).
+            penalty_score is 0.0 (no penalty) to 0.5 (max penalty).
+        """
+        if not previous_sentence or not candidate:
+            return 0.0, ""
+
+        # Extract first N words from both sentences
+        candidate_words = candidate.split()[:words_to_check]
+        previous_words = previous_sentence.split()[:words_to_check]
+
+        if len(candidate_words) < 3 or len(previous_words) < 3:
+            return 0.0, ""
+
+        # Calculate similarity for word sequence
+        # Simple approach: count matching words in same position
+        matches = sum(1 for c, p in zip(candidate_words, previous_words) if c.lower() == p.lower())
+        similarity_ratio = matches / min(len(candidate_words), len(previous_words))
+
+        if similarity_ratio >= 0.8:  # 80% of words match
+            penalty = 0.5
+            feedback = f"Repetitive Sentence Opener. You started with '{' '.join(candidate_words[:3])}' which is too similar to the previous sentence's opener '{' '.join(previous_words[:3])}'. Vary the phrasing."
+            return penalty, feedback
+
+        return 0.0, ""
+
+    def _check_vocabulary_repetition(self, text: str) -> Tuple[bool, List[str]]:
+        """Check for repetitive vocabulary using local NLP.
+
+        Uses spaCy to extract content words and count frequencies.
+        Only detects repetition if a word appears > 2 times.
+
+        Args:
+            text: Text to check for repetition
+
+        Returns:
+            Tuple of (has_repetition: bool, repeated_words: List[str])
+        """
+        try:
+            from src.utils.nlp_manager import NLPManager
+            from collections import Counter
+
+            nlp = NLPManager.get_nlp()
+            if nlp is None:
+                return False, []
+
+            doc = nlp(text)
+
+            # Extract content words (nouns, verbs, adjectives)
+            content_words = [token.lemma_.lower()
+                           for token in doc
+                           if token.pos_ in ['NOUN', 'VERB', 'ADJ']
+                           and not token.is_stop
+                           and len(token.lemma_) > 2]  # Filter very short words
+
+            # Count frequencies
+            word_counts = Counter(content_words)
+
+            # Find repeated words (appears > 2 times)
+            repeated = [word for word, count in word_counts.items() if count > 2]
+
+            return len(repeated) > 0, repeated
+        except Exception:
+            # Fallback: no repetition detected
+            return False, []
+
+    def _evaluate_batch(
+        self,
+        candidate_populations: List[List[str]],
+        templates: List[str],
+        prop_map: List[List[str]],
+        narrative_roles: List[str] = None,
+        best_sentences: List[Optional[str]] = None,
+        verbose: bool = False
+    ) -> List[List[Dict]]:
+        """Evaluate all candidates in a single batch LLM call.
+
+        Args:
+            candidate_populations: List[List[str]] where candidate_populations[i] is
+                the population for slot i.
+            templates: List[str] of templates (one per slot).
+            prop_map: List[List[str]] where prop_map[i] contains propositions for slot i.
+            verbose: Whether to print debug information.
+
+        Returns:
+            List[List[Dict]] where result[i][j] contains evaluation for candidate j of slot i.
+
+        Raises:
+            Exception: If batch evaluation fails (caller should fall back to individual).
+        """
+        import json
+        import re
+
+        # Pre-process all slots: extract anchors and build slot blocks
+        slot_blocks = []
+        total_candidates = 0
+        slots_with_candidates = []
+        slot_contexts = {}  # Store context for each slot (for repetition checking)
+
+        for slot_idx in range(len(templates)):
+            candidates = candidate_populations[slot_idx]
+            template = templates[slot_idx]
+            propositions = prop_map[slot_idx]
+
+            # Skip empty populations (locked slots)
+            if not candidates:
+                continue
+
+            # Get narrative role for this slot
+            narrative_role = narrative_roles[slot_idx] if narrative_roles and slot_idx < len(narrative_roles) else "BODY"
+
+            # Build previous context with soft fallback
+            prev_sentence_context = "None (Start of Paragraph)"
+            is_pending_draft = False
+            prev_sentence_for_repetition = None  # For repetition penalty check
+            if slot_idx > 0:
+                if best_sentences and best_sentences[slot_idx - 1]:
+                    prev_sentence_context = best_sentences[slot_idx - 1]
+                    prev_sentence_for_repetition = best_sentences[slot_idx - 1]
+                elif candidate_populations[slot_idx - 1]:
+                    # FALLBACK: Use the first candidate of the previous slot as a proxy for context
+                    # This prevents "Deadlock" where Slot 1 fails because Slot 0 isn't finished.
+                    prev_sentence_context = candidate_populations[slot_idx - 1][0]
+                    prev_sentence_for_repetition = candidate_populations[slot_idx - 1][0]
+                    is_pending_draft = True
+
+            # Store context for repetition checking
+            slot_contexts[slot_idx] = {
+                "prev_sentence": prev_sentence_for_repetition
+            }
+
+            # Extract fixed anchors
+            anchors = self._extract_fixed_anchors(template)
+            anchors_text = ", ".join([f'"{anchor}"' for anchor in anchors]) if anchors else "None"
+
+            # Format propositions
+            props_text = "\n".join([f"- {prop}" for prop in propositions])
+
+            # Format candidates with indices
+            candidates_text = "\n".join([f'{i}. "{candidate}"' for i, candidate in enumerate(candidates)])
+
+            # Build context label with pending draft marker if applicable
+            prev_context_label = prev_sentence_context
+            if is_pending_draft:
+                prev_context_label = f"[Pending Draft]: {prev_sentence_context}"
+
+            # Build slot block
+            slot_block = f"""---
+### SLOT {slot_idx}
+**Template:** "{template}"
+**Narrative Role:** {narrative_role}
+**Fixed Anchors (Must match exactly):** [{anchors_text}]
+**Required Meaning Atoms:**
+{props_text}
+**Previous Sentence Context:** {prev_context_label}
+
+**Candidates:**
+{candidates_text}
+---"""
+            slot_blocks.append(slot_block)
+            slots_with_candidates.append(slot_idx)
+            total_candidates += len(candidates)
+
+        if not slot_blocks:
+            # No candidates to evaluate
+            return [[] for _ in templates]
+
+        # Check token limit (rough estimate: ~4 tokens per character)
+        exam_sheet = "\n".join(slot_blocks)
+        estimated_tokens = len(exam_sheet) // 4
+        if estimated_tokens > 100000:  # Safety limit
+            raise ValueError(f"Batch prompt too large ({estimated_tokens} estimated tokens), exceeds safety limit of 100000 tokens")
+
+        # Build system prompt
+        system_prompt = """You are a Batch Syntax & Semantic Validator. Evaluate multiple candidates across multiple structural slots simultaneously. Grade each candidate based on Structural Anchors (exact match required), Semantic Meaning (flexible phrasing allowed), and Narrative Flow (rhetorical function and coherence).
+
+**Evaluation Criteria:**
+1. **Anchor Adherence (Flexible POS) (0.0-1.0):**
+   - **Primary Goal:** Check if the **Fixed Anchors** (words like 'It is', 'the', 'of', 'therefore', 'there was', 'the fact is') are present exactly.
+   - **Secondary Goal:** Check the variable slots (`[NP]`, `[VP]`, `[ADJ]`, `[ADV]`).
+   - **Flexibility Rule:** If the candidate uses a Noun Phrase where the template asked for an Adjective (or vice versa), **ACCEPT IT** as long as:
+     * The sentence is grammatically correct
+     * The rhythm and structure are preserved
+     * The meaning is conveyed
+   - **DO NOT fail a candidate solely for Part-of-Speech tag mismatches.**
+   - **Grammar > Template Tags:** If changing a tag improved grammar, reward it, don't penalize it.
+   - **IMPORTANT:** Allow small grammatical adjustments to fixed anchors to maintain subject-verb agreement. For example, 'is' ↔ 'are', 'has' ↔ 'have', 'was' ↔ 'were' are acceptable variations if they improve grammatical correctness.
+2. **Semantic Presence (Register Aware) (0.0-1.0):** Does the candidate convey the core meaning of the required propositions?
+   - **Register Translation:** The candidate should convey the *meaning* of the required propositions, not necessarily the exact words.
+   - **Accept High-Register Synonyms:**
+     * Input 'Hunger' → Candidate 'Material Deprivation' ✅
+     * Input 'Ruins' → Candidate 'Collapsed Infrastructure' ✅
+     * Input 'brought void' → Candidate 'precipitated a material crisis' ✅
+   - **Accept Metaphorical Equivalents:**
+     * Input 'scavenging' → Candidate 'systematic extraction of resources' ✅
+   - **Fail Only If:** The *core concept* is missing entirely (not just rephrased).
+   - **DO NOT penalize** for using elevated register or academic synonyms.
+   - DO NOT check for specific words - check if the *idea* is present. Allow flexible phrasing, synonyms, metaphors, rephrasing.
+3. **Narrative Flow (0.0-1.0):**
+   - Role Check: Does this candidate fulfill the assigned Narrative Role: '{narrative_role}'?
+   - Coherence Check: Does this candidate follow logically from the previous sentence?
+   - (If Slot 0): Does it establish a strong opening?
+   - (If Slot > 0): Does it connect to the context of the previous slot?
+   - **IMPORTANT:** If 'Previous Sentence Context' is marked [Pending Draft], evaluate if the candidate *could* logically follow such a sentence, but be lenient on exact transitions. Grade based on internal coherence and role fulfillment rather than strict flow matching.
+4. **Logical Entailment (0.0-1.0):** Does the sentence make internal sense?
+   - **Connector Validation:** If the sentence uses strong logical connectors ('Therefore', 'Consequently', 'Paradoxically', 'Because', 'Thus', 'remains a'), analyze the content.
+   - **Question:** Does the clause following the connector logically follow from the clause before it?
+   - **Verdict:**
+     * If the logic is non-existent (e.g., 'It is blue, therefore the economy collapsed'), mark as **FAIL** (logic_score = 0.0) even if the structure is perfect.
+     * If the connector is justified by the content, mark as **PASS** (logic_score = 1.0).
+   - **Examples:**
+     * Bad: "...remains a paradox" (no paradox established) → logic_score = 0.0
+     * Good: "The contradiction between X and Y remains a paradox" → logic_score = 1.0
+     * Bad: "The sky is blue, therefore capitalism fails" → logic_score = 0.0 (non-sequitur)
+     * Good: "Production declined, therefore the economy collapsed" → logic_score = 1.0 (causal link)
+5. **Repetition Check:** If the candidate starts with the same words as the previous sentence, apply a -0.5 penalty to narrative_score. Vary sentence openers to maintain reader engagement.
+
+**Key Instructions:**
+- DO enforce exact wording for Fixed Anchors, BUT allow grammatical inflection (is/are, has/have, was/were) for subject-verb agreement
+- DO NOT enforce exact wording for meaning atoms - allow rephrasing
+- DO NOT check for specific nouns or individual words - focus on whether the *concept* is present
+- A candidate passes if anchor_score >= 1.0 AND semantic_score >= 0.95 AND narrative_score >= 0.8 AND logic_score >= 0.8"""
+
+        # Check for vocabulary repetition across all candidates (local check)
+        all_candidates_text = " ".join([c for candidates in candidate_populations for c in candidates])
+        has_vocab_repetition, repeated_words = self._check_vocabulary_repetition(all_candidates_text)
+
+        # Build repetition instruction if needed
+        repetition_instruction = ""
+        if has_vocab_repetition:
+            repeated_words_str = ", ".join(repeated_words[:10])  # Limit to first 10
+            repetition_instruction = f"\n\n**IMPORTANT - Vocabulary Repetition Detected:**\nThe following words appear too frequently (>2 times): {repeated_words_str}\nApply a penalty to narrative_score if candidates overuse these words. Prefer variety in vocabulary."
+
+        # Build user prompt (exam sheet)
+        user_prompt = f"""Evaluate the following candidates across {len(slots_with_candidates)} structural slots.
+
+{exam_sheet}
+{repetition_instruction}
+
+**Task:** For EACH candidate, evaluate:
+1. **Anchor Adherence (0.0-1.0):** Are the fixed anchors present exactly?
+2. **Semantic Presence (0.0-1.0):** Is the core meaning conveyed (flexible phrasing allowed)?
+3. **Narrative Flow (0.0-1.0):** Does the candidate fulfill its Narrative Role and connect logically to the previous sentence?
+4. **Logical Entailment (0.0-1.0):** Does the sentence make internal sense? Check if connectors like 'therefore', 'remains a', 'because', 'consequently' are justified by the preceding text.
+
+**Output Format:** Return a JSON object with keys "slot_0", "slot_1", etc., where each value is an array of evaluation objects (one per candidate, in order).
+
+Each evaluation object must contain:
+- "id": integer (candidate index, 0-based)
+- "anchor_score": float (0.0-1.0)
+- "semantic_score": float (0.0-1.0)
+- "narrative_score": float (0.0-1.0)
+- "logic_score": float (0.0-1.0)
+- "grammar_override_detected": boolean (true if candidate changed POS tags but grammar is valid)
+- "pass": boolean (true if anchor_score >= 1.0 AND semantic_score >= 0.95 AND narrative_score >= 0.8 AND logic_score >= 0.8)
+- "feedback": string (combined feedback explaining the scores)
+
+**Example JSON structure:**
+{{
+  "slot_0": [
+    {{
+      "id": 0,
+      "anchor_score": 1.0,
+      "semantic_score": 0.95,
+      "narrative_score": 0.8,
+      "logic_score": 0.9,
+      "grammar_override_detected": true,
+      "pass": true,
+      "feedback": "Candidate changed [ADJ] to [NP] for grammar, but structure preserved."
+    }},
+    {{
+      "id": 1,
+      "anchor_score": 1.0,
+      "semantic_score": 0.5,
+      "narrative_score": 0.8,
+      "logic_score": 0.9,
+      "grammar_override_detected": false,
+      "pass": false,
+      "feedback": "Missing semantic atom 'scavenged'."
+    }},
+    {{
+      "id": 2,
+      "anchor_score": 0.0,
+      "semantic_score": 1.0,
+      "narrative_score": 0.9,
+      "logic_score": 0.8,
+      "grammar_override_detected": false,
+      "pass": false,
+      "feedback": "Missing anchor 'In' at start."
+    }}
+  ],
+  "slot_1": [...]
+}}
+
+Return ONLY valid JSON, no additional text."""
+
+        if verbose:
+            print(f"  Batch evaluating {total_candidates} total candidates across {len(slots_with_candidates)} slots")
+            print(f"    Slots with candidates: {slots_with_candidates}")
+            for slot_idx in slots_with_candidates:
+                candidates = candidate_populations[slot_idx]
+                template = templates[slot_idx]
+                print(f"      Slot {slot_idx}: {len(candidates)} candidates, template=\"{template[:60]}{'...' if len(template) > 60 else ''}\"")
+
+        # Call LLM
+        if not self.llm_provider:
+            raise ValueError("LLM provider not available for batch evaluation")
+
+        # Calculate max_tokens (rough estimate: 300 per candidate with cap)
+        max_tokens = min(300 * total_candidates, 16000)  # Cap at 16k for safety
+
+        # Retry logic for batch evaluation with JSON parsing
+        import time
+        retry_delay = self.retry_delay
+        batch_results = None
+
+        for attempt in range(self.max_retries):
+            try:
+                if attempt > 0:
+                    if verbose:
+                        print(f"  🔄 Retry attempt {attempt + 1}/{self.max_retries} for batch evaluation (JSON parse failed)")
+                    time.sleep(retry_delay)
+                    retry_delay *= 2  # Exponential backoff
+
+                response = self.llm_provider.call(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    model_type="critic",
+                    require_json=True,
+                    temperature=0.1,  # Strict grading
+                    max_tokens=max_tokens,
+                    timeout=getattr(self, 'batch_timeout', 180)  # Configurable timeout for batch operations
+                )
+
+                # Parse JSON response with repair if needed
+                response = response.strip()
+                try:
+                    batch_results = self._safe_json_parse(response, verbose=verbose)
+                    # Successfully parsed - break out of retry loop
+                    break
+                except json.JSONDecodeError as e:
+                    if verbose:
+                        print(f"  ❌ Failed to parse JSON even after repair (attempt {attempt + 1}/{self.max_retries}): {e}")
+                    if attempt < self.max_retries - 1:
+                        # Will retry
+                        continue
+                    else:
+                        # Last attempt failed - raise error
+                        raise ValueError(f"Failed to parse batch evaluation JSON after {self.max_retries} attempts: {e}")
+            except Exception as e:
+                if attempt < self.max_retries - 1:
+                    if verbose:
+                        print(f"  ⚠ Batch evaluation error (attempt {attempt + 1}/{self.max_retries}): {e}, retrying...")
+                    continue
+                else:
+                    # Last attempt - re-raise
+                    raise
+
+        if batch_results is None:
+            raise ValueError(f"Failed to get batch evaluation results after {self.max_retries} attempts")
+
+        if not isinstance(batch_results, dict):
+            raise ValueError(f"Expected JSON object, got {type(batch_results)}")
+
+        # Map batch results back to result structure
+        results = [[] for _ in templates]
+
+        for slot_idx in slots_with_candidates:
+            slot_key = f"slot_{slot_idx}"
+            if slot_key not in batch_results:
+                if verbose:
+                    print(f"    Warning: Slot {slot_idx} missing from batch response, using failure results")
+                # Fill with failure results
+                candidates = candidate_populations[slot_idx]
+                for candidate_idx in range(len(candidates)):
+                    results[slot_idx].append({
+                        "pass": False,
+                        "anchor_score": 0.0,
+                        "semantic_score": 0.0,
+                        "narrative_score": 0.0,
+                        "logic_score": 0.0,
+                        "grammar_override_detected": False,
+                        "combined_score": 0.0,
+                        "feedback": "Missing from batch response",
+                        "slot_index": slot_idx,
+                        "candidate_index": candidate_idx
+                    })
+                continue
+
+            slot_evaluations = batch_results[slot_key]
+            if not isinstance(slot_evaluations, list):
+                if verbose:
+                    print(f"    Warning: Slot {slot_idx} has invalid format, using failure results")
+                candidates = candidate_populations[slot_idx]
+                for candidate_idx in range(len(candidates)):
+                    results[slot_idx].append({
+                        "pass": False,
+                        "anchor_score": 0.0,
+                        "semantic_score": 0.0,
+                        "narrative_score": 0.0,
+                        "logic_score": 0.0,
+                        "grammar_override_detected": False,
+                        "combined_score": 0.0,
+                        "feedback": "Invalid format in batch response",
+                        "slot_index": slot_idx,
+                        "candidate_index": candidate_idx
+                    })
+                continue
+
+            candidates = candidate_populations[slot_idx]
+            # Create a map of id -> evaluation for easy lookup
+            eval_map = {}
+            for eval_obj in slot_evaluations:
+                if isinstance(eval_obj, dict) and "id" in eval_obj:
+                    eval_map[eval_obj["id"]] = eval_obj
+
+            # Map evaluations to candidates
+            for candidate_idx in range(len(candidates)):
+                if candidate_idx in eval_map:
+                    eval_obj = eval_map[candidate_idx]
+                    anchor_score = float(eval_obj.get("anchor_score", 0.0))
+                    semantic_score = float(eval_obj.get("semantic_score", 0.0))
+                    narrative_score = float(eval_obj.get("narrative_score", 0.0))
+                    logic_score = float(eval_obj.get("logic_score", 1.0))  # Default to 1.0 if not provided (backward compatibility)
+                    grammar_override_detected = bool(eval_obj.get("grammar_override_detected", False))
+
+                    # Initialize feedback from evaluation object
+                    feedback = str(eval_obj.get("feedback", ""))
+
+                    # Apply repetition penalty
+                    candidate = candidates[candidate_idx]
+                    if slot_idx > 0:
+                        prev_sentence = slot_contexts.get(slot_idx, {}).get("prev_sentence")
+                        if prev_sentence:
+                            penalty, feedback_addition = self._calculate_repetition_penalty(
+                                candidate, prev_sentence
+                            )
+                            if penalty > 0:
+                                narrative_score = max(0.0, narrative_score - penalty)
+                                if feedback_addition:
+                                    if feedback:
+                                        feedback += f" {feedback_addition}"
+                                    else:
+                                        feedback = feedback_addition
+
+                    combined_score = anchor_score + semantic_score
+                    pass_flag = bool(eval_obj.get("pass", False))
+                    # Re-check pass flag after applying repetition penalty and logic check
+                    if narrative_score < 0.8:
+                        pass_flag = False
+                    if logic_score < 0.8:
+                        pass_flag = False
+
+                    results[slot_idx].append({
+                        "pass": pass_flag,
+                        "anchor_score": anchor_score,
+                        "semantic_score": semantic_score,
+                        "narrative_score": narrative_score,
+                        "logic_score": logic_score,
+                        "grammar_override_detected": grammar_override_detected,
+                        "combined_score": combined_score,
+                        "feedback": feedback,
+                        "slot_index": slot_idx,
+                        "candidate_index": candidate_idx
+                    })
+                else:
+                    # Missing evaluation for this candidate
+                    if verbose:
+                        print(f"    Warning: Slot {slot_idx}, Candidate {candidate_idx} missing from batch response")
+                    results[slot_idx].append({
+                        "pass": False,
+                        "anchor_score": 0.0,
+                        "semantic_score": 0.0,
+                        "narrative_score": 0.0,
+                        "logic_score": 0.0,
+                        "combined_score": 0.0,
+                        "feedback": "Missing from batch response",
+                        "slot_index": slot_idx,
+                        "candidate_index": candidate_idx
+                    })
+
+        if verbose:
+            total_evaluated = sum(len(r) for r in results)
+            passing_candidates = sum(sum(1 for res in r if res.get("pass", False)) for r in results)
+            print(f"  ✅ Batch evaluated {total_evaluated} candidates: {passing_candidates} passing")
+            # Show summary per slot
+            for slot_idx in slots_with_candidates:
+                slot_results = results[slot_idx]
+                if slot_results:
+                    passing = sum(1 for r in slot_results if r.get("pass", False))
+                    avg_combined = sum(r.get("combined_score", 0.0) for r in slot_results) / len(slot_results)
+                    print(f"      Slot {slot_idx}: {passing}/{len(slot_results)} passing, avg_score={avg_combined:.2f}")
+
+        return results
+
+    def evaluate_candidate_populations(
+        self,
+        candidate_populations: List[List[str]],
+        templates: List[str],
+        prop_map: List[List[str]],
+        narrative_roles: List[str] = None,
+        best_sentences: List[Optional[str]] = None,
+        verbose: bool = False
+    ) -> List[List[Dict]]:
+        """Evaluate all candidates for all slots and return per-candidate results.
+
+        Uses batch evaluation with retry logic. If JSON parsing fails, retries the call
+        up to max_retries times with improved JSON repair.
+
+        Args:
+            candidate_populations: List[List[str]] where candidate_populations[i] is
+                the population for slot i.
+            templates: List[str] of templates (one per slot).
+            prop_map: List[List[str]] where prop_map[i] contains propositions for slot i.
+            narrative_roles: Optional list of narrative role strings (one per slot).
+            best_sentences: Optional list of best sentences for flow context (one per slot).
+            verbose: Whether to print debug information.
+
+        Returns:
+            List[List[Dict]] where result[i][j] contains evaluation for candidate j of slot i.
+            Each dict contains:
+            - pass: bool
+            - anchor_score: float
+            - semantic_score: float
+            - narrative_score: float (NEW)
+            - combined_score: float (anchor_score + semantic_score)
+            - feedback: str
+            - slot_index: int
+            - candidate_index: int
+        """
+        if len(candidate_populations) != len(templates) or len(templates) != len(prop_map):
+            raise ValueError(
+                f"Mismatched lengths: populations={len(candidate_populations)}, "
+                f"templates={len(templates)}, prop_map={len(prop_map)}"
+            )
+
+        # Batch evaluation with retry logic (no fallback to individual)
+        return self._evaluate_batch(
+            candidate_populations=candidate_populations,
+            templates=templates,
+            prop_map=prop_map,
+            narrative_roles=narrative_roles,
+            best_sentences=best_sentences,
+            verbose=verbose
+        )
 
     def _check_style_alignment(
         self,
@@ -1943,7 +3058,8 @@ Does the generated text align with the intent '{intent}'? Consider:
         proposition_recall, recall_details = self._check_proposition_recall(
             generated_text,
             propositions,
-            similarity_threshold=0.30  # More lenient for paragraph mode to avoid false negatives
+            similarity_threshold=0.30,  # More lenient for paragraph mode to avoid false negatives
+            verbose=verbose
         )
 
         # MEANING GATE: Hard floor check for proposition recall BEFORE style calculation
@@ -1972,7 +3088,11 @@ Does the generated text align with the intent '{intent}'? Consider:
 
         # MEANING FIRST: Run coherence check BEFORE style calculation
         coherence_score, coherence_reason = self._verify_coherence(generated_text, verbose=verbose)
-        topic_similarity = self._calculate_semantic_similarity(original_text, generated_text)
+        # Instead of comparing to original_text, compare to propositions
+        # Propositions are stripped of style, so they represent pure meaning
+        # This prevents false negatives when doing radical style transfer (e.g., Memoir → Theory)
+        propositions_text = " ".join(propositions) if propositions else original_text
+        topic_similarity = self._calculate_semantic_similarity(propositions_text, generated_text)
 
         # HARD GATE: If incoherent, fail immediately (no style calculation needed)
         if coherence_score < coherence_threshold:

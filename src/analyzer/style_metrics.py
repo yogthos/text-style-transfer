@@ -72,7 +72,8 @@ def _get_dependency_depth_spacy(text: str) -> Optional[int]:
 
         # Try to load spaCy model
         try:
-            nlp = spacy.load("en_core_web_sm")
+            from src.utils.nlp_manager import NLPManager
+            nlp = NLPManager.get_nlp()
         except OSError:
             # Model not installed, return None to use NLTK fallback
             return None

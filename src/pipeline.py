@@ -11,7 +11,8 @@ This module implements the pipeline that:
 import json
 import re
 from pathlib import Path
-from typing import List, Optional, Callable
+from typing import List, Optional, Callable, Dict
+from concurrent.futures import ThreadPoolExecutor
 from src.ingestion.blueprint import SemanticBlueprint, BlueprintExtractor
 from src.atlas.rhetoric import RhetoricalType, RhetoricalClassifier
 from src.generator.translator import StyleTranslator
@@ -22,6 +23,7 @@ from src.analyzer.style_extractor import StyleExtractor
 from src.analysis.semantic_analyzer import PropositionExtractor
 from src.utils.structure_tracker import StructureTracker
 from src.analyzer.global_context import GlobalContextAnalyzer
+from src.utils.nlp_manager import NLPManager
 
 
 def _split_into_paragraphs(text: str) -> List[str]:
@@ -115,6 +117,106 @@ def _split_into_sentences_safe(paragraph: str) -> List[str]:
     return sentences
 
 
+def _prepare_paragraphs_parallel(
+    paragraphs: List[str],
+    atlas: StyleAtlas,
+    author_name: str,
+    extractor: BlueprintExtractor,
+    proposition_extractor: PropositionExtractor,
+    translator: StyleTranslator,
+    classifier: RhetoricalClassifier,
+    verbose: bool = False
+) -> List[Dict]:
+    """Prepare all paragraphs in parallel (proposition extraction, mapping, skeleton retrieval).
+
+    This function performs independent operations in parallel:
+    - Extract propositions
+    - Extract blueprints
+    - Classify rhetorical type
+    - Retrieve skeletons (uses cache from Phase 1.2)
+
+    Args:
+        paragraphs: List of paragraph strings to prepare
+        atlas: StyleAtlas instance for skeleton retrieval
+        author_name: Author name for skeleton retrieval
+        extractor: BlueprintExtractor instance
+        proposition_extractor: PropositionExtractor instance
+        translator: StyleTranslator instance (for skeleton retrieval)
+        classifier: RhetoricalClassifier instance
+        verbose: Enable verbose logging
+
+    Returns:
+        List of preparation results, one per paragraph. Each dict contains:
+        - paragraph: str - Original paragraph text
+        - propositions: List[str] - Extracted propositions
+        - blueprint: SemanticBlueprint - Extracted blueprint
+        - rhetorical_type: RhetoricalType - Classified rhetorical type
+        - templates: List[str] - Retrieved sentence templates
+        - teacher_example: str - Teacher example used for templates
+    """
+    def prepare_paragraph(para_idx: int, paragraph: str) -> Dict:
+        """Prepare a single paragraph (runs in parallel)."""
+        try:
+            # Extract propositions
+            propositions = proposition_extractor.extract_atomic_propositions(paragraph)
+
+            # Extract blueprint
+            blueprint = extractor.extract(paragraph)
+
+            # Classify rhetoric
+            rhetorical_type = classifier.classify_heuristic(paragraph)
+
+            # Retrieve skeleton (uses cache from Phase 1.2)
+            try:
+                teacher_example, templates = translator._retrieve_robust_skeleton(
+                    rhetorical_type=rhetorical_type.value if hasattr(rhetorical_type, 'value') else str(rhetorical_type),
+                    author=author_name,
+                    prop_count=len(propositions),
+                    atlas=atlas,
+                    verbose=verbose
+                )
+            except Exception as e:
+                if verbose:
+                    print(f"  Warning: Skeleton retrieval failed for para {para_idx}: {e}")
+                templates = ["[NP] [VP] [NP]."]  # Fallback
+                teacher_example = None
+
+            return {
+                'paragraph': paragraph,
+                'propositions': propositions,
+                'blueprint': blueprint,
+                'rhetorical_type': rhetorical_type,
+                'templates': templates,
+                'teacher_example': teacher_example
+            }
+        except Exception as e:
+            if verbose:
+                print(f"  Error preparing paragraph {para_idx}: {e}")
+            # Return minimal result on error
+            return {
+                'paragraph': paragraph,
+                'propositions': [],
+                'blueprint': None,
+                'rhetorical_type': RhetoricalType.OBSERVATION,
+                'templates': ["[NP] [VP] [NP]."],
+                'teacher_example': None
+            }
+
+    # Execute in parallel
+    if verbose:
+        print(f"  Preparing {len(paragraphs)} paragraphs in parallel...")
+
+    with ThreadPoolExecutor(max_workers=4) as executor:
+        futures = [executor.submit(prepare_paragraph, idx, para)
+                  for idx, para in enumerate(paragraphs)]
+        results = [f.result() for f in futures]
+
+    if verbose:
+        print(f"  ✅ Prepared {len(results)} paragraphs")
+
+    return results
+
+
 def process_text(
     input_text: str,
     atlas: StyleAtlas,
@@ -140,6 +242,18 @@ def process_text(
     Returns:
         List of generated paragraphs (each paragraph is a space-joined string of sentences).
     """
+    # Initialize spaCy model early (shared across all components)
+    if verbose:
+        print("Initializing NLP pipeline...")
+    try:
+        NLPManager.get_nlp()
+        if verbose:
+            print("✅ NLP pipeline ready")
+    except Exception as e:
+        if verbose:
+            print(f"⚠ Warning: spaCy model not available: {e}")
+            print("  Some features may be limited")
+
     # Read blending configuration
     try:
         import json
@@ -225,6 +339,37 @@ def process_text(
     # Structure tracking for paragraph diversity
     structure_tracker = StructureTracker()
     total_paragraphs = len(paragraphs)
+
+    # Prepare all paragraphs in parallel (proposition extraction, skeleton retrieval)
+    # This optimizes independent operations before sequential evolution
+    prepared_paragraphs = _prepare_paragraphs_parallel(
+        paragraphs=paragraphs,
+        atlas=atlas,
+        author_name=author_name,
+        extractor=extractor,
+        proposition_extractor=proposition_extractor,
+        translator=translator,
+        classifier=classifier,
+        verbose=verbose
+    )
+
+    # Create a mapping from paragraph index to prepared data
+    paragraph_prep_map = {idx: prep for idx, prep in enumerate(prepared_paragraphs)}
+
+    # Batch proposition mapping for paragraphs with same rhetorical type
+    # Group paragraphs by rhetorical type
+    paragraphs_by_type = {}
+    for idx, prep in enumerate(prepared_paragraphs):
+        rt = prep['rhetorical_type']
+        rt_key = rt.value if hasattr(rt, 'value') else str(rt)
+        if rt_key not in paragraphs_by_type:
+            paragraphs_by_type[rt_key] = []
+        paragraphs_by_type[rt_key].append((idx, prep))
+
+    # For paragraphs with same rhetorical type, we could batch map propositions
+    # However, since each paragraph has different templates and narrative roles,
+    # batching would require significant refactoring. For now, we keep individual mapping
+    # but the preparation (proposition extraction, skeleton retrieval) is already parallelized
 
     # Context tracking for contextual anchoring
     previous_generated_text = ""
@@ -330,142 +475,148 @@ def process_text(
                 position = "BODY"
 
             # Translate paragraph holistically
+            generated_paragraph, teacher_rhythm_map, teacher_example, internal_recall = translator.translate_paragraph(
+                paragraph,
+                atlas,
+                author_name,
+                style_dna=style_dna_dict,
+                position=position,
+                structure_tracker=structure_tracker,
+                used_examples=used_examples,
+                secondary_author=secondary_author,
+                blend_ratio=blend_ratio,
+                verbose=verbose,
+                global_context=global_context,
+                is_opener=(para_idx == 0)
+            )
+
+            # Use internal_recall from translator (includes repair loop context and relaxed thresholds)
+            # Re-evaluate to get coherence and topic similarity scores for sanity gate
+            # Load thresholds from config for tiered evaluation
             try:
-                generated_paragraph, teacher_rhythm_map, teacher_example, internal_recall = translator.translate_paragraph(
-                    paragraph,
-                    atlas,
-                    author_name,
-                    style_dna=style_dna_dict,
-                    position=position,
-                    structure_tracker=structure_tracker,
-                    used_examples=used_examples,
-                    secondary_author=secondary_author,
-                    blend_ratio=blend_ratio,
-                    verbose=verbose,
-                    global_context=global_context,
-                    is_opener=(para_idx == 0)
-                )
+                with open(config_path, 'r') as f:
+                    config = json.load(f)
+                paragraph_fusion_config = config.get("paragraph_fusion", {})
+                ideal_threshold = paragraph_fusion_config.get("proposition_recall_threshold", 0.85)
+                min_viable = paragraph_fusion_config.get("min_viable_recall_threshold", 0.70)
+                coherence_threshold = paragraph_fusion_config.get("coherence_threshold", 0.8)
+                topic_similarity_threshold = paragraph_fusion_config.get("topic_similarity_threshold", 0.6)
+            except Exception:
+                # Fallback to defaults if config read fails
+                ideal_threshold = 0.85
+                min_viable = 0.70
+                coherence_threshold = 0.8
+                topic_similarity_threshold = 0.6
 
-                # Use internal_recall from translator (includes repair loop context and relaxed thresholds)
-                # Re-evaluate to get coherence and topic similarity scores for sanity gate
-                # Load thresholds from config for tiered evaluation
-                try:
-                    with open(config_path, 'r') as f:
-                        config = json.load(f)
-                    paragraph_fusion_config = config.get("paragraph_fusion", {})
-                    ideal_threshold = paragraph_fusion_config.get("proposition_recall_threshold", 0.85)
-                    min_viable = paragraph_fusion_config.get("min_viable_recall_threshold", 0.70)
-                    coherence_threshold = paragraph_fusion_config.get("coherence_threshold", 0.8)
-                    topic_similarity_threshold = paragraph_fusion_config.get("topic_similarity_threshold", 0.6)
-                except Exception:
-                    # Fallback to defaults if config read fails
-                    ideal_threshold = 0.85
-                    min_viable = 0.70
-                    coherence_threshold = 0.8
-                    topic_similarity_threshold = 0.6
-
-                # Re-evaluate final paragraph to get coherence and topic similarity
-                # (These are expensive checks that only run on promising candidates)
-                # Note: critic and proposition_extractor are already initialized at function start
+            # Re-evaluate final paragraph to get coherence and topic similarity
+            # (These are expensive checks that only run on promising candidates)
+            # Use prepared data if available (from parallel preparation)
+            prep_data = paragraph_prep_map.get(para_idx)
+            if prep_data:
+                propositions = prep_data['propositions']
+                blueprint = prep_data['blueprint']
+            else:
+                # Fallback: extract if not prepared
                 propositions = proposition_extractor.extract_atomic_propositions(paragraph)
-
-                # Create blueprint for evaluation
                 blueprint = extractor.extract(paragraph)
 
-                # Re-evaluate to get coherence and topic similarity
-                critic_result = critic.evaluate(
-                    generated_text=generated_paragraph,
-                    input_blueprint=blueprint,
-                    propositions=propositions,
-                    is_paragraph=True,
-                    author_style_vector=None,  # Not needed for coherence check
-                    style_lexicon=None
-                )
+            # Re-evaluate to get coherence and topic similarity
+            critic_result = critic.evaluate(
+                generated_text=generated_paragraph,
+                input_blueprint=blueprint,
+                propositions=propositions,
+                is_paragraph=True,
+                author_style_vector=None,  # Not needed for coherence check
+                style_lexicon=None
+            )
 
-                # Get coherence and topic similarity from critic result
-                coherence_score = critic_result.get('coherence_score', 1.0)
-                topic_similarity = critic_result.get('topic_similarity', 1.0)
+            # Get coherence and topic similarity from critic result
+            coherence_score = critic_result.get('coherence_score', 1.0)
+            topic_similarity = critic_result.get('topic_similarity', 1.0)
 
-                # internal_recall is already available from translate_paragraph return value
-                # This is the best recall achieved during the repair loop, with proper context
+            # internal_recall is already available from translate_paragraph return value
+            # This is the best recall achieved during the repair loop, with proper context
 
-                # Tiered evaluation logic with sanity gate
-                if internal_recall >= ideal_threshold and coherence_score >= coherence_threshold and topic_similarity >= topic_similarity_threshold:
-                    # Scenario A: Perfect Pass (high recall, coherent, and preserves topic)
-                    if verbose:
-                        print(f"  ✓ Fusion Success: Recall {internal_recall:.2f} >= {ideal_threshold}, Coherence {coherence_score:.2f} >= {coherence_threshold}, Topic similarity {topic_similarity:.2f} >= {topic_similarity_threshold}")
-                    # Override critic_result to ensure pass=True
-                    critic_result["pass"] = True
-                    critic_result["score"] = 1.0  # Perfect score
-                    pass_status = "PERFECT PASS"
-                elif internal_recall >= ideal_threshold:
-                    # High recall but low coherence/similarity = gibberish
-                    if verbose:
-                        print(f"  ⚠ High recall ({internal_recall:.2f}) but coherence ({coherence_score:.2f}) or topic similarity ({topic_similarity:.2f}) too low")
-                    pass_status = "COHERENCE FAIL"
-                    critic_result["pass"] = False
-                    # Don't override score - let it reflect the failure
-
-                elif internal_recall >= min_viable:
-                    # Scenario B: Soft Pass (The Fix)
-                    if verbose:
-                        print(f"  ⚠ Soft Pass: Recall {internal_recall:.2f} is below ideal ({ideal_threshold}) but viable (>= {min_viable}). Accepting.")
-                    # Create critic_result for soft pass
-                    critic_result = {"pass": True, "score": 0.8, "proposition_recall": internal_recall}
-                    pass_status = "SOFT PASS"
-
-                else:
-                    # Scenario C: Hard Fail -> Trigger Sentence-by-Sentence Fallback
-                    if verbose:
-                        print(f"  ✗ Fusion Failed: Recall {internal_recall:.2f} below viability floor ({min_viable}).")
-                    # Create a minimal critic_result for logging consistency
-                    critic_result = {"pass": False, "score": 0.0, "proposition_recall": internal_recall}
-                    pass_status = "HARD FAIL"
-
-                # Logging with status indicator
+            # Tiered evaluation logic with sanity gate
+            if internal_recall >= ideal_threshold and coherence_score >= coherence_threshold and topic_similarity >= topic_similarity_threshold:
+                # Scenario A: Perfect Pass (high recall, coherent, and preserves topic)
                 if verbose:
-                    pass_value = critic_result.get('pass', False)
-                    # Color codes: green for Perfect/Soft Pass, red for Hard Fail
-                    if pass_value:
-                        pass_color = '\033[92m'  # Green
-                    else:
-                        pass_color = '\033[91m'  # Red
-                    reset_color = '\033[0m'
-                    pass_str = f"{pass_color}{pass_value}{reset_color}"
-                    composite_score = critic_result.get('score', 0.0)
-                    print(f"  Paragraph fusion result: {pass_status}, pass={pass_str}, "
-                          f"recall={internal_recall:.2f}, "
-                          f"composite_score={composite_score:.2f}")
-
-                # Use generated paragraph if it passes (Perfect or Soft Pass), otherwise fall back
-                if critic_result.get('pass', False):
-                    # Record structure for diversity tracking
-                    if teacher_rhythm_map:
-                        from src.analyzer.structuralizer import generate_structure_signature
-                        signature = generate_structure_signature(teacher_rhythm_map)
-                        structure_tracker.add_structure(signature, teacher_rhythm_map)
-
-                    # Track teacher example to prevent reuse
-                    if teacher_example:
-                        used_examples.add(teacher_example)
-
-                    generated_paragraphs.append(generated_paragraph)
-                    if write_callback:
-                        # Each paragraph is a new paragraph (except we track is_first_paragraph separately)
-                        is_new_paragraph = True
-                        write_callback(generated_paragraph, is_new_paragraph, is_first_paragraph)
-                        if is_first_paragraph:
-                            is_first_paragraph = False
-                    previous_generated_text = generated_paragraph  # Update context
-                    continue  # Skip sentence-by-sentence processing
-                else:
-                    if verbose:
-                        print(f"  Paragraph fusion failed, falling back to sentence-by-sentence")
-                    # Fall through to sentence-by-sentence processing
-            except Exception as e:
+                    print(f"  ✓ Fusion Success: Recall {internal_recall:.2f} >= {ideal_threshold}, Coherence {coherence_score:.2f} >= {coherence_threshold}, Topic similarity {topic_similarity:.2f} >= {topic_similarity_threshold}")
+                # Override critic_result to ensure pass=True
+                critic_result["pass"] = True
+                critic_result["score"] = 1.0  # Perfect score
+                pass_status = "PERFECT PASS"
+            elif internal_recall >= ideal_threshold:
+                # High recall but low coherence/similarity = gibberish
                 if verbose:
-                    print(f"  Paragraph fusion error: {e}, falling back to sentence-by-sentence")
-                # Fall through to sentence-by-sentence processing
+                    print(f"  ⚠ High recall ({internal_recall:.2f}) but coherence ({coherence_score:.2f}) or topic similarity ({topic_similarity:.2f}) too low")
+                pass_status = "COHERENCE FAIL"
+                critic_result["pass"] = False
+                # Don't override score - let it reflect the failure
+
+            elif internal_recall >= min_viable:
+                # Scenario B: Soft Pass (The Fix)
+                if verbose:
+                    print(f"  ⚠ Soft Pass: Recall {internal_recall:.2f} is below ideal ({ideal_threshold}) but viable (>= {min_viable}). Accepting.")
+                # Create critic_result for soft pass
+                critic_result = {"pass": True, "score": 0.8, "proposition_recall": internal_recall}
+                pass_status = "SOFT PASS"
+
+            else:
+                # Scenario C: Hard Fail -> Skip paragraph (no fallback)
+                if verbose:
+                    print(f"  ✗ Fusion Failed: Recall {internal_recall:.2f} below viability floor ({min_viable}).")
+                # Create a minimal critic_result for logging consistency
+                critic_result = {"pass": False, "score": 0.0, "proposition_recall": internal_recall}
+                pass_status = "HARD FAIL"
+
+            # Logging with status indicator
+            if verbose:
+                pass_value = critic_result.get('pass', False)
+                # Color codes: green for Perfect/Soft Pass, red for Hard Fail
+                if pass_value:
+                    pass_color = '\033[92m'  # Green
+                else:
+                    pass_color = '\033[91m'  # Red
+                reset_color = '\033[0m'
+                pass_str = f"{pass_color}{pass_value}{reset_color}"
+                composite_score = critic_result.get('score', 0.0)
+                print(f"  Paragraph fusion result: {pass_status}, pass={pass_str}, "
+                      f"recall={internal_recall:.2f}, "
+                      f"composite_score={composite_score:.2f}")
+
+            # Use generated paragraph if it passes (Perfect or Soft Pass), otherwise skip
+            if critic_result.get('pass', False):
+                # Record structure for diversity tracking
+                if teacher_rhythm_map:
+                    from src.analyzer.structuralizer import generate_structure_signature
+                    signature = generate_structure_signature(teacher_rhythm_map)
+                    structure_tracker.add_structure(signature, teacher_rhythm_map)
+
+                # Track teacher example to prevent reuse
+                if teacher_example:
+                    used_examples.add(teacher_example)
+
+                generated_paragraphs.append(generated_paragraph)
+                if write_callback:
+                    # Each paragraph is a new paragraph (except we track is_first_paragraph separately)
+                    is_new_paragraph = True
+                    write_callback(generated_paragraph, is_new_paragraph, is_first_paragraph)
+                    if is_first_paragraph:
+                        is_first_paragraph = False
+                previous_generated_text = generated_paragraph  # Update context
+                continue  # Move to next paragraph
+            else:
+                # Paragraph fusion failed - skip this paragraph (no fallback)
+                if verbose:
+                    print(f"  ✗ Skipping paragraph {para_idx + 1}: Paragraph fusion failed (no fallback)")
+                # Skip to next paragraph - do not process sentence-by-sentence
+                continue
+
+        # This code should never be reached if paragraph fusion is used
+        # It's kept for backwards compatibility if paragraph fusion is disabled
+        if verbose:
+            print(f"  ⚠ Warning: Processing paragraph {para_idx + 1} sentence-by-sentence (paragraph fusion not used)")
 
         generated_sentences = []
 
@@ -783,6 +934,9 @@ def run_pipeline(
     Returns:
         List of generated paragraphs (each paragraph is a space-joined string of sentences).
     """
+    # Note: NLP pipeline initialization is handled by process_text() which is called below
+    # No need to initialize here to avoid duplicate initialization messages
+
     # Load input text
     if input_text is None:
         if input_file is None:

@@ -20,7 +20,7 @@ from src.validator.semantic_critic import SemanticCritic
 from src.atlas.builder import StyleAtlas, load_atlas
 from src.atlas.style_registry import StyleRegistry
 from src.analyzer.style_extractor import StyleExtractor
-from src.analysis.semantic_analyzer import PropositionExtractor
+# PropositionExtractor removed in Phase 1 - replaced by SemanticTranslator
 from src.utils.structure_tracker import StructureTracker
 from src.analyzer.global_context import GlobalContextAnalyzer
 from src.utils.nlp_manager import NLPManager
@@ -122,7 +122,7 @@ def _prepare_paragraphs_parallel(
     atlas: StyleAtlas,
     author_name: str,
     extractor: BlueprintExtractor,
-    proposition_extractor: PropositionExtractor,
+    proposition_extractor,  # Removed - no longer used
     translator: StyleTranslator,
     classifier: RhetoricalClassifier,
     verbose: bool = False
@@ -297,7 +297,7 @@ def process_text(
     translator = StyleTranslator(config_path=config_path)
     critic = SemanticCritic(config_path=config_path)
     style_extractor = StyleExtractor(config_path=config_path)
-    proposition_extractor = PropositionExtractor(config_path=config_path)
+    # PropositionExtractor removed - no longer needed
 
     # Split into paragraphs first
     paragraphs = _split_into_paragraphs(input_text)
@@ -340,40 +340,12 @@ def process_text(
     structure_tracker = StructureTracker()
     total_paragraphs = len(paragraphs)
 
-    # Prepare all paragraphs in parallel (proposition extraction, skeleton retrieval)
-    # This optimizes independent operations before sequential evolution
-    prepared_paragraphs = _prepare_paragraphs_parallel(
-        paragraphs=paragraphs,
-        atlas=atlas,
-        author_name=author_name,
-        extractor=extractor,
-        proposition_extractor=proposition_extractor,
-        translator=translator,
-        classifier=classifier,
-        verbose=verbose
-    )
+    # Track previous archetype ID for Markov chain continuity
+    prev_archetype_id = None
 
-    # Create a mapping from paragraph index to prepared data
-    paragraph_prep_map = {idx: prep for idx, prep in enumerate(prepared_paragraphs)}
-
-    # Batch proposition mapping for paragraphs with same rhetorical type
-    # Group paragraphs by rhetorical type
-    paragraphs_by_type = {}
-    for idx, prep in enumerate(prepared_paragraphs):
-        rt = prep['rhetorical_type']
-        rt_key = rt.value if hasattr(rt, 'value') else str(rt)
-        if rt_key not in paragraphs_by_type:
-            paragraphs_by_type[rt_key] = []
-        paragraphs_by_type[rt_key].append((idx, prep))
-
-    # For paragraphs with same rhetorical type, we could batch map propositions
-    # However, since each paragraph has different templates and narrative roles,
-    # batching would require significant refactoring. For now, we keep individual mapping
-    # but the preparation (proposition extraction, skeleton retrieval) is already parallelized
-
-    # Context tracking for contextual anchoring
-    previous_generated_text = ""
+    # Track previous paragraph ID for context reset
     previous_paragraph_id = -1
+    previous_generated_text = ""
 
     for para_idx, paragraph in enumerate(paragraphs):
         if verbose:
@@ -440,472 +412,40 @@ def process_text(
                         is_first_paragraph = False
                 continue  # Skip restyling for this paragraph
 
-        # Check if this is a multi-sentence paragraph (use paragraph fusion)
-        is_multi_sentence = len(sentences) > 1
-        min_sentences_for_fusion = 2
-        if paragraph_fusion_config.get("enabled", True):
-            min_sentences_for_fusion = paragraph_fusion_config.get("min_sentences_for_fusion", 2)
-
-        # Use paragraph fusion if enabled and paragraph has multiple sentences
-        if is_multi_sentence and len(sentences) >= min_sentences_for_fusion:
-            if verbose:
-                print(f"  Using paragraph fusion mode ({len(sentences)} sentences)")
-
-            # Extract style DNA from examples
-            style_dna_dict = None
-            try:
-                # Get examples for style extraction
-                examples = atlas.get_examples_by_rhetoric(
-                    RhetoricalType.OBSERVATION,
-                    top_k=5,
-                    author_name=author_name,
-                    query_text=paragraph
-                )
-                if examples:
-                    style_dna_dict = style_extractor.extract_style_dna(examples)
-            except Exception:
-                pass
-
-            # Determine paragraph position (OPENER, BODY, CLOSER)
-            if para_idx == 0:
-                position = "OPENER"
-            elif para_idx == total_paragraphs - 1:
-                position = "CLOSER"
-            else:
-                position = "BODY"
-
-            # Translate paragraph holistically
-            generated_paragraph, teacher_rhythm_map, teacher_example, internal_recall = translator.translate_paragraph(
-                paragraph,
-                atlas,
-                author_name,
-                style_dna=style_dna_dict,
-                position=position,
-                structure_tracker=structure_tracker,
-                used_examples=used_examples,
-                secondary_author=secondary_author,
-                blend_ratio=blend_ratio,
-                verbose=verbose,
-                global_context=global_context,
-                is_opener=(para_idx == 0)
-            )
-
-            # Use internal_recall from translator (includes repair loop context and relaxed thresholds)
-            # Re-evaluate to get coherence and topic similarity scores for sanity gate
-            # Load thresholds from config for tiered evaluation
-            try:
-                with open(config_path, 'r') as f:
-                    config = json.load(f)
-                paragraph_fusion_config = config.get("paragraph_fusion", {})
-                ideal_threshold = paragraph_fusion_config.get("proposition_recall_threshold", 0.85)
-                min_viable = paragraph_fusion_config.get("min_viable_recall_threshold", 0.70)
-                coherence_threshold = paragraph_fusion_config.get("coherence_threshold", 0.8)
-                topic_similarity_threshold = paragraph_fusion_config.get("topic_similarity_threshold", 0.6)
-            except Exception:
-                # Fallback to defaults if config read fails
-                ideal_threshold = 0.85
-                min_viable = 0.70
-                coherence_threshold = 0.8
-                topic_similarity_threshold = 0.6
-
-            # Re-evaluate final paragraph to get coherence and topic similarity
-            # (These are expensive checks that only run on promising candidates)
-            # Use prepared data if available (from parallel preparation)
-            prep_data = paragraph_prep_map.get(para_idx)
-            if prep_data:
-                propositions = prep_data['propositions']
-                blueprint = prep_data['blueprint']
-            else:
-                # Fallback: extract if not prepared
-                propositions = proposition_extractor.extract_atomic_propositions(paragraph)
-                blueprint = extractor.extract(paragraph)
-
-            # Re-evaluate to get coherence and topic similarity
-            critic_result = critic.evaluate(
-                generated_text=generated_paragraph,
-                input_blueprint=blueprint,
-                propositions=propositions,
-                is_paragraph=True,
-                author_style_vector=None,  # Not needed for coherence check
-                style_lexicon=None
-            )
-
-            # Get coherence and topic similarity from critic result
-            coherence_score = critic_result.get('coherence_score', 1.0)
-            topic_similarity = critic_result.get('topic_similarity', 1.0)
-
-            # internal_recall is already available from translate_paragraph return value
-            # This is the best recall achieved during the repair loop, with proper context
-
-            # Tiered evaluation logic with sanity gate
-            if internal_recall >= ideal_threshold and coherence_score >= coherence_threshold and topic_similarity >= topic_similarity_threshold:
-                # Scenario A: Perfect Pass (high recall, coherent, and preserves topic)
-                if verbose:
-                    print(f"  ✓ Fusion Success: Recall {internal_recall:.2f} >= {ideal_threshold}, Coherence {coherence_score:.2f} >= {coherence_threshold}, Topic similarity {topic_similarity:.2f} >= {topic_similarity_threshold}")
-                # Override critic_result to ensure pass=True
-                critic_result["pass"] = True
-                critic_result["score"] = 1.0  # Perfect score
-                pass_status = "PERFECT PASS"
-            elif internal_recall >= ideal_threshold:
-                # High recall but low coherence/similarity = gibberish
-                if verbose:
-                    print(f"  ⚠ High recall ({internal_recall:.2f}) but coherence ({coherence_score:.2f}) or topic similarity ({topic_similarity:.2f}) too low")
-                pass_status = "COHERENCE FAIL"
-                critic_result["pass"] = False
-                # Don't override score - let it reflect the failure
-
-            elif internal_recall >= min_viable:
-                # Scenario B: Soft Pass (The Fix)
-                if verbose:
-                    print(f"  ⚠ Soft Pass: Recall {internal_recall:.2f} is below ideal ({ideal_threshold}) but viable (>= {min_viable}). Accepting.")
-                # Create critic_result for soft pass
-                critic_result = {"pass": True, "score": 0.8, "proposition_recall": internal_recall}
-                pass_status = "SOFT PASS"
-
-            else:
-                # Scenario C: Hard Fail -> Skip paragraph (no fallback)
-                if verbose:
-                    print(f"  ✗ Fusion Failed: Recall {internal_recall:.2f} below viability floor ({min_viable}).")
-                # Create a minimal critic_result for logging consistency
-                critic_result = {"pass": False, "score": 0.0, "proposition_recall": internal_recall}
-                pass_status = "HARD FAIL"
-
-            # Logging with status indicator
-            if verbose:
-                pass_value = critic_result.get('pass', False)
-                # Color codes: green for Perfect/Soft Pass, red for Hard Fail
-                if pass_value:
-                    pass_color = '\033[92m'  # Green
-                else:
-                    pass_color = '\033[91m'  # Red
-                reset_color = '\033[0m'
-                pass_str = f"{pass_color}{pass_value}{reset_color}"
-                composite_score = critic_result.get('score', 0.0)
-                print(f"  Paragraph fusion result: {pass_status}, pass={pass_str}, "
-                      f"recall={internal_recall:.2f}, "
-                      f"composite_score={composite_score:.2f}")
-
-            # Use generated paragraph if it passes (Perfect or Soft Pass), otherwise skip
-            if critic_result.get('pass', False):
-                # Record structure for diversity tracking
-                if teacher_rhythm_map:
-                    from src.analyzer.structuralizer import generate_structure_signature
-                    signature = generate_structure_signature(teacher_rhythm_map)
-                    structure_tracker.add_structure(signature, teacher_rhythm_map)
-
-                # Track teacher example to prevent reuse
-                if teacher_example:
-                    used_examples.add(teacher_example)
-
-                generated_paragraphs.append(generated_paragraph)
-                if write_callback:
-                    # Each paragraph is a new paragraph (except we track is_first_paragraph separately)
-                    is_new_paragraph = True
-                    write_callback(generated_paragraph, is_new_paragraph, is_first_paragraph)
-                    if is_first_paragraph:
-                        is_first_paragraph = False
-                previous_generated_text = generated_paragraph  # Update context
-                continue  # Move to next paragraph
-            else:
-                # Paragraph fusion failed - skip this paragraph (no fallback)
-                if verbose:
-                    print(f"  ✗ Skipping paragraph {para_idx + 1}: Paragraph fusion failed (no fallback)")
-                # Skip to next paragraph - do not process sentence-by-sentence
-                continue
-
-        # This code should never be reached if paragraph fusion is used
-        # It's kept for backwards compatibility if paragraph fusion is disabled
+        # Use statistical paragraph generation
         if verbose:
-            print(f"  ⚠ Warning: Processing paragraph {para_idx + 1} sentence-by-sentence (paragraph fusion not used)")
+            print(f"  Using statistical paragraph generation mode")
 
-        generated_sentences = []
+        # Translate paragraph using statistical archetype generation
+        generated_paragraph, arch_id, compliance_score = translator.translate_paragraph_statistical(
+            paragraph,
+            author_name,
+            prev_archetype_id=prev_archetype_id,
+            verbose=verbose
+        )
 
-        for sent_idx, sentence in enumerate(sentences):
-            # Determine position in paragraph
-            if len(sentences) == 1:
-                position = "SINGLETON"
-            elif sent_idx == 0:
-                position = "OPENER"
-            elif sent_idx == len(sentences) - 1:
-                position = "CLOSER"
-            else:
-                position = "BODY"
+        # Update previous archetype ID for Markov chain continuity
+        prev_archetype_id = arch_id
 
-            if verbose:
-                print(f"  Position: {position}")
-                if previous_generated_text:
-                    print(f"  Previous context: {previous_generated_text[:50]}...")
-            # DEBUG: Verify sentence is unique
-            sentence_hash = hash(sentence)
-            if verbose:
-                print(f"\n  [{sent_idx + 1}/{len(sentences)}] Sentence: {sentence[:50]}{'...' if len(sentence) > 50 else ''}")
-                print(f"  DEBUG: Sentence hash: {sentence_hash}")
+        # Check compliance score
+        if verbose:
+            print(f"  Compliance score: {compliance_score:.2f}")
 
-            # Check for duplicate input sentences (shouldn't happen, but verify)
-            if sent_idx > 0:
-                prev_sentences = [s for i, s in enumerate(sentences) if i < sent_idx]
-                if sentence in prev_sentences:
-                    print(f"  ⚠ WARNING: Duplicate input sentence detected at index {sent_idx}!")
-                    if verbose:
-                        print(f"    This sentence appeared at indices: {[i for i, s in enumerate(sentences) if s == sentence]}")
+        # Accept the generated paragraph
+        if verbose:
+            print(f"  ✓ Generated paragraph accepted")
 
-            # Step 1: Extract blueprint with positional metadata
-            try:
-                blueprint = extractor.extract(
-                    sentence,
-                    paragraph_id=para_idx,
-                    position=position,
-                    previous_context=previous_generated_text
-                )
-                # DEBUG: Verify blueprint is unique
-                blueprint_hash = hash(str(blueprint.svo_triples) + str(blueprint.core_keywords))
-                if verbose:
-                    print(f"  Blueprint:")
-                    print(f"    Subjects: {blueprint.get_subjects()}")
-                    print(f"    Verbs: {blueprint.get_verbs()}")
-                    print(f"    Objects: {blueprint.get_objects()}")
-                    keywords_list = sorted(list(blueprint.core_keywords))
-                    print(f"    Keywords: {keywords_list[:10]}{'...' if len(keywords_list) > 10 else ''}")
-                    print(f"  DEBUG: Blueprint hash: {blueprint_hash}")
-            except Exception as e:
-                print(f"Warning: Failed to extract blueprint from '{sentence}': {e}")
-                # Fallback: use original sentence
-                # Check for duplicate before appending
-                if sentence in generated_sentences:
-                    print(f"  ⚠ WARNING: Duplicate generated sentence detected (fallback)!")
-                generated_sentences.append(sentence)
-                continue
+        generated_paragraphs.append(generated_paragraph)
 
-            # Step 2: Classify rhetoric
-            rhetorical_type = classifier.classify_heuristic(sentence)
-            if verbose:
-                print(f"  Rhetorical Type: {rhetorical_type.value}")
+        # Write paragraph if callback provided
+        if write_callback:
+            is_new_paragraph = True
+            write_callback(generated_paragraph, is_new_paragraph, is_first_paragraph)
+            if is_first_paragraph:
+                is_first_paragraph = False
 
-            # Step 3: Retrieve examples (exclude previously used ones)
-            # Pass sentence as query_text for length window filtering
-            # Fetch 15 examples to provide wide net for filtering
-            examples = atlas.get_examples_by_rhetoric(
-                rhetorical_type,
-                top_k=15,
-                author_name=author_name,
-                exclude=list(used_examples),
-                query_text=sentence
-            )
-            if not examples:
-                # Fallback to any examples from same author
-                examples = atlas.get_examples_by_rhetoric(
-                    RhetoricalType.OBSERVATION,
-                    top_k=15,
-                    author_name=author_name,
-                    exclude=list(used_examples),
-                    query_text=sentence
-                )
-                if not examples:
-                    # Ultimate fallback: empty examples (translator will handle it)
-                    examples = []
-
-            # Track used examples
-            used_examples.update(examples)
-
-            if verbose:
-                print(f"  Examples retrieved: {len(examples)}")
-                for i, ex in enumerate(examples[:2]):
-                    print(f"    Example {i+1}: {ex[:80]}{'...' if len(ex) > 80 else ''}")
-
-            # Step 3.5: Extract style DNA from examples (RAG-driven)
-            style_dna_dict = None
-            style_lexicon = None
-            if examples:
-                try:
-                    style_dna_dict = style_extractor.extract_style_dna(examples)
-                    style_lexicon = style_dna_dict.get("lexicon", [])
-                    if verbose:
-                        print(f"  Style DNA extracted:")
-                        print(f"    Lexicon: {', '.join(style_lexicon[:5])}{'...' if len(style_lexicon) > 5 else ''}")
-                        print(f"    Tone: {style_dna_dict.get('tone', 'N/A')}")
-                        print(f"    Structure: {style_dna_dict.get('structure', 'N/A')[:60]}...")
-                except Exception as e:
-                    if verbose:
-                        print(f"  ⚠ Style DNA extraction failed: {e}")
-                    style_dna_dict = None
-                    style_lexicon = None
-
-            # Step 4: Generate initial draft
-            result = None
-            generated = None
-
-            try:
-                # Generate initial draft (examples already retrieved above)
-
-                # Generate initial draft
-                generated = translator.translate(
-                    blueprint=blueprint,
-                    author_name=author_name,
-                    style_dna=style_dna,
-                    rhetorical_type=rhetorical_type,
-                    examples=examples,
-                    verbose=verbose
-                )
-
-                if verbose:
-                    print(f"  Generated (initial draft): {generated}")
-
-                # Step 5: Validate initial draft (with style whitelist)
-                result = critic.evaluate(generated, blueprint, allowed_style_words=style_lexicon)
-
-                if verbose:
-                    print(f"  Critic Result: pass={result['pass']}, score={result['score']:.2f}")
-                    print(f"    Recall: {result['recall_score']:.2f}, Precision: {result['precision_score']:.2f}")
-                    if not result['pass']:
-                        print(f"    Feedback: {result['feedback']}")
-
-                # If initial draft fails, evolve it using hill climbing
-                if not result["pass"]:
-                    if verbose:
-                        print(f"  ↻ Initial draft failed, evolving with hill climbing...")
-
-                    try:
-                        generated, final_score = translator._evolve_text(
-                            initial_draft=generated,
-                            blueprint=blueprint,
-                            author_name=author_name,
-                            style_dna=style_dna,
-                            rhetorical_type=rhetorical_type,
-                            initial_score=result["score"],
-                            initial_feedback=result["feedback"],
-                            critic=critic,
-                            verbose=verbose,
-                            style_dna_dict=style_dna_dict,
-                            examples=examples
-                        )
-
-                        # Re-evaluate evolved draft
-                        result = critic.evaluate(generated, blueprint)
-
-                        if verbose:
-                            print(f"  Evolution Result: pass={result['pass']}, score={result['score']:.2f}")
-                            if result['pass']:
-                                print(f"    ✓ Evolution successful: Score improved to {result['score']:.2f}")
-                                print(f"    Evolved text: {generated}")
-                            else:
-                                print(f"    ✗ Evolution failed: Final score {result['score']:.2f}")
-                                print(f"    Evolved text: {generated}")
-                    except Exception as e:
-                        if verbose:
-                            print(f"  ⚠ Evolution failed with exception: {e}")
-                        # Continue with initial draft
-
-            except Exception as e:
-                print(f"Warning: Initial generation failed: {e}")
-                result = None
-
-            # Step 6: Accept or fallback
-            # Soft Landing: If we have a decent draft (Score >= 0.75), KEEP IT.
-            # This prevents throwing away good work (e.g., 0.81 scores) just because pass=False
-            if result and result.get("score", 0.0) >= 0.75:
-                # Accept even if pass=False - score >= 0.75 is good enough
-                # DEBUG: Before appending, verify we haven't seen this before
-                if generated in generated_sentences:
-                    print(f"  ⚠ WARNING: Duplicate generated sentence detected!")
-                    if verbose:
-                        print(f"    Generated text: {generated[:80]}...")
-                        print(f"    This sentence was already generated at an earlier index")
-                        # Find where it was first generated
-                        first_idx = next(i for i, s in enumerate(generated_sentences) if s == generated)
-                        print(f"    First occurrence was at sentence index {first_idx}")
-                    # Skip duplicate - don't append again
-                    if verbose:
-                        print(f"  ✓ Accepted (but skipped duplicate)")
-                else:
-                    generated_sentences.append(generated)
-                    current_paragraph_sentences.append(generated)
-
-                    # Update context for next iteration
-                    previous_generated_text = generated
-
-                    # Write sentence immediately if callback provided
-                    if write_callback:
-                        is_new_paragraph = (sent_idx == 0)
-                        write_callback(generated, is_new_paragraph, is_first_paragraph)
-                        if is_new_paragraph and is_first_paragraph:
-                            is_first_paragraph = False
-
-                    if verbose:
-                        pass_status = "PASS" if result.get("pass", False) else "SOFT PASS"
-                        print(f"  ✓ Accepted ({pass_status}, score: {result.get('score', 0.0):.2f}): {generated}")
-            elif result and result.get("score", 0.0) < 0.60:
-                # Evolution failed or initial generation failed, use literal translation fallback
-                # Lowered threshold to 0.60 to avoid discarding "diamonds in the rough" (good style, minor issues)
-                if verbose:
-                    print(f"  ↻ Evolution/Generation failed (score < 0.60), using literal translation")
-                try:
-                    # Pass rhetorical_type and examples for style-preserving fallback
-                    generated = translator.translate_literal(
-                        blueprint=blueprint,
-                        author_name=author_name,
-                        style_dna=style_dna,
-                        rhetorical_type=rhetorical_type,
-                        examples=examples
-                    )
-                    if verbose:
-                        print(f"  Style-preserving fallback: {generated}")
-
-                    # DEBUG: Check for duplicate before appending
-                    if generated in generated_sentences:
-                        print(f"  ⚠ WARNING: Duplicate generated sentence detected (literal fallback)!")
-                        if verbose:
-                            print(f"    Generated text: {generated[:80]}...")
-                    else:
-                        generated_sentences.append(generated)
-                        current_paragraph_sentences.append(generated)
-
-                        # Update context for next iteration
-                        previous_generated_text = generated
-
-                        # Write sentence immediately if callback provided
-                        if write_callback:
-                            is_new_paragraph = (sent_idx == 0)
-                            write_callback(generated, is_new_paragraph, is_first_paragraph)
-                            if is_new_paragraph and is_first_paragraph:
-                                is_first_paragraph = False
-
-                        if verbose:
-                            print(f"  ✓ Accepted (literal fallback): {generated}")
-                except Exception as e:
-                    print(f"Warning: Literal translation failed: {e}")
-                    # Ultimate fallback: use original sentence
-                    if verbose:
-                        print(f"  ↻ Using original sentence as fallback")
-
-                    # DEBUG: Check for duplicate before appending
-                    if sentence in generated_sentences:
-                        print(f"  ⚠ WARNING: Duplicate generated sentence detected (ultimate fallback)!")
-                    else:
-                        generated_sentences.append(sentence)
-                        current_paragraph_sentences.append(sentence)
-
-                        # Update context for next iteration (use original sentence as context)
-                        previous_generated_text = sentence
-
-                        # Write sentence immediately if callback provided
-                        if write_callback:
-                            is_new_paragraph = (sent_idx == 0)
-                            write_callback(sentence, is_new_paragraph, is_first_paragraph)
-                            if is_new_paragraph and is_first_paragraph:
-                                is_first_paragraph = False
-
-                        if verbose:
-                            print(f"  ✓ Accepted (original fallback): {sentence}")
-
-        # Join sentences within paragraph with spaces
-        if generated_sentences:
-            para_text = ' '.join(generated_sentences)
-            if verbose:
-                print(f"\n  Paragraph output: {para_text[:100]}{'...' if len(para_text) > 100 else ''}")
-            generated_paragraphs.append(para_text)
-
-            # Reset for next paragraph
-            current_paragraph_sentences = []
+        # Continue to next paragraph (old sentence-by-sentence logic removed)
+        continue
 
     return generated_paragraphs
 

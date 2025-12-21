@@ -11,6 +11,7 @@ import requests
 from pathlib import Path
 from typing import List, Tuple, Dict, Optional, Set, TYPE_CHECKING
 from dataclasses import dataclass
+from concurrent.futures import ThreadPoolExecutor, as_completed
 
 if TYPE_CHECKING:
     import numpy as np
@@ -29,8 +30,11 @@ from src.validator.semantic_critic import SemanticCritic
 from src.generator.mutation_operators import (
     get_operator, OP_SEMANTIC_INJECTION, OP_GRAMMAR_REPAIR, OP_STYLE_POLISH, OP_DYNAMIC_STYLE, OP_STRUCTURAL_CLONE
 )
-from src.analyzer.structuralizer import Structuralizer
-from src.analysis.semantic_analyzer import PropositionExtractor
+from src.atlas.paragraph_atlas import ParagraphAtlas
+from src.atlas.style_rag import StyleRAG
+from src.generator.semantic_translator import SemanticTranslator
+from src.validator.statistical_critic import StatisticalCritic
+from src.utils.nlp_manager import NLPManager
 
 
 def _load_prompt_template(template_name: str) -> str:
@@ -121,17 +125,25 @@ class StyleTranslator:
         self._nlp_cache = None
         # Initialize soft scorer for fitness-based evolution
         self.soft_scorer = SoftScorer(config_path=config_path)
-        # Initialize structuralizer for JIT structural templating
-        self.structuralizer = Structuralizer(config_path=config_path)
-        # Initialize proposition extractor for paragraph fusion
-        self.proposition_extractor = PropositionExtractor(config_path=config_path)
-        # Initialize structure extractor for template bleaching
-        from src.analyzer.structure_extractor import StructureExtractor
-        self.structure_extractor = StructureExtractor(config_path=config_path)
-        # Load paragraph fusion config
-        self.paragraph_fusion_config = self.config.get("paragraph_fusion", {})
         # Load LLM provider config (for retry settings)
         self.llm_provider_config = self.config.get("llm_provider", {})
+
+        # Initialize ParagraphAtlas and SemanticTranslator
+        atlas_path = self.config.get("paragraph_atlas", {}).get("path", "atlas_cache/paragraph_atlas")
+        # Author will be set when translate_paragraph_statistical is called
+        self.atlas_path = atlas_path
+        self.paragraph_atlas = None  # Will be initialized per-author
+        self.semantic_translator = SemanticTranslator(config_path=config_path)
+
+        # Initialize StyleRAG (lazy initialization per author)
+        self.style_rag = {}  # Dict keyed by author name
+
+        # Load generation config
+        self.generation_config = self.config.get("generation", {})
+
+        # Initialize statistical critic
+        self.statistical_critic = StatisticalCritic(config_path=config_path)
+
         # Initialize skeleton cache for atlas memorization
         self._skeleton_cache = {}  # Key: (author, rhetorical_type, prop_count_bucket) -> (teacher_example, templates)
 
@@ -3709,266 +3721,6 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
 
         return result
 
-    def _map_propositions_to_templates(
-        self,
-        propositions: List[str],
-        templates: List[str],
-        narrative_roles: List[str],
-        verbose: bool = False
-    ) -> List[List[str]]:
-        """Map propositions to template slots using LLM.
-
-        Assigns each proposition to exactly one template slot, ensuring every
-        template gets at least 1 proposition (strict 1:1 mapping).
-        Considers narrative roles to match propositions to appropriate rhetorical functions.
-
-        Args:
-            propositions: List of proposition strings to assign.
-            templates: List of template strings (one per sentence slot).
-            narrative_roles: List of narrative role strings (one per template slot).
-            verbose: Whether to print debug information.
-
-        Returns:
-            List of lists where index i contains propositions for template i.
-
-        Raises:
-            ValueError: If mapping fails after retries.
-        """
-        if not propositions:
-            raise ValueError("Cannot map propositions: propositions list is empty")
-        if not templates:
-            raise ValueError("Cannot map propositions: templates list is empty")
-        if not narrative_roles:
-            raise ValueError("Cannot map propositions: narrative_roles list is empty")
-        if len(narrative_roles) != len(templates):
-            raise ValueError(f"Mismatched lengths: templates={len(templates)}, narrative_roles={len(narrative_roles)}")
-
-        max_retries = self.llm_provider_config.get("max_retries", 3)
-        retry_delay = self.llm_provider_config.get("retry_delay", 2)
-
-        # Build prompt
-        system_prompt = """You are a Structural Architect constructing a logical narrative. Your task is to assign propositions to sentence templates.
-
-You will receive:
-- A list of propositions (atomic meaning units)
-- A list of sentence templates (structural blueprints)
-- A list of narrative roles (rhetorical function for each template)
-
-Your job: Assign every proposition to exactly one template where it fits best contextually, considering both semantic fit and narrative role alignment.
-
-**Critical Constraints:**
-1. **Role Alignment:** Prioritize matching facts to the Slot's Narrative Role (e.g., 'Evidence' facts -> 'Evidence' slot).
-2. **Load Balancing (CRITICAL):** Do NOT assign more than 3 propositions to a single slot.
-   - If a fact does not fit the available roles perfectly, assign it to the most logical 'Body' or 'Analysis' slot rather than overloading the perfect match.
-   - It is better to have a 'Setup' fact in a 'Body' slot than to break the sentence structure with too many facts.
-   - If a proposition does not fit the specific Narrative Role of the remaining slots, assign it to the slot where it can serve as *supporting context*, but do NOT overload any single slot (max 3 props).
-3. **Dependency Rule:** If two propositions are grammatically linked in the source (e.g., Action + Location like 'Scavenging in ruins', Cause + Effect, Subject + Modifier), you MUST assign them to the **SAME** template slot. Do not split dependent propositions.
-   - Before assigning, identify prepositional phrases, adverbial modifiers, and causal chains. Keep these together.
-   - Examples:
-     - Bad: Slot 1: 'Scavenging', Slot 2: 'In ruins'
-     - Good: Slot 1: 'Scavenging in ruins'
-4. **Subject Consistency Rule:** If multiple propositions share the same subject (e.g., 'The Soviet Union'), group them together rather than scattering them, unless you are creating a deliberate list. This maintains narrative coherence and prevents fragmented references to the same entity.
-5. Every proposition must be assigned to exactly one template
-6. Every template must receive at least 1 proposition
-
-Output format: JSON array of objects, each with:
-- "template_index": integer (0-based index of the template)
-- "propositions": array of strings (propositions assigned to this template)
-
-Example:
-[
-  {"template_index": 0, "propositions": ["Prop 1", "Prop 2"]},
-  {"template_index": 1, "propositions": ["Prop 3"]},
-  {"template_index": 2, "propositions": ["Prop 4", "Prop 5"]}
-]"""
-
-        # Build structure with roles
-        structure_lines = []
-        for i, (role, template) in enumerate(zip(narrative_roles, templates)):
-            structure_lines.append(f"{i}. Role: {role} | Template: {template}")
-
-        user_prompt = f"""Propositions ({len(propositions)} total):
-{chr(10).join(f"{i}. {prop}" for i, prop in enumerate(propositions))}
-
-Structure:
-{chr(10).join(structure_lines)}
-
-Assign each proposition to exactly one template. Every template must have at least 1 proposition.
-Ensure the facts assigned to each slot fit the role of that slot. If perfect role match is not possible, assign to the most compatible slot while maintaining load balance (max 3 props per slot).
-**Distribute propositions evenly** - avoid overloading any single template with more than 3 propositions.
-
-**CRITICAL:** Analyze each proposition for grammatical dependencies (prepositions, modifiers, causal links). If Proposition A modifies or depends on Proposition B, assign them to the same slot.
-
-**CRITICAL:** Identify propositions that share the same subject and group them together in the same template slot to maintain subject consistency.
-
-Return JSON array with template_index and propositions for each template."""
-
-        for attempt in range(max_retries):
-            try:
-                if verbose:
-                    if attempt > 0:
-                        print(f"  🔄 Retry attempt {attempt + 1}/{max_retries} for proposition mapping")
-                    else:
-                        print(f"  📤 Calling LLM for proposition mapping ({len(propositions)} props -> {len(templates)} templates)")
-
-                response = self.llm_provider.call(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    model_type="editor",
-                    require_json=True,
-                    temperature=0.3,  # Low temperature for consistent assignment
-                    max_tokens=self.translator_config.get("max_tokens", 1000)
-                )
-
-                if verbose:
-                    print(f"  📥 Received response ({len(response)} chars)")
-
-                # Parse JSON response
-                assignments = json.loads(response)
-                if not isinstance(assignments, list):
-                    raise ValueError(f"Expected JSON array, got {type(assignments)}")
-
-                # Build prop_map: List[List[str]] where index i is propositions for template i
-                prop_map = [[] for _ in templates]
-                assigned_props = set()
-
-                for assignment in assignments:
-                    if not isinstance(assignment, dict):
-                        continue
-                    template_idx = assignment.get("template_index")
-                    assigned_props_list = assignment.get("propositions", [])
-
-                    if template_idx is None or not isinstance(template_idx, int):
-                        continue
-                    if template_idx < 0 or template_idx >= len(templates):
-                        continue
-                    if not isinstance(assigned_props_list, list):
-                        continue
-
-                    # Add propositions to this template slot
-                    for prop in assigned_props_list:
-                        if isinstance(prop, str) and prop.strip():
-                            prop_map[template_idx].append(prop.strip())
-                            assigned_props.add(prop.strip())
-
-                # Post-process: Ensure every template gets at least 1 proposition
-                unassigned_props = [p for p in propositions if p not in assigned_props]
-
-                # Redistribute unassigned propositions
-                if unassigned_props:
-                    if verbose:
-                        print(f"  ⚠ Found {len(unassigned_props)} unassigned propositions, redistributing...")
-                    # Distribute evenly to templates with fewest propositions
-                    for prop in unassigned_props:
-                        # Find template with fewest propositions
-                        min_idx = min(range(len(prop_map)), key=lambda i: len(prop_map[i]))
-                        prop_map[min_idx].append(prop)
-
-                # Ensure every template has at least 1 proposition
-                empty_templates = [i for i, props in enumerate(prop_map) if not props]
-                if empty_templates:
-                    if verbose:
-                        print(f"  ⚠ Found {len(empty_templates)} empty templates, redistributing...")
-                    # Redistribute from templates with multiple propositions
-                    for empty_idx in empty_templates:
-                        # Find template with most propositions
-                        max_idx = max(range(len(prop_map)), key=lambda i: len(prop_map[i]) if i != empty_idx else -1)
-                        if prop_map[max_idx]:
-                            # Move one proposition from max to empty
-                            prop_map[empty_idx].append(prop_map[max_idx].pop())
-
-                # Final validation
-                all_assigned = all(len(props) > 0 for props in prop_map)
-                if not all_assigned:
-                    raise ValueError("Post-processing failed: some templates still have no propositions")
-
-                # Verify all propositions are assigned
-                all_props_assigned = set()
-                for props in prop_map:
-                    all_props_assigned.update(props)
-
-                # Check if all original propositions are accounted for (allowing for minor variations)
-                if len(all_props_assigned) < len(propositions) * 0.8:  # Allow 20% variation
-                    if verbose:
-                        print(f"  ⚠ Warning: Only {len(all_props_assigned)}/{len(propositions)} propositions assigned")
-
-                # Load balancing: Redistribute if any slot is overloaded
-                # Heuristic: If any slot has >50% of total propositions OR >3 propositions when others have ≤1
-                total_props = sum(len(props) for props in prop_map)
-                max_props = max(len(props) for props in prop_map) if prop_map else 0
-                min_props = min(len(props) for props in prop_map) if prop_map else 0
-
-                needs_redistribution = False
-                if max_props > 3 and min_props <= 1:
-                    # One slot has >3 props while others have ≤1
-                    needs_redistribution = True
-                elif max_props > total_props * 0.5 and len(prop_map) > 1:
-                    # One slot has >50% of all propositions
-                    needs_redistribution = True
-
-                if needs_redistribution:
-                    if verbose:
-                        print(f"  ⚠ Unbalanced distribution detected: {[len(props) for props in prop_map]}, redistributing...")
-
-                    # Find overloaded slots (those with >3 props or >50% of total)
-                    overloaded_slots = []
-                    for i, props in enumerate(prop_map):
-                        if len(props) > 3 or (len(props) > total_props * 0.5 and len(prop_map) > 1):
-                            overloaded_slots.append(i)
-
-                    # Redistribute from overloaded slots to underloaded ones
-                    for overloaded_idx in overloaded_slots:
-                        excess_props = prop_map[overloaded_idx][3:]  # Keep first 3, move the rest
-                        if not excess_props:
-                            continue
-
-                        # Remove excess from overloaded slot
-                        prop_map[overloaded_idx] = prop_map[overloaded_idx][:3]
-
-                        # Distribute excess to slots with fewest propositions
-                        for prop in excess_props:
-                            # Find slot with fewest propositions (excluding the overloaded one)
-                            min_idx = min(
-                                (i for i in range(len(prop_map)) if i != overloaded_idx),
-                                key=lambda i: len(prop_map[i]),
-                                default=None
-                            )
-                            if min_idx is not None:
-                                prop_map[min_idx].append(prop)
-                            else:
-                                # Fallback: put it back in the overloaded slot
-                                prop_map[overloaded_idx].append(prop)
-
-                    if verbose:
-                        print(f"  ✅ Redistributed to: {[len(props) for props in prop_map]} propositions per template")
-
-                if verbose:
-                    print(f"  ✅ Mapped propositions: {[len(props) for props in prop_map]} propositions per template")
-
-                return prop_map
-
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
-                if verbose:
-                    print(f"  ❌ Mapping failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    continue
-                else:
-                    raise ValueError(f"Failed to map propositions to templates after {max_retries} attempts: {e}")
-            except Exception as e:
-                if verbose:
-                    print(f"  ❌ Unexpected error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                    continue
-                else:
-                    raise ValueError(f"Unexpected error mapping propositions: {e}")
-
-        # Should never reach here, but just in case
-        raise ValueError("Failed to map propositions to templates")
-
     def _smooth_paragraph(
         self,
         draft_text: str,
@@ -4133,361 +3885,6 @@ Return JSON array with template_index and propositions for each template."""
                 print(f"  ⚠ Simplification pass failed: {e}, using original text")
             return draft_text
 
-    def _generate_candidate_populations(
-        self,
-        state: ParagraphState,
-        author_name: str,
-        style_dna: Optional[Dict],
-        population_size: int,
-        verbose: bool = False
-    ) -> List[List[str]]:
-        """Generate multiple candidates for UNLOCKED slots in one LLM call with neighbor context.
-
-        For each unlocked slot, provides context from neighboring slots (X-1, X+1) to ensure flow.
-        Uses locked best sentences if available, otherwise uses best candidates as placeholders.
-
-        Args:
-            state: ParagraphState containing current paragraph state.
-            author_name: Target author name.
-            style_dna: Optional style DNA dictionary.
-            population_size: Number of candidates to generate per unlocked slot.
-            verbose: Whether to print debug information.
-
-        Returns:
-            List[List[str]] where index i is the population for slot i (empty list for locked slots).
-
-        Raises:
-            ValueError: If generation fails.
-        """
-        # Identify unlocked slots
-        unlocked_slots = [i for i, locked in enumerate(state.locked_flags) if not locked]
-
-        if not unlocked_slots:
-            if verbose:
-                print("  All slots are locked, no candidates to generate")
-            return [[] for _ in state.templates]
-
-        if verbose:
-            print(f"  Generating candidates for {len(unlocked_slots)} unlocked slots (population_size={population_size})")
-
-        # Build context for each unlocked slot
-        slot_contexts = []
-        for slot_idx in unlocked_slots:
-            # Get previous context (Slot i-1)
-            prev_context = ""
-            if slot_idx > 0:
-                if state.locked_flags[slot_idx - 1] and state.best_sentences[slot_idx - 1]:
-                    prev_context = state.best_sentences[slot_idx - 1]
-                elif state.candidate_populations[slot_idx - 1]:
-                    # Use first candidate as placeholder (could be improved to use best scoring)
-                    prev_context = state.candidate_populations[slot_idx - 1][0]
-
-            # Get next context (Slot i+1)
-            next_context = ""
-            if slot_idx < len(state.templates) - 1:
-                if state.locked_flags[slot_idx + 1] and state.best_sentences[slot_idx + 1]:
-                    next_context = state.best_sentences[slot_idx + 1]
-                elif state.candidate_populations[slot_idx + 1]:
-                    # Use first candidate as placeholder
-                    next_context = state.candidate_populations[slot_idx + 1][0]
-
-            # Get narrative role for this slot
-            narrative_role = state.narrative_roles[slot_idx] if slot_idx < len(state.narrative_roles) else "BODY"
-
-            # Determine role with descriptive label
-            if slot_idx == 0:
-                role = "OPENER (Establish the context)"
-            elif slot_idx == len(state.templates) - 1:
-                role = "CLOSER (Summarize or conclude)"
-            else:
-                role = "BODY (Develop the argument)"
-
-            # Build context hint
-            prev_sentence_text = prev_context if prev_context else "None (Start of paragraph)"
-            context_hint = f"""
-**Paragraph Context:**
-- Position: Sentence {slot_idx + 1} of {len(state.templates)} ({role}).
-- Narrative Role: {narrative_role}
-- Previous Sentence: "{prev_sentence_text}"
-- Instruction: Write a sentence that fulfills the rhetorical function of '{narrative_role}' while connecting logically to the previous sentence.
-"""
-
-            slot_contexts.append({
-                "slot_index": slot_idx,
-                "role": role,
-                "template": state.templates[slot_idx],
-                "propositions": state.prop_map[slot_idx],
-                "prev_context": prev_context,
-                "next_context": next_context,
-                "context_hint": context_hint
-            })
-
-        # Extract synthesized feedback and elite candidate for each slot
-        for ctx in slot_contexts:
-            slot_idx = ctx['slot_index']
-            # Extract synthesized feedback and elite candidate if present
-            synthesized_feedback = None
-            elite_text = None
-            elite_feedback = None
-            if state.feedback[slot_idx]:
-                for fb in state.feedback[slot_idx]:
-                    if isinstance(fb, str):
-                        if fb.startswith("[SYNTHESIZED]"):
-                            synthesized_feedback = fb.replace("[SYNTHESIZED]", "").strip()
-                        elif fb.startswith("[ELITE_TEXT]"):
-                            elite_text = fb.replace("[ELITE_TEXT]", "").strip()
-                        elif fb.startswith("[ELITE_FEEDBACK]"):
-                            elite_feedback = fb.replace("[ELITE_FEEDBACK]", "").strip()
-            ctx['synthesized_feedback'] = synthesized_feedback
-            ctx['elite_text'] = elite_text
-            ctx['elite_feedback'] = elite_feedback
-
-        # Build prompt
-        system_prompt = """You are a Narrative Architect.
-
-**Task:** Write candidate sentences for each slot in a paragraph.
-
-For each unlocked slot, you will receive:
-- **Paragraph Context:** Position, role, narrative role, and flow instructions
-- **Template:** Structural blueprint (fixed anchors must be preserved)
-- **Propositions:** Meaning atoms to express
-- **Neighbor Context:** Previous and next sentences for flow
-
-**Style Translation Rule:** Do not use the literal phrasing of the propositions. You must **Elevate the Register** to match the Target Author's vocabulary and tone.
-- Examples:
-  - Input Prop: 'brought void and hunger'
-  - Target (Mao): 'precipitated a material crisis of subsistence'
-  - Target (Hemingway): 'left nothing but the empty stomach'
-- **Task:** Rewrite the proposition to fit the Template's Tone *before* inserting it. Translate the *meaning* of the proposition, not the words.
-
-**Grammar Supremacy Rule:**
-Grammar correctness ALWAYS overrides template tag requirements.
-- If the template says `[ADJ]` but your fact is a Noun, use it as a Noun.
-- If changing a tag from `[ADJ]` to `[NP]` makes the sentence grammatically correct, DO IT.
-- The template tags are GUIDELINES, not strict requirements.
-- **Your goal:** Create a grammatically perfect English sentence that conveys the meaning.
-
-**CRITICAL ANTI-PATTERNS (DO NOT DO THIS):**
-- ❌ "It is [ADV] the [NOUN] is [ADJ]" → Creates nonsense like "It is profoundly the ghost is historical"
-- ✅ Instead: "It is [ADV] that the [NOUN] is [ADJ]" OR restructure completely
-- ❌ Forcing adjectives where nouns belong just to match template tags
-- ✅ Use the correct part of speech for the concept, even if it doesn't match the template tag
-
-**Red Flags to Avoid:**
-- Sentences that sound like machine translation errors
-- Awkward constructions that prioritize template matching over natural English
-- Phrases that make no logical sense when read aloud
-
-**Constraints:**
-1. **Meaning:** Express the assigned propositions by *translating* their meaning into the target style, not by copying their wording. DO NOT paste proposition text literally. Transform it to match the author's register.
-2. **Structure:** Follow the template exactly (preserve fixed anchors)
-3. **Narrative Role:** Each slot has a Narrative Role that must be fulfilled (e.g., 'Theoretical Analysis', 'Evidence'). Your sentence must fulfill this rhetorical function.
-4. **Flow:** Connect logically to the previous sentence (DO NOT rewrite it)
-5. **Style:** Match the target author's voice
-6. **CRITICAL GRAMMAR RULE:** You must replace every `[NP]`, `[VP]`, `[ADJ]`, `[ADV]` placeholder with actual words. The result must be a complete, grammatical English sentence.
-   - BAD: "Consequently I can neither the small..." (Missing verb in [VP] slot)
-   - GOOD: "Consequently I can **tolerate** neither the small..." (Complete verb phrase)
-   - BAD: "In the ruins, there was..." (Incomplete, missing object)
-   - GOOD: "In the ruins, there was **scavenging**." (Complete sentence)
-   - DO NOT skip placeholders or leave them empty
-   - DO NOT create fragments or incomplete sentences
-   - Every placeholder must be filled with appropriate words
-
-7. **Grammar Overrides Template (ENHANCED):**
-   The template placeholders (e.g., `[ADJ]`, `[NP]`, `[VP]`) are suggestions for the *kind of complexity* required, not strict grammatical rules.
-   - **Grammar > Template Tags:** If adhering to the template tag would create nonsense, BREAK THE TEMPLATE TAG.
-   - If the template says `[ADJ]` but your fact is a Noun, **change it to a Noun**.
-   - If the template says `[NP]` but your fact is an Adjective, **change it to an Adjective**.
-   - **Constraint:** You must maintain the *sentence structure* (clauses, punctuation, word order), but you may swap Parts of Speech to create valid English.
-   - **DO NOT write nonsense** like "The ghost is historical" just to fit an `[ADJ]` slot. If "ghost" is a noun, use it as a noun.
-   - **CRITICAL EXAMPLE:** Template `It is [ADV] the "[ADJ]" is [ADJ]` with fact "ghost" →
-     * ❌ WRONG: `It is profoundly the "ghost" is historical` (gibberish - "the ghost is historical" makes no sense)
-     * ✅ CORRECT: `It is profoundly the ghost is historical` (noun in noun position, but still awkward)
-     * ✅ BEST: `It is profoundly that the ghost is historical` (restructured with "that" clause)
-     * ✅ ALTERNATIVE: `The ghost is profoundly historical` (complete restructure, grammar-first)
-
-**Output Format:** JSON object with keys for each slot:
-- "slot_0_plan": "Brief explanation of your approach (e.g., 'I need to convert the noun 'ghost' to fit the template structure...')"
-- "slot_0": ["Candidate 1", "Candidate 2", ...]
-- "slot_1_plan": "..."
-- "slot_1": [...]
-
-The `_plan` field forces you to think through the grammar/template trade-offs before generating.
-
-Example:
-{{
-  "slot_0_plan": "The template has [ADJ] but my fact is a noun 'ghost'. I'll restructure to use 'ghost' as a noun in a grammatically correct way.",
-  "slot_0": ["Candidate 1 for slot 0", "Candidate 2 for slot 0", ...],
-  "slot_1_plan": "The template requires [VP] but the proposition is a state. I'll use a verb form that captures the state.",
-  "slot_1": ["Candidate 1 for slot 1", "Candidate 2 for slot 1", ...]
-}}""".format(population_size=population_size)
-
-        user_prompt_parts = [
-            f"Original text: {state.original_text}",
-            "",
-            "Unlocked slots to generate:"
-        ]
-
-        # Build set of locked sentence texts to avoid duplicates
-        locked_texts = set()
-        for i, (locked, best) in enumerate(zip(state.locked_flags, state.best_sentences)):
-            if locked and best:
-                locked_texts.add(best.strip())
-
-        for ctx in slot_contexts:
-            user_prompt_parts.append(f"\nSlot {ctx['slot_index']} {ctx['role']}:")
-            user_prompt_parts.append(ctx['context_hint'])
-            user_prompt_parts.append(f"  Template: {ctx['template']}")
-            user_prompt_parts.append(f"  Propositions: {', '.join(ctx['propositions'])}")
-            # Only include next_context if it's not already in locked_sentences
-            if ctx['next_context'] and ctx['next_context'].strip() not in locked_texts:
-                user_prompt_parts.append(f"  Next sentence (for reference): {ctx['next_context']}")
-
-            # Add synthesized feedback if available
-            if ctx.get('synthesized_feedback'):
-                user_prompt_parts.append(f"  **Population Analysis:** {ctx['synthesized_feedback']}")
-
-            # Add elite candidate if available
-            if ctx.get('elite_text') and ctx.get('elite_feedback'):
-                user_prompt_parts.append(f"  **Best Previous Attempt (Near Miss):**")
-                user_prompt_parts.append(f"    Draft: '{ctx['elite_text']}'")
-                user_prompt_parts.append(f"    Error: {ctx['elite_feedback']}")
-                user_prompt_parts.append(f"    Task: Fix THIS specific error while preserving what worked.")
-
-        # Add locked slots context for global awareness
-        # Only include locked sentences that are adjacent to unlocked slots or the opener
-        locked_sentences = []
-        locked_indices = set()
-
-        # Always include opener (slot 0) if it exists and is locked
-        if state.locked_flags[0] and state.best_sentences[0]:
-            locked_sentences.append(f"Slot 0 (locked, opener): {state.best_sentences[0]}")
-            locked_indices.add(0)
-
-        # Include adjacent locked sentences (i-1, i+1) for each unlocked slot
-        for slot_idx in unlocked_slots:
-            # Previous slot (i-1)
-            if slot_idx > 0:
-                prev_idx = slot_idx - 1
-                if prev_idx not in locked_indices and state.locked_flags[prev_idx] and state.best_sentences[prev_idx]:
-                    locked_sentences.append(f"Slot {prev_idx} (locked, previous): {state.best_sentences[prev_idx]}")
-                    locked_indices.add(prev_idx)
-
-            # Next slot (i+1)
-            if slot_idx < len(state.templates) - 1:
-                next_idx = slot_idx + 1
-                if next_idx not in locked_indices and state.locked_flags[next_idx] and state.best_sentences[next_idx]:
-                    locked_sentences.append(f"Slot {next_idx} (locked, next): {state.best_sentences[next_idx]}")
-                    locked_indices.add(next_idx)
-
-        if locked_sentences:
-            user_prompt_parts.append("\nLocked sentences (for global context):")
-            user_prompt_parts.extend(locked_sentences)
-
-        # Add style DNA if available
-        if style_dna:
-            style_info = []
-            if style_dna.get("tone"):
-                style_info.append(f"Tone: {style_dna['tone']}")
-            if style_dna.get("lexicon"):
-                lexicon_sample = style_dna['lexicon'][:10] if isinstance(style_dna['lexicon'], list) else []
-                if lexicon_sample:
-                    style_info.append(f"Lexicon sample: {', '.join(lexicon_sample)}")
-            if style_info:
-                user_prompt_parts.append(f"\nStyle DNA: {', '.join(style_info)}")
-
-        user_prompt = "\n".join(user_prompt_parts)
-
-        # Call LLM
-        max_retries = self.llm_provider_config.get("max_retries", 3)
-        retry_delay = self.llm_provider_config.get("retry_delay", 2)
-        temperature = self.paragraph_fusion_config.get("generation_temperature", 0.7)
-
-        for attempt in range(max_retries):
-            try:
-                if verbose:
-                    if attempt > 0:
-                        print(f"  🔄 Retry attempt {attempt + 1}/{max_retries} for candidate generation")
-                    else:
-                        print(f"  📤 Calling LLM for candidate generation ({len(unlocked_slots)} slots, {population_size} candidates each)")
-
-                response = self.llm_provider.call(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    model_type="editor",
-                    require_json=True,
-                    temperature=temperature,
-                    max_tokens=self.translator_config.get("max_tokens", 2000)
-                )
-
-                if verbose:
-                    print(f"  📥 Received response ({len(response)} chars)")
-
-                # Parse JSON response
-                result = json.loads(response)
-                if not isinstance(result, dict):
-                    raise ValueError(f"Expected JSON object, got {type(result)}")
-
-                # Build populations: List[List[str]] where index i is population for slot i
-                populations = [[] for _ in state.templates]
-
-                for slot_idx in unlocked_slots:
-                    slot_key = f"slot_{slot_idx}"
-                    # Ignore _plan fields (Chain of Thought planning step)
-                    plan_key = f"slot_{slot_idx}_plan"
-
-                    # Extract plan if present (for potential logging/debugging, but not used)
-                    if plan_key in result and verbose:
-                        plan_text = result[plan_key]
-                        if plan_text:
-                            print(f"  📋 Slot {slot_idx} plan: {plan_text[:100]}{'...' if len(plan_text) > 100 else ''}")
-
-                    if slot_key in result and isinstance(result[slot_key], list):
-                        candidates = [str(c).strip() for c in result[slot_key] if c and str(c).strip()]
-                        # Ensure we have exactly population_size candidates
-                        if len(candidates) < population_size:
-                            if verbose:
-                                print(f"  ⚠ Slot {slot_idx}: Only {len(candidates)} candidates, expected {population_size}")
-                            # Pad with empty strings or repeat last candidate
-                            while len(candidates) < population_size:
-                                candidates.append(candidates[-1] if candidates else "")
-                        elif len(candidates) > population_size:
-                            candidates = candidates[:population_size]
-                        populations[slot_idx] = candidates
-                    else:
-                        if verbose:
-                            print(f"  ⚠ Slot {slot_idx}: Missing or invalid candidates in response")
-                        # Fallback: generate empty list (will be handled by evolution loop)
-                        populations[slot_idx] = []
-
-                if verbose:
-                    total_candidates = sum(len(p) for p in populations)
-                    print(f"  ✅ Generated {total_candidates} total candidates across {len(unlocked_slots)} slots")
-
-                return populations
-
-            except (json.JSONDecodeError, ValueError, KeyError) as e:
-                if verbose:
-                    print(f"  ❌ Generation failed: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 2  # Exponential backoff
-                    continue
-                else:
-                    raise ValueError(f"Failed to generate candidate populations after {max_retries} attempts: {e}")
-            except Exception as e:
-                if verbose:
-                    print(f"  ❌ Unexpected error: {e}")
-                if attempt < max_retries - 1:
-                    time.sleep(retry_delay)
-                    retry_delay *= 2
-                    continue
-                else:
-                    raise ValueError(f"Unexpected error generating candidates: {e}")
-
-        # Should never reach here
-        raise ValueError("Failed to generate candidate populations")
-
     def _sanity_check_candidates(
         self,
         candidates: List[str],
@@ -4543,624 +3940,510 @@ Example:
 
         return filtered
 
-    def _synthesize_slot_feedback(
-        self,
-        slot_results: List[Dict],
-        slot_candidates: List[str],
-        slot_template: str,
-        slot_propositions: List[str],
-        prev_context: Optional[str] = None,
-        verbose: bool = False
-    ) -> Tuple[Optional[str], Optional[str], Optional[str]]:
-        """Synthesize feedback from entire candidate population using elite forwarding.
-
-        Analyzes all candidates to identify partial successes and creates targeted
-        directives for the next generation. Uses "elite forwarding" - forwards entire
-        feedback strings from leader candidates rather than parsing them.
-
-        Args:
-            slot_results: List of evaluation result dicts (one per candidate)
-            slot_candidates: List of candidate sentence strings
-            slot_template: Template string for this slot
-            slot_propositions: List of propositions assigned to this slot
-            prev_context: Previous sentence context (for narrative flow)
-            verbose: Enable verbose logging
-
-        Returns:
-            Tuple of (directive_string, elite_candidate_text, elite_candidate_feedback)
-            Returns (None, None, None) if slot is passing or no candidates exist
-        """
-        if not slot_results or not slot_candidates:
-            return (None, None, None)
-
-        if len(slot_results) != len(slot_candidates):
-            if verbose:
-                print(f"      ⚠ Warning: Mismatch between results ({len(slot_results)}) and candidates ({len(slot_candidates)})")
-            return (None, None, None)
-
-        # Extract scores and identify leaders
-        structure_leader_idx = None
-        structure_leader_score = -1.0
-        meaning_leader_idx = None
-        meaning_leader_score = -1.0
-        logic_leader_idx = None
-        logic_leader_score = -1.0
-        max_narrative = -1.0
-
-        elite_failing_idx = None
-        elite_failing_score = -1.0
-
-        for idx, result in enumerate(slot_results):
-            anchor_score = result.get("anchor_score", 0.0)
-            semantic_score = result.get("semantic_score", 0.0)
-            narrative_score = result.get("narrative_score", 0.0)
-            logic_score = result.get("logic_score", 0.0)
-            combined_score = result.get("combined_score", 0.0)
-            passed = result.get("pass", False)
-
-            # Track leaders
-            if anchor_score > structure_leader_score:
-                structure_leader_score = anchor_score
-                structure_leader_idx = idx
-
-            if semantic_score > meaning_leader_score:
-                meaning_leader_score = semantic_score
-                meaning_leader_idx = idx
-
-            if logic_score > logic_leader_score:
-                logic_leader_score = logic_score
-                logic_leader_idx = idx
-
-            if narrative_score > max_narrative:
-                max_narrative = narrative_score
-
-            # Track best failing candidate (highest combined score that didn't pass)
-            if not passed and combined_score > elite_failing_score:
-                elite_failing_score = combined_score
-                elite_failing_idx = idx
-
-        # Check if slot is passing (all thresholds met)
-        if (structure_leader_score >= 1.0 and
-            meaning_leader_score >= 0.95 and
-            max_narrative >= 0.8 and
-            logic_leader_score >= 0.8):
-            if verbose:
-                print(f"      ✅ Slot is passing, no synthesis needed")
-            return (None, None, None)
-
-        # Build directive parts
-        directive_parts = []
-
-        # Structural failure
-        if structure_leader_idx is not None and structure_leader_score < 1.0:
-            structure_leader_feedback = slot_results[structure_leader_idx].get("feedback", "")
-            if structure_leader_feedback:
-                directive_parts.append(
-                    f"The best structural attempt (Candidate #{structure_leader_idx}) failed. "
-                    f"Feedback: {structure_leader_feedback}"
-                )
-
-        # Semantic failure
-        if meaning_leader_idx is not None and meaning_leader_score < 0.95:
-            meaning_leader_feedback = slot_results[meaning_leader_idx].get("feedback", "")
-            if meaning_leader_feedback:
-                directive_parts.append(
-                    f"The best semantic attempt (Candidate #{meaning_leader_idx}) failed. "
-                    f"Feedback: {meaning_leader_feedback}"
-                )
-
-        # Cross-pollination: if different leaders, suggest combining
-        if (structure_leader_idx is not None and
-            meaning_leader_idx is not None and
-            structure_leader_idx != meaning_leader_idx and
-            structure_leader_score < 1.0 and
-            meaning_leader_score < 0.95):
-            directive_parts.append(
-                f"Candidate #{structure_leader_idx} had good structure. "
-                f"Candidate #{meaning_leader_idx} had good meaning. Combine their strengths."
-            )
-
-        # Narrative failure
-        if max_narrative < 0.8:
-            if prev_context:
-                directive_parts.append(
-                    f"The narrative connection is weak. Ensure you connect to the previous sentence: '{prev_context}'."
-                )
-            else:
-                directive_parts.append(
-                    "The narrative connection is weak. Ensure proper flow and coherence."
-                )
-
-        # Logic failure
-        if logic_leader_idx is not None and logic_leader_score < 0.8:
-            logic_leader_feedback = slot_results[logic_leader_idx].get("feedback", "")
-            if logic_leader_feedback:
-                directive_parts.append(
-                    f"Logical coherence issue. Feedback: {logic_leader_feedback}"
-                )
-
-        # Combine directive parts
-        directive = " ".join(directive_parts) if directive_parts else None
-
-        # Get elite failing candidate
-        elite_text = None
-        elite_feedback = None
-        if elite_failing_idx is not None:
-            elite_text = slot_candidates[elite_failing_idx]
-            elite_feedback = slot_results[elite_failing_idx].get("feedback", "")
-
-        if verbose and directive:
-            print(f"      📊 Synthesized feedback: {directive[:100]}{'...' if len(directive) > 100 else ''}")
-            if elite_text:
-                print(f"      🏆 Elite candidate: {elite_text[:60]}{'...' if len(elite_text) > 60 else ''}")
-
-        return (directive, elite_text, elite_feedback)
-
-    def translate_paragraph(
+    def translate_paragraph_statistical(
         self,
         paragraph: str,
-        atlas,
         author_name: str,
-        style_dna: Optional[Dict] = None,
-        position: str = "BODY",
-        structure_tracker: Optional[object] = None,
-        used_examples: Optional[Set[str]] = None,
-        secondary_author: Optional[str] = None,
-        blend_ratio: float = 0.5,
-        verbose: bool = False,
-        global_context: Optional[Dict] = None,
-        is_opener: bool = False
-    ) -> tuple[str, Optional[List[Dict]], Optional[str], float]:
-        """Translate a paragraph holistically using paragraph fusion.
+        prev_archetype_id: Optional[int] = None,
+        verbose: bool = False
+    ) -> tuple[str, int, float]:
+        """Translate paragraph using statistical archetype generation with iterative refinement.
 
-        Extracts atomic propositions from the paragraph, retrieves complex style examples,
-        and generates a single cohesive paragraph that combines all propositions in the
-        target author's style.
-
-        Args:
-            paragraph: Input paragraph text (multiple sentences).
-            atlas: StyleAtlas instance for retrieving examples.
-            author_name: Target author name.
-            style_dna: Optional pre-extracted style DNA dictionary.
-            verbose: Whether to print debug information.
+        Uses parallel generation of multiple candidates, selects the best, and iteratively
+        refines if compliance is below threshold.
 
         Returns:
-            Tuple of (generated_paragraph, rhythm_map, teacher_example, internal_recall).
-            internal_recall is the best proposition recall achieved during evaluation/repair loop.
+            Tuple of (generated_paragraph, archetype_id_used, compliance_score)
         """
         if not paragraph or not paragraph.strip():
-            return paragraph, None, None, 0.0
+            return paragraph, 0, 1.0
 
-        # Step 1: Extract atomic propositions (with citations bound to facts)
-        if verbose:
-            print(f"  Extracting atomic propositions from paragraph...")
-        propositions = self.proposition_extractor.extract_atomic_propositions(paragraph)
-        if verbose:
-            print(f"  Extracted {len(propositions)} propositions: {propositions[:3]}...")
-
-        if not propositions:
-            raise ValueError("No propositions extracted from paragraph")
-
-        # Extract quotes and citations for later verification/restoration
-        quote_pattern = r'["\'](?:[^"\']|(?<=\\)["\'])*["\']'
-        extracted_quotes = []
-        for match in re.finditer(quote_pattern, paragraph):
-            quote_text = match.group(0)
-            if len(quote_text.strip('"\'')) > 2:
-                extracted_quotes.append(quote_text)
-
-        if verbose and extracted_quotes:
-            print(f"  Extracted {len(extracted_quotes)} direct quotations")
-
-        citation_pattern = r'\[\^\d+\]'
-        expected_citations = set(re.findall(citation_pattern, paragraph))
-        if verbose and expected_citations:
-            print(f"  Expected citations: {sorted(expected_citations)}")
-
-        # Step 2: Retrieve robust skeleton and extract sentence templates
-        from src.atlas.rhetoric import RhetoricalType, RhetoricalClassifier
-        classifier = RhetoricalClassifier()
-        rhetorical_type = classifier.classify_heuristic(paragraph)
-
-        if verbose:
-            print(f"  Retrieving robust skeleton for {len(propositions)} propositions...")
-
-        try:
-            teacher_example, templates = self._retrieve_robust_skeleton(
-                rhetorical_type=rhetorical_type.value if hasattr(rhetorical_type, 'value') else str(rhetorical_type),
-                author=author_name,
-                prop_count=len(propositions),
-                atlas=atlas,
-                verbose=verbose
-            )
-        except Exception as e:
+        # Initialize ParagraphAtlas for this author if needed
+        if self.paragraph_atlas is None or getattr(self.paragraph_atlas, 'author', None) != author_name:
             if verbose:
-                print(f"  ❌ Failed to retrieve skeleton: {e}")
-            raise ValueError(f"Failed to retrieve robust skeleton: {e}")
+                print(f"  Initializing ParagraphAtlas for {author_name}...")
+            self.paragraph_atlas = ParagraphAtlas(self.atlas_path, author_name)
 
+        # Step 1: Neutralize
         if verbose:
-            print(f"  ✅ Retrieved skeleton with {len(templates)} sentence templates")
-
-        # Step 2.5: Extract narrative roles from teacher example
+            print(f"  Extracting neutral summary...")
+        neutral_text = self.semantic_translator.extract_neutral_summary(paragraph)
         if verbose:
-            print(f"  Extracting narrative arc from teacher example...")
-        narrative_roles = self._extract_narrative_arc(teacher_example, verbose=verbose)
-        if verbose:
-            print(f"  ✅ Extracted {len(narrative_roles)} narrative roles")
+            print(f"  Neutral summary: {neutral_text[:100]}{'...' if len(neutral_text) > 100 else ''}")
 
-        # Step 3: Map propositions to templates
-        if verbose:
-            print(f"  Mapping {len(propositions)} propositions to {len(templates)} templates...")
-
-        try:
-            prop_map = self._map_propositions_to_templates(
-                propositions=propositions,
-                templates=templates,
-                narrative_roles=narrative_roles,
-                verbose=verbose
-            )
-        except Exception as e:
-            if verbose:
-                print(f"  ❌ Failed to map propositions: {e}")
-            raise ValueError(f"Failed to map propositions to templates: {e}")
-
-        if verbose:
-            print(f"  ✅ Mapped propositions to templates")
-
-        # Step 4: Extract style DNA if not provided
-        # Use the teacher_example that was already retrieved for style DNA extraction
-        if not style_dna:
+        # Step 1.5: Retrieve style palette using StyleRAG
+        style_palette_fragments = []
+        if author_name not in self.style_rag:
             try:
-                from src.analyzer.style_extractor import StyleExtractor
-                style_extractor = StyleExtractor(config_path=self.config_path)
-                # Use the teacher_example as a source for style DNA
-                style_dna = style_extractor.extract_style_dna([teacher_example])
-                if verbose:
-                    print(f"  Extracted style DNA: {style_dna.get('tone', 'Unknown')} tone")
+                self.style_rag[author_name] = StyleRAG(self.atlas_path, author_name, self.config_path)
             except Exception as e:
                 if verbose:
-                    print(f"  ⚠ Style DNA extraction failed: {e}, continuing without style DNA")
-                style_dna = None
+                    print(f"  ⚠ Could not initialize StyleRAG: {e}")
+                self.style_rag[author_name] = None
 
-        style_lexicon = None
-        if style_dna and isinstance(style_dna, dict):
-            style_lexicon = style_dna.get("lexicon", [])
-
-        # Extract rhythm_map from teacher_example for return value
-        rhythm_map = None
-        try:
-            from src.analyzer.structuralizer import extract_paragraph_rhythm
-            rhythm_map = extract_paragraph_rhythm(teacher_example)
-        except Exception:
-            pass
-
-        # Step 5: Initialize ParagraphState and run evolution loop
-        if not style_dna:
-            try:
-                from src.analyzer.style_extractor import StyleExtractor
-                style_extractor = StyleExtractor(config_path=self.config_path)
-
-                # Get examples for style DNA extraction
-                examples_for_dna = atlas.get_examples_by_rhetoric(
-                    rhetorical_type,
-                    top_k=5,
-                    author_name=author_name,
-                    query_text=None
-                )
-
-                if secondary_author:
-                    style_dna = style_extractor.extract_style_dna(examples_for_dna) if examples_for_dna else None
-
-                    # Extract secondary author's DNA separately for lexicon fusion
-                    secondary_examples = atlas.get_examples_by_rhetoric(
-                        RhetoricalType.OBSERVATION,
-                        top_k=5,
-                        author_name=secondary_author,
-                        query_text=None
-                    )
-                    secondary_dna = style_extractor.extract_style_dna(secondary_examples) if secondary_examples else None
-
-                    # Merge lexicons
-                    if secondary_dna and isinstance(secondary_dna, dict) and isinstance(style_dna, dict):
-                        primary_lexicon = style_dna.get("lexicon", [])[:15]
-                        secondary_lexicon = secondary_dna.get("lexicon", [])[:15]
-                        blended_lexicon = list(set(primary_lexicon) | set(secondary_lexicon))
-                        style_dna["lexicon"] = blended_lexicon
-
-                        if verbose:
-                            print(f"  Blended lexicon: {len(blended_lexicon)} words")
+        if self.style_rag.get(author_name):
+            style_rag_config = self.config.get("style_rag", {})
+            num_fragments = style_rag_config.get("num_fragments", 8)
+            style_palette_fragments = self.style_rag[author_name].retrieve_palette(neutral_text, n=num_fragments)
+            if verbose:
+                if style_palette_fragments:
+                    print(f"  Retrieved {len(style_palette_fragments)} style fragments")
                 else:
-                    style_dna = style_extractor.extract_style_dna(examples_for_dna) if examples_for_dna else None
+                    print(f"  ⚠ No style fragments retrieved (collection may not exist)")
 
-                if verbose and style_dna:
-                    print(f"  Extracted style DNA: {style_dna.get('tone', 'Unknown')} tone")
-            except Exception as e:
-                if verbose:
-                    print(f"  ⚠ Style DNA extraction failed: {e}, continuing without style DNA")
-                style_dna = None
+        # Format style palette as newline-joined string
+        style_palette_text = "\n".join([f'"{fragment}"' for fragment in style_palette_fragments]) if style_palette_fragments else ""
 
-        # Extract style_lexicon for use in evaluation
-        style_lexicon = None
-        if style_dna and isinstance(style_dna, dict):
-            style_lexicon = style_dna.get("lexicon", [])
-
-        # Step 4: Initialize ParagraphState and run evolution loop
-        # Get config values
-        population_size = self.paragraph_fusion_config.get("candidate_population_size", 5)
-        max_generations = self.paragraph_fusion_config.get("max_generations_per_slot", 10)
-        lock_threshold = self.paragraph_fusion_config.get("lock_threshold", 0.9)
-
-        # Initialize ParagraphState
-        num_slots = len(templates)
-        state = ParagraphState(
-            original_text=paragraph,
-            templates=templates,
-            prop_map=prop_map,
-            narrative_roles=narrative_roles,
-            candidate_populations=[[] for _ in range(num_slots)],
-            best_sentences=[None] * num_slots,
-            locked_flags=[False] * num_slots,
-            feedback=[[None] * population_size for _ in range(num_slots)],
-            generation_count=[0] * num_slots
-        )
-
-        # Initialize critic and run evolution loop
-        from src.validator.semantic_critic import SemanticCritic
-        critic = SemanticCritic(config_path=self.config_path)
-
+        # Step 2: Select next archetype
         if verbose:
-            print(f"  Starting evolution loop (max {max_generations} generations per slot)...")
+            print(f"  Selecting next archetype (prev: {prev_archetype_id})...")
+        target_arch_id = self.paragraph_atlas.select_next_archetype(prev_archetype_id)
+        if verbose:
+            print(f"  Selected archetype: {target_arch_id}")
 
-        for generation in range(max_generations):
-            # Check if all slots are locked
-            if all(state.locked_flags):
-                if verbose:
-                    print(f"  ✅ All slots locked after {generation} generations")
-                break
+        # Step 3: Get archetype description
+        archetype_desc = self.paragraph_atlas.get_archetype_description(target_arch_id)
+        if verbose:
+            print(f"  Archetype stats: {archetype_desc['avg_len']} words/sent, {archetype_desc['avg_sents']} sents, {archetype_desc['burstiness']} burstiness")
 
-            # Generate candidates for unlocked slots
+        # Step 3.5: Generate style directives by comparing neutral text vs target archetype
+        style_directives = self._generate_style_directives(neutral_text, archetype_desc)
+        if verbose and style_directives:
+            print(f"  Style directives: {style_directives[:100]}{'...' if len(style_directives) > 100 else ''}")
+
+        # Step 3.6: Build style constraints from forensic profile
+        style_constraints = self._build_style_constraints(author_name)
+        if verbose and style_constraints:
+            print(f"  Style constraints loaded from forensic profile")
+
+        # Step 4: MANDATORY - Fetch full paragraph from ChromaDB
+        if verbose:
+            print(f"  Fetching full example paragraph from ChromaDB...")
+        rhythm_reference = self.paragraph_atlas.get_example_paragraph(target_arch_id)
+
+        # Fallback to truncated JSON snippet if ChromaDB fails
+        if not rhythm_reference:
             if verbose:
-                unlocked_count = sum(1 for locked in state.locked_flags if not locked)
-                print(f"  Generation {generation + 1}/{max_generations}: Generating for {unlocked_count} unlocked slots...")
+                print(f"  ⚠ ChromaDB retrieval failed, using truncated JSON snippet")
+            rhythm_reference = archetype_desc.get('example', '')
 
-            try:
-                new_populations = self._generate_candidate_populations(
-                    state=state,
-                    author_name=author_name,
-                    style_dna=style_dna,
-                    population_size=population_size,
-                    verbose=verbose
-                )
+        if verbose and rhythm_reference:
+            print(f"  Rhythm reference: {rhythm_reference[:100]}{'...' if len(rhythm_reference) > 100 else ''}")
 
-                # Update candidate populations for unlocked slots
-                for i, (locked, new_pop) in enumerate(zip(state.locked_flags, new_populations)):
-                    if not locked:
-                        # Apply sanity check to filter gibberish
-                        filtered_pop = self._sanity_check_candidates(
-                            candidates=new_pop,
-                            template=state.templates[i],
-                            verbose=verbose
-                        )
-                        state.candidate_populations[i] = filtered_pop
-                        state.generation_count[i] += 1
-                        if verbose:
-                            print(f"    Slot {i}: Generated {len(new_pop)} candidates, {len(filtered_pop)} after sanity check")
-                            for idx, candidate in enumerate(filtered_pop[:3]):  # Show first 3
-                                print(f"      [{idx}] {candidate[:80]}{'...' if len(candidate) > 80 else ''}")
-                            if len(filtered_pop) > 3:
-                                print(f"      ... and {len(filtered_pop) - 3} more")
+        # Get generation config
+        num_candidates = self.generation_config.get("num_candidates", 4)
+        max_retries = self.generation_config.get("max_retries", 2)
+        compliance_threshold = self.generation_config.get("compliance_threshold", 0.85)
+        generation_temp = self.generation_config.get("temperature", 0.8)
+        generation_max_tokens = self.generation_config.get("max_tokens", 1500)
 
-                # Evaluate all candidates
-                if verbose:
-                    print(f"  Evaluating candidates...")
+        # Load prompt templates
+        prompts_dir = Path(__file__).parent.parent.parent / "prompts"
 
-                evaluation_results = critic.evaluate_candidate_populations(
-                    candidate_populations=state.candidate_populations,
-                    templates=state.templates,
-                    prop_map=state.prop_map,
-                    narrative_roles=state.narrative_roles,
-                    best_sentences=state.best_sentences,
-                    verbose=verbose
-                )
+        try:
+            system_prompt_path = prompts_dir / "translator_statistical_system.md"
+            system_prompt = system_prompt_path.read_text().strip()
+            # Always format to inject style palette and author name
+            # If style_palette_text is empty, it will just be an empty string in the template
+            system_prompt = system_prompt.format(
+                style_palette=style_palette_text if style_palette_text else "",
+                author_name=author_name
+            )
+        except (FileNotFoundError, KeyError):
+            # KeyError can occur if template has placeholders we're not providing
+            system_prompt = "You are a style translator. Generate paragraphs that match statistical archetypes while preserving semantic content."
+            if style_palette_text:
+                system_prompt += f"\n\n## Author's Phrasing Palette\n{style_palette_text}\n\nStudy these actual sentences written by {author_name} on similar topics. Use them as a **Vocabulary and Phrasing Bank**."
 
-                # Update best sentences and lock flags
-                for slot_idx, slot_results in enumerate(evaluation_results):
-                    if state.locked_flags[slot_idx]:
-                        continue  # Skip locked slots
+        # Build archetype descriptions for prompts
+        avg_len = archetype_desc['avg_len']
+        avg_sents = archetype_desc['avg_sents']
+        burstiness = archetype_desc['burstiness']
+        style = archetype_desc['style']
 
-                    if verbose:
-                        print(f"    Slot {slot_idx} evaluation results:")
-                        for candidate_idx, result in enumerate(slot_results):
-                            anchor = result.get("anchor_score", 0.0)
-                            semantic = result.get("semantic_score", 0.0)
-                            narrative = result.get("narrative_score", 0.0)
-                            combined = result.get("combined_score", 0.0)
-                            pass_flag = result.get("pass", False)
-                            feedback = result.get("feedback", "")[:60]
-                            candidate = state.candidate_populations[slot_idx][candidate_idx][:60]
-                            status = "✓" if pass_flag else "✗"
-                            print(f"      [{candidate_idx}] {status} anchor={anchor:.2f} semantic={semantic:.2f} narrative={narrative:.2f} combined={combined:.2f}")
-                            print(f"          Text: {candidate}{'...' if len(state.candidate_populations[slot_idx][candidate_idx]) > 60 else ''}")
-                            if feedback:
-                                print(f"          Feedback: {feedback}{'...' if len(result.get('feedback', '')) > 60 else ''}")
+        # Generate descriptions for LLM-friendly language
+        if avg_len >= 20:
+            avg_len_description = f"Long, complex sentences (approximately {avg_len} words each). Use subordinate clauses, relative clauses, and conjunctions to build sophisticated structures."
+        elif avg_len >= 15:
+            avg_len_description = f"Medium-length sentences (approximately {avg_len} words each). Balance complexity with clarity."
+        else:
+            avg_len_description = f"Shorter, more direct sentences (approximately {avg_len} words each). Keep sentences concise and focused."
 
-                    # Find best candidate for this slot
-                    best_candidate_idx = None
-                    best_score = -1.0
+        if avg_sents >= 5:
+            avg_sents_description = f"Developed paragraphs with approximately {avg_sents} sentences. Elaborate on ideas with supporting details."
+        elif avg_sents >= 3:
+            avg_sents_description = f"Standard paragraphs with approximately {avg_sents} sentences. Provide adequate development."
+        else:
+            avg_sents_description = f"Concise paragraphs with approximately {avg_sents} sentences. Keep focused and direct."
 
-                    for candidate_idx, result in enumerate(slot_results):
-                        combined_score = result.get("combined_score", 0.0)
-                        if combined_score > best_score:
-                            best_score = combined_score
-                            best_candidate_idx = candidate_idx
-
-                    if best_candidate_idx is not None:
-                        best_result = slot_results[best_candidate_idx]
-                        best_candidate = state.candidate_populations[slot_idx][best_candidate_idx]
-
-                        # Update best sentence if this is better
-                        if state.best_sentences[slot_idx] is None or best_score > 0.0:
-                            state.best_sentences[slot_idx] = best_candidate
-                            state.feedback[slot_idx] = [r.get("feedback") for r in slot_results]
-
-                        # Stricter locking: require complete meaning, structure, AND narrative flow
-                        anchor_score = best_result.get("anchor_score", 0.0)
-                        semantic_score = best_result.get("semantic_score", 0.0)
-                        narrative_score = best_result.get("narrative_score", 0.0)
-
-                        if anchor_score >= 1.0 and semantic_score >= 0.95 and narrative_score >= 0.8:
-                            state.locked_flags[slot_idx] = True
-                            if verbose:
-                                print(f"  🔒 Slot {slot_idx} locked (anchor={anchor_score:.2f} >= 1.0, semantic={semantic_score:.2f} >= 0.95, narrative={narrative_score:.2f} >= 0.8)")
-                                print(f"      Selected: {best_candidate[:100]}{'...' if len(best_candidate) > 100 else ''}")
-                        else:
-                            if verbose:
-                                reason = []
-                                if anchor_score < 1.0:
-                                    reason.append(f"anchor={anchor_score:.2f} < 1.0")
-                                if semantic_score < 0.95:
-                                    reason.append(f"semantic={semantic_score:.2f} < 0.95")
-                                print(f"  ⚠ Slot {slot_idx} NOT locked: {', '.join(reason)}")
-                                print(f"      Best candidate: {best_candidate[:100]}{'...' if len(best_candidate) > 100 else ''}")
-
-                            # Synthesize feedback for unlocked slots that failed to lock
-                            directive, elite_text, elite_feedback = self._synthesize_slot_feedback(
-                                slot_results=slot_results,
-                                slot_candidates=state.candidate_populations[slot_idx],
-                                slot_template=state.templates[slot_idx],
-                                slot_propositions=state.prop_map[slot_idx],
-                                prev_context=state.best_sentences[slot_idx - 1] if slot_idx > 0 else None,
-                                verbose=verbose
-                            )
-
-                            # Store synthesized feedback and elite candidate info
-                            if directive or elite_text:
-                                if state.feedback[slot_idx] is None:
-                                    state.feedback[slot_idx] = []
-                                # Store as structured format: [SYNTHESIZED] directive | [ELITE_TEXT] text | [ELITE_FEEDBACK] feedback
-                                # Insert at beginning to preserve order
-                                if directive:
-                                    state.feedback[slot_idx].insert(0, f"[SYNTHESIZED] {directive}")
-                                if elite_text and elite_feedback:
-                                    # Insert after synthesized directive if it exists
-                                    insert_pos = 1 if directive else 0
-                                    state.feedback[slot_idx].insert(insert_pos, f"[ELITE_TEXT] {elite_text}")
-                                    state.feedback[slot_idx].insert(insert_pos + 1, f"[ELITE_FEEDBACK] {elite_feedback}")
-
-            except Exception as e:
-                if verbose:
-                    print(f"  ⚠ Generation {generation + 1} failed: {e}")
-                # Continue to next generation
-                continue
-
-        # Build final paragraph from best sentences
-        if verbose:
-            print(f"  Assembling final paragraph from {len(state.best_sentences)} slots...")
-        final_sentences = []
-        for i, best_sentence in enumerate(state.best_sentences):
-            if best_sentence:
-                final_sentences.append(best_sentence)
-                if verbose:
-                    print(f"    Slot {i}: Using best sentence ({len(best_sentence)} chars)")
-                    print(f"      \"{best_sentence[:100]}{'...' if len(best_sentence) > 100 else ''}\"")
+        if isinstance(burstiness, str):
+            if burstiness.lower() == "high":
+                burstiness_description = "High variation in sentence length (bursty). Mix short punchy sentences with longer complex ones for natural rhythm."
+            elif burstiness.lower() == "low":
+                burstiness_description = "Low variation in sentence length. Maintain consistent sentence length throughout."
             else:
-                # Fallback: use first candidate if available, or empty string
-                if state.candidate_populations[i]:
-                    fallback = state.candidate_populations[i][0]
-                    final_sentences.append(fallback)
-                    if verbose:
-                        print(f"    Slot {i}: ⚠ No best sentence, using first candidate ({len(fallback)} chars)")
-                        print(f"      \"{fallback[:100]}{'...' if len(fallback) > 100 else ''}\"")
+                burstiness_description = f"Moderate variation in sentence length ({burstiness})."
+        else:
+            burstiness_description = f"Target burstiness: {burstiness}. Vary sentence length appropriately."
+
+        # Iteration loop (Refinement Rounds)
+        best_candidate_so_far = None
+        best_score_so_far = 0.0
+        previous_best = None
+        previous_feedback = None
+
+        for attempt in range(max_retries + 1):  # +1 because first attempt is attempt 0
+            if verbose:
+                if attempt == 0:
+                    print(f"  Generating {num_candidates} candidates (Round {attempt + 1})...")
                 else:
-                    if verbose:
-                        print(f"    Slot {i}: ⚠ No valid candidates, using empty string")
-                    final_sentences.append("")
+                    print(f"  Refinement Round {attempt + 1}: Generating {num_candidates} improved candidates...")
 
-        final_text = " ".join(final_sentences)
-        if verbose:
-            print(f"  Final paragraph assembled: {len(final_sentences)} sentences, {len(final_text)} chars")
-            print(f"  Full text: {final_text[:200]}{'...' if len(final_text) > 200 else ''}")
-
-        # Apply smoothing pass to fix grammar and awkward phrasing
-        try:
-            final_text = self._smooth_paragraph(final_text, verbose=verbose)
-        except Exception as e:
-            if verbose:
-                print(f"  ⚠ Smoothing pass failed: {e}, using unsmoothed text")
-
-        # Check coherence after smoothing, apply simplification if needed
-        try:
-            from src.validator.semantic_critic import SemanticCritic
-            coherence_critic = SemanticCritic(config_path=self.config_path)
-            coherence_score, coherence_reason = coherence_critic._verify_coherence(final_text, verbose=verbose)
-
-            if verbose:
-                print(f"  Coherence check after smoothing: {coherence_score:.2f}")
-
-            # If coherence is still low, apply simplification
-            if coherence_score < 0.75:
-                if verbose:
-                    print(f"  ⚠ Coherence still low ({coherence_score:.2f} < 0.75), applying simplification pass...")
-                    print(f"      Reason: {coherence_reason}")
+            # Build user prompt
+            if attempt == 0:
+                # Initial generation
                 try:
-                    final_text = self._simplify_paragraph(final_text, verbose=verbose)
-                    # Re-check coherence after simplification
-                    coherence_score_after, _ = coherence_critic._verify_coherence(final_text, verbose=False)
-                    if verbose:
-                        print(f"  Coherence after simplification: {coherence_score_after:.2f}")
+                    user_template_path = prompts_dir / "translator_statistical_user.md"
+                    user_template = user_template_path.read_text().strip()
+                    user_prompt = user_template.format(
+                        neutral_text=neutral_text,
+                        author_name=author_name,
+                        avg_len=avg_len,
+                        avg_sents=avg_sents,
+                        burstiness=burstiness,
+                        style=style,
+                        rhythm_reference=rhythm_reference,
+                        avg_len_description=avg_len_description,
+                        avg_sents_description=avg_sents_description,
+                        burstiness_description=burstiness_description,
+                        style_directives=style_directives,
+                        style_constraints=style_constraints,
+                        style_palette=style_palette_text if style_palette_text else ""
+                    )
+                except FileNotFoundError:
+                    # Fallback prompt
+                    user_prompt = f"""## Content to Preserve
+{neutral_text}
+
+## Author Voice
+Adopt the Voice of {author_name}.
+
+## Structural Archetype Persona
+You are adopting the structural archetype of: **{style}**
+
+**Target Structure:**
+- **Average Sentence Length:** ~{avg_len} words per sentence
+  - Target: {avg_len_description}
+- **Average Sentences per Paragraph:** ~{avg_sents} sentences
+  - Target: {avg_sents_description}
+- **Burstiness:** {burstiness}
+  - Target: {burstiness_description}
+
+## Rhythm Reference
+Study this example paragraph to understand the target rhythm and flow:
+*'{rhythm_reference}'
+
+## Style Transformation Rules
+The neutral summary is stylistically generic. You must apply these specific shifts to match {author_name}:
+{style_directives}
+
+{style_constraints}
+
+## Your Task
+Generate a paragraph that:
+1. Expresses the Content above accurately
+2. Adopts the Voice of {author_name}
+3. Matches the Structural Archetype parameters exactly
+4. Mimics the rhythm and flow of the Rhythm Reference
+5. Applies the Style Transformation Rules above
+
+Generate the paragraph:
+"""
+            else:
+                # Refinement round with feedback
+                try:
+                    refinement_template_path = prompts_dir / "translator_statistical_user_refinement.md"
+                    refinement_template = refinement_template_path.read_text().strip()
+                    user_prompt = refinement_template.format(
+                        neutral_text=neutral_text,
+                        author_name=author_name,
+                        avg_len=avg_len,
+                        avg_sents=avg_sents,
+                        burstiness=burstiness,
+                        style=style,
+                        rhythm_reference=rhythm_reference,
+                        avg_len_description=avg_len_description,
+                        avg_sents_description=avg_sents_description,
+                        burstiness_description=burstiness_description,
+                        previous_best=previous_best,
+                        qualitative_feedback=previous_feedback,
+                        style_directives=style_directives,
+                        style_constraints=style_constraints,
+                        style_palette=style_palette_text if style_palette_text else ""
+                    )
+                except FileNotFoundError:
+                    # Fallback refinement prompt
+                    user_prompt = f"""## Content to Preserve
+{neutral_text}
+
+## Author Voice
+Adopt the Voice of {author_name}.
+
+## Structural Archetype Persona
+You are adopting the structural archetype of: **{style}**
+
+**Target Structure:**
+- **Average Sentence Length:** ~{avg_len} words per sentence
+- **Average Sentences per Paragraph:** ~{avg_sents} sentences
+- **Burstiness:** {burstiness}
+
+## Rhythm Reference
+*'{rhythm_reference}'
+
+## Style Transformation Rules
+The neutral summary is stylistically generic. You must apply these specific shifts to match {author_name}:
+{style_directives}
+
+## Previous Attempt
+Here is a previous attempt that needs improvement:
+"{previous_best}"
+
+## Feedback
+The previous attempt had these issues:
+{previous_feedback}
+
+## Your Task
+Generate an improved paragraph that addresses the feedback above while:
+1. Expressing the Content accurately
+2. Adopting the Voice of {author_name}
+3. Matching the Structural Archetype parameters exactly
+4. Mimicking the rhythm and flow of the Rhythm Reference
+5. Applying the Style Transformation Rules above
+
+Generate the improved paragraph:
+"""
+
+            # Parallel Generation: Generate N candidates via separate API calls
+            def generate_candidate(candidate_num: int) -> Optional[str]:
+                """Generate a single candidate."""
+                try:
+                    if verbose and attempt == 0:
+                        print(f"    Generating candidate {candidate_num + 1}/{num_candidates}...")
+                    draft = self.llm_provider.call(
+                        system_prompt=system_prompt,
+                        user_prompt=user_prompt,
+                        model_type="editor",
+                        require_json=False,
+                        temperature=generation_temp,  # High temp for diversity
+                        max_tokens=generation_max_tokens
+                    )
+                    return draft.strip()
                 except Exception as e:
                     if verbose:
-                        print(f"  ⚠ Simplification pass failed: {e}, using smoothed text")
-        except Exception as e:
+                        print(f"    ⚠ Error generating candidate {candidate_num + 1}: {e}")
+                    return None
+
+            # Use ThreadPoolExecutor for parallel generation
+            candidates = []
+            with ThreadPoolExecutor(max_workers=num_candidates) as executor:
+                futures = [executor.submit(generate_candidate, i) for i in range(num_candidates)]
+                for future in as_completed(futures):
+                    result = future.result()
+                    if result:
+                        candidates.append(result)
+
+            if not candidates:
+                if verbose:
+                    print(f"  ⚠ No candidates generated, using fallback")
+                # Fallback: return original paragraph or empty
+                return paragraph, target_arch_id, 0.0
+
+            # Select Best: Use StatisticalCritic to evaluate and select winner
             if verbose:
-                print(f"  ⚠ Coherence check failed: {e}, skipping simplification")
-
-        # Extract rhythm_map from teacher_example for return value
-        rhythm_map = None
-        try:
-            from src.analyzer.structuralizer import extract_paragraph_rhythm
-            rhythm_map = extract_paragraph_rhythm(teacher_example)
-        except Exception:
-            pass
-
-        # Calculate internal_recall (proposition recall)
-        try:
-            from src.ingestion.blueprint import BlueprintExtractor
-            extractor = BlueprintExtractor()
-            blueprint = extractor.extract(paragraph)
-
-            # Get author style vector
-            try:
-                author_style_vector = atlas.get_author_style_vector(author_name)
-            except Exception:
-                author_style_vector = None
-
-            # Evaluate final text
-            final_result = critic.evaluate(
-                generated_text=final_text,
-                input_blueprint=blueprint,
-                propositions=propositions,
-                is_paragraph=True,
-                author_style_vector=author_style_vector,
-                style_lexicon=style_lexicon,
-                verbose=verbose
+                print(f"  Evaluating {len(candidates)} candidates...")
+            best_text, best_score, qualitative_feedback = self.statistical_critic.select_best_candidate(
+                candidates, archetype_desc
             )
-            internal_recall = final_result.get("proposition_recall", 0.0)
-        except Exception as e:
+
             if verbose:
-                print(f"  ⚠ Failed to calculate recall: {e}")
-            internal_recall = 0.0
+                print(f"  Best candidate score: {best_score:.2f}")
+                if best_score < 1.0:
+                    print(f"  Feedback: {qualitative_feedback}")
 
-        # Restore citations and quotes
+            # Track best candidate across iterations
+            if best_score > best_score_so_far:
+                best_candidate_so_far = best_text
+                best_score_so_far = best_score
+
+            # Early Exit: If score >= threshold, return best candidate
+            if best_score >= compliance_threshold:
+                if verbose:
+                    print(f"  ✓ Compliance threshold met ({best_score:.2f} >= {compliance_threshold})")
+                return best_text, target_arch_id, best_score
+
+            # Refinement Round: If score < threshold and attempts < max_retries, continue
+            if attempt < max_retries:
+                previous_best = best_text
+                previous_feedback = qualitative_feedback
+                if verbose:
+                    print(f"  ↻ Score below threshold ({best_score:.2f} < {compliance_threshold}), refining...")
+                # Continue to next iteration
+            else:
+                # Max retries reached, return best candidate so far
+                if verbose:
+                    print(f"  ⚠ Max retries reached ({max_retries}), returning best candidate (score: {best_score_so_far:.2f})")
+                return best_candidate_so_far, target_arch_id, best_score_so_far
+
+        # Should not reach here, but return best candidate if we do
+        return best_candidate_so_far or best_text, target_arch_id, best_score_so_far or best_score
+
+    def _build_style_constraints(self, author_name: str) -> str:
+        """Build style constraints from forensic profile.
+
+        Loads the style profile JSON and formats it as prompt text.
+
+        Args:
+            author_name: Name of the author
+
+        Returns:
+            Formatted style constraints string, or empty string if profile not found
+        """
         try:
-            from src.ingestion.blueprint import BlueprintExtractor
-            extractor = BlueprintExtractor()
-            blueprint = extractor.extract(paragraph)
-            final_text = self._restore_citations_and_quotes(final_text, blueprint)
-        except Exception:
-            pass
+            # Use lowercase author name for directory lookup
+            author_lower = author_name.lower()
+            style_profile_path = Path(self.atlas_path) / author_lower / "style_profile.json"
 
-        if verbose:
-            print(f"  ✅ Evolution complete. Final paragraph: {len(final_text)} chars, recall: {internal_recall:.2f}")
+            if not style_profile_path.exists():
+                # Fallback: try exact case
+                style_profile_path = Path(self.atlas_path) / author_name / "style_profile.json"
+                if not style_profile_path.exists():
+                    return ""
 
-        return final_text, rhythm_map, teacher_example, internal_recall
+            with open(style_profile_path, 'r') as f:
+                profile = json.load(f)
+
+            # Format constraints
+            pov = profile.get("pov", "Third Person")
+            pov_breakdown = profile.get("pov_breakdown", {})
+            rhythm_desc = profile.get("rhythm_desc", "Unknown")
+            burstiness = profile.get("burstiness", 0.0)
+            common_openers = profile.get("common_openers", [])
+            keywords = profile.get("keywords", [])
+
+            # Format POV breakdown
+            pov_details = []
+            if pov_breakdown.get("first_singular", 0) > 0:
+                pov_details.append(f"1st singular: {pov_breakdown['first_singular']}")
+            if pov_breakdown.get("first_plural", 0) > 0:
+                pov_details.append(f"1st plural: {pov_breakdown['first_plural']}")
+            if pov_breakdown.get("third_person", 0) > 0:
+                pov_details.append(f"3rd person: {pov_breakdown['third_person']}")
+            pov_breakdown_str = ", ".join(pov_details) if pov_details else "N/A"
+
+            # Format openers (top 5)
+            openers_str = ", ".join(common_openers[:5]) if common_openers else "N/A"
+
+            # Format keywords (top 15)
+            keywords_str = ", ".join(keywords[:15]) if keywords else "N/A"
+
+            constraints = f"""**Voice Constraints (Forensic Profile - MANDATORY):**
+1. **Point of View:** {pov} ({pov_breakdown_str}).
+
+2. **Rhythm Constraint:** You must mimic a Burstiness of {burstiness}. Vary sentence lengths aggressively—mix very short sentences (5-10 words) with longer ones (30+ words) to create the characteristic 'spiky' rhythm. Target: {rhythm_desc}.
+
+3. **Opener Constraint (MANDATORY):** At least 30% of your sentences MUST begin with one of the following Author Signature Openers: {openers_str}. Avoid academic transitions like 'Therefore' or 'However' unless they appear in the list.
+
+4. **Vocabulary Seeding:** Before expanding your syntax, anchor your text with these signature terms: {keywords_str}. These words should appear naturally throughout the paragraph, not just once."""
+
+            return constraints
+
+        except Exception as e:
+            # Silently fail - return empty string if profile can't be loaded
+            return ""
+
+    def _generate_style_directives(self, neutral_text: str, target_stats: Dict) -> str:
+        """Generate dynamic style directives by comparing neutral text stats vs target archetype stats.
+
+        Args:
+            neutral_text: The neutral logical summary text
+            target_stats: Target archetype dictionary with stats (noun_ratio, verb_ratio, adj_ratio, clause_density, etc.)
+
+        Returns:
+            String containing qualitative style transformation directives
+        """
+        if not neutral_text or not neutral_text.strip():
+            return ""
+
+        # Analyze neutral text using spaCy
+        nlp = NLPManager.get_nlp()
+        doc = nlp(neutral_text)
+        sents = list(doc.sents)
+
+        if not sents:
+            return ""
+
+        # Calculate neutral text stats (same metrics as in build_paragraph_atlas.py)
+        total_tokens = len(doc)
+        verb_count = len([t for t in doc if t.pos_ == "VERB"])
+
+        neutral_noun_ratio = len([t for t in doc if t.pos_ in ["NOUN", "PROPN"]]) / total_tokens if total_tokens > 0 else 0
+        neutral_verb_ratio = verb_count / total_tokens if total_tokens > 0 else 0
+        neutral_adj_ratio = len([t for t in doc if t.pos_ == "ADJ"]) / total_tokens if total_tokens > 0 else 0
+
+        # Clause density
+        clause_count = len([t for t in doc if t.dep_ in ["mark", "advcl"]])
+        neutral_clause_density = clause_count / len(sents) if len(sents) > 0 else 0
+
+        # Get target stats (with fallbacks if not present)
+        target_noun_ratio = target_stats.get("noun_ratio", 0.2)
+        target_verb_ratio = target_stats.get("verb_ratio", 0.15)
+        target_adj_ratio = target_stats.get("adj_ratio", 0.1)
+        target_clause_density = target_stats.get("clause_density", 1.0)
+
+        directives = []
+
+        # Compare noun ratio (nominalization)
+        noun_delta = target_noun_ratio - neutral_noun_ratio
+        if noun_delta > 0.05:  # Target has significantly more nouns
+            directives.append("Use nominalization: turn actions into nouns (e.g., 'the transformation' instead of 'transforms').")
+        elif noun_delta < -0.05:  # Target has significantly fewer nouns
+            directives.append("Use more action verbs: prefer active constructions over nominalizations.")
+
+        # Compare verb ratio
+        verb_delta = target_verb_ratio - neutral_verb_ratio
+        if verb_delta > 0.05:
+            directives.append("Increase verb usage: use more action-oriented language.")
+        elif verb_delta < -0.05:
+            directives.append("Reduce verb density: use more nominal constructions.")
+
+        # Compare adjective ratio
+        adj_delta = target_adj_ratio - neutral_adj_ratio
+        if adj_delta < -0.03:  # Target has fewer adjectives
+            directives.append("Remove decorative adjectives: focus on essential descriptive words only.")
+        elif adj_delta > 0.03:  # Target has more adjectives
+            directives.append("Add descriptive adjectives: enrich the text with appropriate modifiers.")
+
+        # Compare clause density (complexity)
+        clause_delta = target_clause_density - neutral_clause_density
+        if clause_delta > 0.5:  # Target has significantly more complex clauses
+            directives.append("Use complex nested clauses: build sophisticated sentence structures with subordinate and relative clauses.")
+        elif clause_delta < -0.5:  # Target has simpler structure
+            directives.append("Simplify clause structure: reduce nested clauses and use more straightforward constructions.")
+
+        # Check burstiness if available
+        target_burstiness = target_stats.get("burstiness", "Low")
+        if isinstance(target_burstiness, str) and target_burstiness.lower() == "high":
+            # Calculate actual burstiness of neutral text
+            sent_lens = [len(sent) for sent in sents]
+            if len(sent_lens) > 1:
+                import numpy as np
+                neutral_avg_len = np.mean(sent_lens)
+                neutral_burstiness = np.std(sent_lens) / neutral_avg_len if neutral_avg_len > 0 else 0
+                if neutral_burstiness < 0.4:  # Neutral is too uniform
+                    directives.append("Alternate strictly between very short and very long sentences: create high variation in sentence length for natural rhythm.")
+
+        if not directives:
+            return "Maintain the current stylistic balance while matching the target archetype."
+
+        return " ".join(directives)
+

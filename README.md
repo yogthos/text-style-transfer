@@ -1,23 +1,34 @@
 # Text Style Transfer
 
-Transform text to match a target author's style while preserving semantic meaning. Uses a Style Atlas architecture with RAG-based retrieval, paragraph fusion, and semantic validation.
+Transform text to match a target author's style while preserving semantic meaning. Uses a multi-layered architecture with:
+
+- **Style Atlas**: ChromaDB-based vector store for paragraph-level style retrieval
+- **Paragraph Atlas**: Statistical archetype system with Markov chain transitions for paragraph generation
+- **Style RAG**: Dynamic retrieval of semantically relevant style fragments (3-sentence windows) for concrete phrasing examples
+- **Semantic Translation**: Neutral summary extraction to preserve meaning while removing source style
+- **Statistical Generation**: Paragraph-level generation using archetype statistics, style palettes, and iterative refinement
+- **Semantic Validation**: Multi-metric validation ensuring meaning preservation and style alignment
 
 ## Dependencies
 
 This project requires the following Python packages (see `requirements.txt` for versions):
-- **spacy** - Natural language processing and grammatical validation
-- **nltk** - Text tokenization and linguistic analysis
-- **numpy** - Numerical computations
-- **scikit-learn** - Machine learning (K-means clustering for style atlas)
-- **sentence-transformers** - Semantic embeddings and similarity calculations
-- **torch** - PyTorch (required by sentence-transformers for neural network operations)
-- **requests** - HTTP requests for LLM API calls
-- **chromadb** - Vector database for style atlas storage
-- **pytest** - Testing framework
+- **spacy** (>=3.7.0) - Natural language processing and grammatical validation
+- **nltk** (>=3.8.0) - Text tokenization and linguistic analysis
+- **numpy** (>=1.24.0) - Numerical computations
+- **scikit-learn** (>=1.3.0) - Machine learning (K-means clustering for style atlas)
+- **pandas** (>=2.0.0) - Data manipulation and analysis
+- **sentence-transformers** (>=2.2.0) - Semantic embeddings and similarity calculations
+- **torch** (>=2.0.0) - PyTorch (required by sentence-transformers for neural network operations)
+- **requests** (>=2.31.0) - HTTP requests for LLM API calls
+- **chromadb** (>=0.4.0) - Vector database for style atlas storage
+- **jsonrepair** (>=0.19.0) - JSON repair utilities
+- **tiktoken** (>=0.5.0) - Token counting for LLM APIs
+- **pytest** (>=7.0.0) - Testing framework
 
 Additional setup required:
-- **spaCy English model**: `en_core_web_sm` (download with `python3 -m spacy download en_core_web_sm`)
-- **NLTK data**: punkt, punkt_tab, averaged_perceptron_tagger_eng, vader_lexicon (downloaded automatically or manually)
+- **spaCy English model**: `en_core_web_sm` (automatically downloaded on first use, or manually with `python3 -m spacy download en_core_web_sm`)
+- **NLTK data**: punkt, punkt_tab, averaged_perceptron_tagger_eng, vader_lexicon (downloaded automatically on first run)
+- **Sentence Transformer models**: `all-mpnet-base-v2` (automatically downloaded on first use, ~420MB)
 
 ## Quick Start
 
@@ -36,6 +47,9 @@ python3 -c "import nltk; nltk.download('punkt', quiet=True); nltk.download('punk
 
 # Download spaCy model (required for grammatical validation):
 python3 -m spacy download en_core_web_sm
+
+# grab the model for the RAG
+python3 -c "from sentence_transformers import SentenceTransformer; SentenceTransformer('all-mpnet-base-v2')"
 ```
 
 ### Configuration
@@ -58,7 +72,17 @@ python3 -m spacy download en_core_web_sm
    python3 scripts/load_style.py --style-file styles/sample_mao.txt --author "Mao"
    ```
 
-3. Transform text:
+3. Build paragraph atlas (for statistical generation):
+   ```bash
+   python3 scripts/build_paragraph_atlas.py styles/sample_mao.txt --author "Mao"
+   ```
+
+4. Build Style RAG index (for dynamic style palette retrieval):
+   ```bash
+   python3 tools/build_rag_index.py --author "Mao"
+   ```
+
+5. Transform text:
    ```bash
    python3 restyle.py input/small.md -o output/small.md
    ```
@@ -67,8 +91,7 @@ python3 -m spacy download en_core_web_sm
 
 ### Loading Author Styles
 
-Load author styles into ChromaDB using `scripts/load_style.py`:
-
+**1. Load Style Atlas** (for paragraph-level style retrieval):
 ```bash
 # Single author
 python3 scripts/load_style.py --style-file styles/sample_mao.txt --author "Mao"
@@ -77,6 +100,39 @@ python3 scripts/load_style.py --style-file styles/sample_mao.txt --author "Mao"
 python3 scripts/load_style.py \
   --style-file styles/sample_hemingway.txt --author "Hemingway" \
   --style-file styles/sample_lovecraft.txt --author "Lovecraft"
+```
+
+**2. Build Paragraph Atlas** (for statistical archetype generation):
+```bash
+python3 scripts/build_paragraph_atlas.py styles/sample_mao.txt --author "Mao"
+```
+
+This creates:
+- `atlas_cache/paragraph_atlas/{author}/archetypes.json` - Paragraph archetype statistics
+- `atlas_cache/paragraph_atlas/{author}/transition_matrix.json` - Markov chain transitions
+- `atlas_cache/paragraph_atlas/{author}/chroma/` - ChromaDB collection with paragraph examples
+
+**3. Build Style RAG Index** (for dynamic style palette retrieval):
+```bash
+# Uses default corpus file: styles/sample_{author}.txt
+python3 tools/build_rag_index.py --author "Mao"
+
+# Or specify custom corpus file
+python3 tools/build_rag_index.py --author "Mao" --corpus-file path/to/corpus.txt
+```
+
+This creates:
+- `atlas_cache/paragraph_atlas/{author}/style_fragments_chroma/` - ChromaDB collection with 3-sentence style fragments
+- Uses high-fidelity `all-mpnet-base-v2` embeddings for semantic retrieval
+
+**4. Generate Style DNA** (optional, for style profiling):
+```bash
+python3 scripts/generate_style_dna.py --author "Mao"
+```
+
+**5. List Loaded Styles**:
+```bash
+python3 scripts/list_styles.py
 ```
 
 ### Transforming Text
@@ -97,6 +153,7 @@ python3 restyle.py input/small.md -o output/small.md \
 - `-c, --config`: Config file path (default: `config.json`)
 - `--max-retries`: Max retry attempts per sentence (default: 3)
 - `--atlas-cache`: ChromaDB persistence directory (overrides config)
+- `--blend-ratio`: Style blending ratio (0.0-1.0, default: 0.6)
 - `-v, --verbose`: Enable verbose output
 
 ### Python API
@@ -144,38 +201,40 @@ The first author in the list is used. Style DNA is loaded from the Style Registr
 
 ### Key Configuration Sections
 
-**Paragraph Fusion** (paragraph-level generation):
+**Paragraph Atlas** (statistical archetype generation):
 ```json
 {
-  "paragraph_fusion": {
-    "enabled": true,
-    "min_sentences_for_fusion": 2,
-    "style_lexicon_ratio": 0.4,
-    "proposition_recall_threshold": 0.8,
-    "meaning_weight": 0.6,
-    "style_alignment_weight": 0.4,
-    "num_variations": 5
+  "paragraph_atlas": {
+    "path": "atlas_cache/paragraph_atlas",
+    "default_archetype": 0
   }
 }
 ```
 
-**Style Lexicon Ratio** (`style_lexicon_ratio`):
-- **Range**: `0.0` to `1.0`
-- **Default**: `0.4` (40% of extracted style vocabulary)
-- **Purpose**: Controls how much of the target author's vocabulary is injected into paragraph fusion prompts. This ratio scales naturally with the richness of the extracted Style DNA.
+Controls the statistical archetype system used for paragraph generation. The paragraph atlas contains:
+- **Archetypes**: Statistical patterns (sentence length, sentence count, burstiness, style type)
+- **Transition Matrix**: Markov chain probabilities for archetype transitions
+- **ChromaDB Collection**: Full example paragraphs for each archetype
 
-**How it works:**
-- The system extracts a style lexicon (typically ~20 words) from the target author's examples
-- The ratio determines how many of these words are included in the prompt
-- Example: With a 20-word lexicon and `style_lexicon_ratio: 0.4`, the top 8 words (40%) are used
+**Generation** (statistical generation parameters):
+```json
+{
+  "generation": {
+    "temperature": 0.8,
+    "max_tokens": 1500,
+    "num_candidates": 4,
+    "max_retries": 2,
+    "compliance_threshold": 0.85
+  }
+}
+```
 
-**Special values:**
-- `0.0`: Disables style injection entirely (no MANDATORY_VOCABULARY section added)
-- `< 0.3`: Light style injection with instruction "Sprinkle these style markers sparingly."
-- `0.3 - 0.7`: Moderate style injection with instruction "Integrate these words naturally."
-- `> 0.7`: Heavy style injection with instruction "Heavily saturate the text with this vocabulary."
-
-This replaces the previous hardcoded 15-word limit with a flexible ratio that adapts to the size of the extracted lexicon.
+Controls the statistical paragraph generation process:
+- `temperature`: Generation temperature (default: 0.8)
+- `max_tokens`: Maximum tokens per paragraph (default: 1500)
+- `num_candidates`: Number of candidates to generate per round (default: 4)
+- `max_retries`: Maximum refinement rounds if compliance is low (default: 2)
+- `compliance_threshold`: Minimum statistical compliance score to accept (default: 0.85)
 
 **Semantic Critic** (validation thresholds):
 ```json
@@ -251,6 +310,26 @@ The `weights` section controls how different metrics contribute to the composite
 
 When enabled, the system uses document-level context (thesis, intent, keywords) to improve style transfer quality. This is particularly useful for maintaining consistency across long documents.
 
+**Style RAG** (Dynamic Style Palette retrieval):
+```json
+{
+  "style_rag": {
+    "num_fragments": 8,
+    "window_size": 3,
+    "overlap": 1,
+    "embedding_model": "all-mpnet-base-v2"
+  }
+}
+```
+
+Controls the Style RAG system that retrieves semantically relevant style fragments from the author's corpus:
+- `num_fragments`: Number of style fragments to retrieve per paragraph (default: 8)
+- `window_size`: Number of sentences per fragment (default: 3)
+- `overlap`: Number of sentences to overlap between fragments (default: 1)
+- `embedding_model`: Sentence transformer model for semantic embeddings (default: "all-mpnet-base-v2")
+
+The Style RAG system retrieves actual phrases and sentence structures from the author's corpus that are semantically similar to the content being generated, providing concrete examples for the LLM to mimic.
+
 **Evolutionary** (evolutionary generation parameters):
 ```json
 {
@@ -282,12 +361,16 @@ text-style-transfer/
 │   ├── atlas/
 │   │   ├── builder.py          # Style Atlas construction
 │   │   ├── navigator.py        # RAG retrieval
+│   │   ├── paragraph_atlas.py  # Paragraph archetype loader
+│   │   ├── style_rag.py        # Style fragment retrieval (RAG)
 │   │   └── style_registry.py   # Style DNA storage
 │   ├── generator/
 │   │   ├── translator.py       # Text generation
+│   │   ├── semantic_translator.py # Neutral summary extraction
 │   │   └── mutation_operators.py # Prompt templates
 │   ├── validator/
-│   │   └── semantic_critic.py  # Validation
+│   │   ├── semantic_critic.py  # Semantic validation
+│   │   └── statistical_critic.py # Statistical validation
 │   ├── analyzer/
 │   │   ├── style_extractor.py  # Style DNA extraction
 │   │   ├── structuralizer.py   # Rhythm extraction
@@ -296,11 +379,20 @@ text-style-transfer/
 │       └── semantic_analyzer.py # Proposition extraction
 ├── prompts/                     # LLM prompt templates (markdown)
 ├── scripts/
-│   ├── load_style.py           # Load author styles
+│   ├── load_style.py           # Load author styles into Style Atlas
+│   ├── build_paragraph_atlas.py # Build paragraph archetype atlas
+│   ├── generate_style_dna.py   # Generate Style DNA profiles
 │   ├── list_styles.py          # List loaded authors
-│   └── clear_chromadb.py       # Clear ChromaDB
-├── config.json                 # Configuration
-└── restyle.py                  # CLI entry point
+│   └── clear_chromadb.py       # Clear ChromaDB collections
+├── tools/
+│   └── build_rag_index.py      # Build Style RAG fragment index
+├── styles/                      # Author corpus files
+├── input/                       # Input text files
+├── output/                      # Generated output files
+├── atlas_cache/                 # ChromaDB persistence directory
+├── config.json                  # Configuration
+├── restyle.py                   # CLI entry point
+└── run_pipeline.py             # Alternative CLI entry point
 ```
 
 ## How It Works
@@ -309,62 +401,54 @@ text-style-transfer/
 
 ```mermaid
 flowchart TD
-    Start([Input Text]) --> LoadAtlas[Load Style Atlas]
+    Start([Input Text]) --> LoadAtlas[Load Style Atlas & Paragraph Atlas]
     LoadAtlas --> GetDNA[Get Style DNA from Registry]
     GetDNA --> ProcessPara[Process Each Paragraph]
 
-    ProcessPara --> CheckFusion{Multi-sentence<br/>Paragraph?}
-    CheckFusion -->|Yes| ParaFusion[Paragraph Fusion]
-    CheckFusion -->|No| SentenceMode[Sentence-by-Sentence]
-
-    ParaFusion --> ExtractProps[Extract Atomic Propositions]
-    ExtractProps --> SelectTeacher[Select Teacher Example]
-    SelectTeacher --> ExtractRhythm[Extract Rhythm Map]
-    ExtractRhythm --> GeneratePara[Generate Paragraph Variations]
-    GeneratePara --> EvaluatePara[Evaluate with Semantic Critic]
-    EvaluatePara --> PassCheck{Pass?}
+    ProcessPara --> ExtractNeutral[Extract Neutral Summary]
+    ExtractNeutral --> RetrievePalette[Retrieve Style Palette via RAG]
+    RetrievePalette --> SelectArchetype[Select Statistical Archetype]
+    SelectArchetype --> GetRhythm[Get Rhythm Reference Example]
+    GetRhythm --> GenerateCandidates[Generate Multiple Candidates]
+    GenerateCandidates --> EvaluateStats[Evaluate with Statistical Critic]
+    EvaluateStats --> PassCheck{Compliance<br/>Score OK?}
     PassCheck -->|Yes| AcceptPara[Accept Paragraph]
-    PassCheck -->|No| SentenceMode
+    PassCheck -->|No| Refine[Refinement Round]
+    Refine --> GenerateCandidates
 
-    SentenceMode --> ExtractBlueprint[Extract Blueprint]
-    ExtractBlueprint --> RetrieveExamples[Retrieve Style Examples]
-    RetrieveExamples --> Generate[Generate Sentence]
-    Generate --> Evaluate[Evaluate with Critic]
-    Evaluate --> Accept[Accept or Retry]
-
-    AcceptPara --> MorePara{More<br/>Paragraphs?}
-    Accept --> MorePara
+    AcceptPara --> UpdateMarkov[Update Markov Chain State]
+    UpdateMarkov --> MorePara{More<br/>Paragraphs?}
     MorePara -->|Yes| ProcessPara
     MorePara -->|No| End([Output Text])
 ```
 
 ### Key Components
 
-1. **Style Atlas**: ChromaDB-based vector store with dual embeddings (semantic + style) and K-means clustering
-2. **Paragraph Fusion**: For multi-sentence paragraphs, extracts atomic propositions and generates cohesive paragraphs matching human rhythm patterns
-3. **Structural Cloning**: Extracts sentence rhythm (length, type, opener) from examples and forces LLM to match it exactly
-4. **Semantic Critic**: Validates generated text using proposition recall and style alignment metrics
-5. **Style Registry**: Sidecar JSON storage for author Style DNA profiles
+1. **Style Atlas**: ChromaDB-based vector store with dual embeddings (semantic + style) and K-means clustering for paragraph-level style retrieval
+2. **Paragraph Atlas**: Statistical archetype system with Markov chain transitions for generating paragraphs matching author's structural patterns
+3. **Style RAG**: Dynamic retrieval of semantically relevant style fragments (3-sentence windows) to provide concrete phrasing examples during generation
+4. **Semantic Translator**: Extracts neutral logical summaries from input text, removing style while preserving meaning
+5. **Statistical Critic**: Validates generated paragraphs against statistical archetype parameters (sentence length, sentence count, burstiness)
+6. **Semantic Critic**: Validates generated text using proposition recall and style alignment metrics
+7. **Style Registry**: Sidecar JSON storage for author Style DNA profiles
 
-### Paragraph Fusion Process
+### Statistical Paragraph Generation Process
 
-1. Extract atomic propositions from input paragraph
-2. Retrieve complex style examples from atlas
-3. Select "teacher example" with sentence count matching `ceil(n_props * min_sentence_ratio)`
-4. If `use_structural_templates` is enabled, "bleach" the teacher example by replacing content words with placeholders (`[NP]`, `[VP]`, `[ADJ]`, `[ADV]`) while preserving functional words
-5. Extract rhythm map (sentence length, type, opener) from teacher
-6. Generate variations using structural blueprint (or structural template if enabled)
-7. Evaluate with semantic critic (proposition recall + style alignment + context metrics)
-8. Select best candidate or trigger repair loop if recall is low
+The current implementation uses **Statistical Archetype Generation**:
 
-### Sentence-by-Sentence Fallback
-
-If paragraph fusion fails or is disabled:
-1. Extract semantic blueprint (SVO triples, entities, keywords)
-2. Classify rhetorical type (observation, argument, etc.)
-3. Retrieve style examples by rhetorical type
-4. Generate sentence with style constraints
-5. Evaluate and refine iteratively
+1. **Neutral Summary Extraction**: Convert input paragraph to a neutral logical summary, removing style while preserving semantic content
+2. **Style Palette Retrieval**: Use Style RAG to retrieve 5-10 semantically relevant style fragments from the author's corpus
+3. **Archetype Selection**: Use Markov chain to select the next paragraph archetype based on the previous paragraph's archetype
+4. **Archetype Description**: Load statistical parameters (avg sentence length, avg sentences per paragraph, burstiness, style type)
+5. **Rhythm Reference**: Retrieve a full example paragraph matching the selected archetype from ChromaDB
+6. **Generation**: Generate multiple candidate paragraphs using:
+   - Neutral summary as content source
+   - Style palette fragments as phrasing examples
+   - Archetype statistics as structural constraints
+   - Rhythm reference as flow model
+7. **Evaluation**: Score candidates using Statistical Critic (compliance with archetype parameters)
+8. **Refinement**: If compliance is below threshold, generate improved candidates with feedback
+9. **Markov Update**: Update Markov chain state for next paragraph continuity
 
 ## Testing
 
@@ -387,12 +471,26 @@ pytest tests/
 
 **Atlas not found**: Load styles first using `scripts/load_style.py`
 
+**Paragraph Atlas not found**: Build paragraph atlas using `scripts/build_paragraph_atlas.py`
+
+**Style RAG collection not found**: Build RAG index using `tools/build_rag_index.py --author <name>`
+
 **Author not found**: Check `blend.authors` in config.json matches loaded author names
 
-**Low quality output**: Adjust `paragraph_fusion.proposition_recall_threshold` or `semantic_critic.recall_threshold`
+**Low quality output**:
+- Adjust `generation.compliance_threshold` or `semantic_critic.recall_threshold`
+- Ensure Style RAG index is built for better style palette retrieval (`tools/build_rag_index.py`)
+- Check that paragraph atlas is built for statistical generation (`scripts/build_paragraph_atlas.py`)
+- Verify that Style DNA is generated for the author (`scripts/generate_style_dna.py`)
+- Increase `generation.num_candidates` for more diverse generation
+- Adjust `generation.temperature` (higher = more creative, lower = more conservative)
 
 **Import errors**: Ensure virtual environment is activated and dependencies are installed
 
-**Missing spaCy model**: Run `python3 -m spacy download en_core_web_sm` to download the English model
+**Missing spaCy model**: The model is automatically downloaded on first use. If issues occur, run `python3 -m spacy download en_core_web_sm` manually
 
-**Missing NLTK data**: The code will attempt to download required NLTK data automatically, but you can also download manually using the command in the Installation section
+**Missing NLTK data**: The code will attempt to download required NLTK data automatically on first run
+
+**Missing embedding model**: The `all-mpnet-base-v2` model (~420MB) is automatically downloaded by sentence-transformers on first use
+
+**ChromaDB errors**: Ensure ChromaDB is properly installed and the atlas_cache directory is writable

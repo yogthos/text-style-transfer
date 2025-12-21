@@ -2561,12 +2561,17 @@ Does the generated text align with the intent '{intent}'? Consider:
      * Bad: "The sky is blue, therefore capitalism fails" → logic_score = 0.0 (non-sequitur)
      * Good: "Production declined, therefore the economy collapsed" → logic_score = 1.0 (causal link)
 5. **Repetition Check:** If the candidate starts with the same words as the previous sentence, apply a -0.5 penalty to narrative_score. Vary sentence openers to maintain reader engagement.
+6. **Noun Piling Check (0.0-1.0):** Reject sentences where nouns are jammed together without prepositions or connectors.
+   - **Example failure:** "observation horror death" → noun_piling_score = 0.0 (nouns piled without connectors)
+   - **Example pass:** "observation of horror and death" → noun_piling_score = 1.0 (proper grammatical connectors)
+   - **Rule:** If a sentence contains consecutive nouns without prepositions (like "of", "and", "in", "from") or conjunctions, mark as FAIL (noun_piling_score = 0.0).
+   - **Exception:** Allow noun compounds that are standard English (e.g., "coffee shop", "book store") but reject awkward noun chains.
 
 **Key Instructions:**
 - DO enforce exact wording for Fixed Anchors, BUT allow grammatical inflection (is/are, has/have, was/were) for subject-verb agreement
 - DO NOT enforce exact wording for meaning atoms - allow rephrasing
 - DO NOT check for specific nouns or individual words - focus on whether the *concept* is present
-- A candidate passes if anchor_score >= 1.0 AND semantic_score >= 0.95 AND narrative_score >= 0.8 AND logic_score >= 0.8"""
+- A candidate passes if anchor_score >= 1.0 AND semantic_score >= 0.95 AND narrative_score >= 0.8 AND logic_score >= 0.8 AND noun_piling_score >= 0.8"""
 
         # Check for vocabulary repetition across all candidates (local check)
         all_candidates_text = " ".join([c for candidates in candidate_populations for c in candidates])
@@ -2589,6 +2594,7 @@ Does the generated text align with the intent '{intent}'? Consider:
 2. **Semantic Presence (0.0-1.0):** Is the core meaning conveyed (flexible phrasing allowed)?
 3. **Narrative Flow (0.0-1.0):** Does the candidate fulfill its Narrative Role and connect logically to the previous sentence?
 4. **Logical Entailment (0.0-1.0):** Does the sentence make internal sense? Check if connectors like 'therefore', 'remains a', 'because', 'consequently' are justified by the preceding text.
+5. **Noun Piling Check (0.0-1.0):** Are nouns properly connected with prepositions or conjunctions? Reject sentences where nouns are jammed together without connectors.
 
 **Output Format:** Return a JSON object with keys "slot_0", "slot_1", etc., where each value is an array of evaluation objects (one per candidate, in order).
 
@@ -2598,8 +2604,9 @@ Each evaluation object must contain:
 - "semantic_score": float (0.0-1.0)
 - "narrative_score": float (0.0-1.0)
 - "logic_score": float (0.0-1.0)
+- "noun_piling_score": float (0.0-1.0)
 - "grammar_override_detected": boolean (true if candidate changed POS tags but grammar is valid)
-- "pass": boolean (true if anchor_score >= 1.0 AND semantic_score >= 0.95 AND narrative_score >= 0.8 AND logic_score >= 0.8)
+- "pass": boolean (true if anchor_score >= 1.0 AND semantic_score >= 0.95 AND narrative_score >= 0.8 AND logic_score >= 0.8 AND noun_piling_score >= 0.8)
 - "feedback": string (combined feedback explaining the scores)
 
 **Example JSON structure:**
@@ -2611,6 +2618,7 @@ Each evaluation object must contain:
       "semantic_score": 0.95,
       "narrative_score": 0.8,
       "logic_score": 0.9,
+      "noun_piling_score": 1.0,
       "grammar_override_detected": true,
       "pass": true,
       "feedback": "Candidate changed [ADJ] to [NP] for grammar, but structure preserved."
@@ -2621,6 +2629,7 @@ Each evaluation object must contain:
       "semantic_score": 0.5,
       "narrative_score": 0.8,
       "logic_score": 0.9,
+      "noun_piling_score": 1.0,
       "grammar_override_detected": false,
       "pass": false,
       "feedback": "Missing semantic atom 'scavenged'."
@@ -2631,6 +2640,7 @@ Each evaluation object must contain:
       "semantic_score": 1.0,
       "narrative_score": 0.9,
       "logic_score": 0.8,
+      "noun_piling_score": 1.0,
       "grammar_override_detected": false,
       "pass": false,
       "feedback": "Missing anchor 'In' at start."
@@ -2726,6 +2736,7 @@ Return ONLY valid JSON, no additional text."""
                         "semantic_score": 0.0,
                         "narrative_score": 0.0,
                         "logic_score": 0.0,
+                        "noun_piling_score": 0.0,
                         "grammar_override_detected": False,
                         "combined_score": 0.0,
                         "feedback": "Missing from batch response",
@@ -2746,6 +2757,7 @@ Return ONLY valid JSON, no additional text."""
                         "semantic_score": 0.0,
                         "narrative_score": 0.0,
                         "logic_score": 0.0,
+                        "noun_piling_score": 0.0,
                         "grammar_override_detected": False,
                         "combined_score": 0.0,
                         "feedback": "Invalid format in batch response",
@@ -2769,6 +2781,7 @@ Return ONLY valid JSON, no additional text."""
                     semantic_score = float(eval_obj.get("semantic_score", 0.0))
                     narrative_score = float(eval_obj.get("narrative_score", 0.0))
                     logic_score = float(eval_obj.get("logic_score", 1.0))  # Default to 1.0 if not provided (backward compatibility)
+                    noun_piling_score = float(eval_obj.get("noun_piling_score", 1.0))  # Default to 1.0 if not provided (backward compatibility)
                     grammar_override_detected = bool(eval_obj.get("grammar_override_detected", False))
 
                     # Initialize feedback from evaluation object
@@ -2797,6 +2810,8 @@ Return ONLY valid JSON, no additional text."""
                         pass_flag = False
                     if logic_score < 0.8:
                         pass_flag = False
+                    if noun_piling_score < 0.8:
+                        pass_flag = False
 
                     results[slot_idx].append({
                         "pass": pass_flag,
@@ -2804,6 +2819,7 @@ Return ONLY valid JSON, no additional text."""
                         "semantic_score": semantic_score,
                         "narrative_score": narrative_score,
                         "logic_score": logic_score,
+                        "noun_piling_score": noun_piling_score,
                         "grammar_override_detected": grammar_override_detected,
                         "combined_score": combined_score,
                         "feedback": feedback,
@@ -2820,6 +2836,7 @@ Return ONLY valid JSON, no additional text."""
                         "semantic_score": 0.0,
                         "narrative_score": 0.0,
                         "logic_score": 0.0,
+                        "noun_piling_score": 0.0,
                         "combined_score": 0.0,
                         "feedback": "Missing from batch response",
                         "slot_index": slot_idx,

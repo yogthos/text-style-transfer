@@ -37,7 +37,7 @@ from src.generator.content_planner import ContentPlanner
 from src.generator.refiner import ParagraphRefiner
 from src.validator.statistical_critic import StatisticalCritic
 from src.utils.nlp_manager import NLPManager
-from src.utils.text_processing import check_zipper_merge
+from src.utils.text_processing import check_zipper_merge, parse_variants_from_response
 
 
 def _load_prompt_template(template_name: str) -> str:
@@ -4286,6 +4286,8 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         max_sentence_retries = self.generation_config.get("max_retries", 3)
         generation_temp = self.generation_config.get("temperature", 0.8)
         generation_max_tokens = self.generation_config.get("max_tokens", 1500)
+        compliance_fuzziness = self.generation_config.get("compliance_fuzziness", 0.05)
+        sentence_variants_per_attempt = self.generation_config.get("sentence_variants_per_attempt", 5)
 
         # Load system prompt for sentence generation
         prompts_dir = Path(__file__).parent.parent.parent / "prompts"
@@ -4333,12 +4335,13 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
             # Inner loop: Generate and validate THIS sentence
             sentence = None
             for attempt in range(max_sentence_retries):
-                # Generate sentence for this slot
-                sentence_result = self._generate_sentence_for_slot(
+                # 1. Generate batch of variants
+                variants = self._generate_sentence_variants(
                     content=content,
                     target_length=target_len,
                     prev_context=context_so_far,
                     author_name=author_name,
+                    n=sentence_variants_per_attempt,
                     slot_type=slot_type,
                     target_perspective=target_pov,
                     perspective_pronouns=perspective_pronoun_list,
@@ -4349,24 +4352,27 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     verbose=verbose and attempt == 0
                 )
 
-                # CRITICAL: Extract text string safely (handle dict or string)
-                if isinstance(sentence_result, dict):
-                    sentence = sentence_result.get('text', '')
-                else:
-                    sentence = sentence_result if sentence_result else ''
+                if verbose and attempt == 0:
+                    print(f"    Generated {len(variants)} variants for attempt {attempt + 1}")
 
-                if not sentence or not sentence.strip():
+                if not variants:
                     if verbose and attempt == 0:
-                        print(f"    ⚠ Empty sentence generated, retrying...")
+                        print(f"    ⚠ No variants generated, retrying...")
                     continue  # Skip empty results
 
-                # ZIPPER CHECK (Fail Fast - before expensive statistical validation)
-                if final_sentences:  # Only check if we have previous sentences
-                    prev_sentence = final_sentences[-1]
-                    if check_zipper_merge(prev_sentence, sentence):
-                        if verbose:
-                            print(f"    ⚠ Stitch Glitch detected (Echo), retrying...")
-                        continue  # Reject and retry immediately
+                # 2. Select best candidate (Zipper-Aware: filters during selection)
+                sentence = self._select_best_sentence_variant(
+                    variants, target_len, context_so_far, verbose=verbose and attempt == 0
+                )
+
+                if not sentence:
+                    if verbose:
+                        print(f"    ⚠ No valid variant found, retrying...")
+                    continue
+
+                if verbose and target_len:
+                    word_count = len(sentence.split())
+                    print(f"    Selected best variant: {word_count} words (target: {target_len}) from {len(variants)} candidates")
 
                 # Validate strict compliance (math only)
                 score, feedback = self.statistical_critic.evaluate_sentence(
@@ -4377,7 +4383,19 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     word_count = len(sentence.split())
                     print(f"    Attempt {attempt + 1}: {word_count} words, score: {score:.2f}")
 
-                if score >= 1.0:  # Passed!
+                # Check if this is the final attempt
+                is_final_attempt = (attempt == max_sentence_retries - 1)
+
+                # Apply fuzzy threshold on final attempt
+                if is_final_attempt:
+                    fuzzy_threshold = 1.0 - compliance_fuzziness
+                    if score >= fuzzy_threshold:
+                        final_sentences.append(sentence)
+                        context_so_far += sentence + " "
+                        if verbose:
+                            print(f"    ✓ Sentence {slot_idx + 1} passed validation (fuzzy threshold: {score:.2f} >= {fuzzy_threshold:.2f})")
+                        break  # Success! Move to next sentence
+                elif score >= 1.0:  # Passed on non-final attempt!
                     final_sentences.append(sentence)
                     context_so_far += sentence + " "
                     if verbose:
@@ -4453,9 +4471,17 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
 
         # Check if refinement is needed (flow/coherence issues OR repetition issues)
         compliance_threshold = self.generation_config.get("compliance_threshold", 0.85)
-        if best_score < compliance_threshold and qualitative_feedback:
+        compliance_fuzziness = self.generation_config.get("compliance_fuzziness", 0.05)
+        fuzzy_threshold = compliance_threshold - compliance_fuzziness
+
+        # Apply fuzzy threshold: if score is close enough, accept without repair
+        if best_score >= fuzzy_threshold and best_score < compliance_threshold:
             if verbose:
-                print(f"  Score below threshold ({best_score:.2f} < {compliance_threshold}), attempting repair...")
+                print(f"  Score within fuzzy threshold ({best_score:.2f} >= {fuzzy_threshold:.2f}), accepting without repair")
+            # Skip repair, accept the paragraph as-is
+        elif best_score < fuzzy_threshold and qualitative_feedback:
+            if verbose:
+                print(f"  Score below fuzzy threshold ({best_score:.2f} < {fuzzy_threshold:.2f}), attempting repair...")
 
             # Initialize refiner if needed
             if not hasattr(self, 'refiner') or self.refiner is None:
@@ -4862,6 +4888,190 @@ Output only the sentence, no explanations.
             if verbose:
                 print(f"    ⚠ Error generating sentence: {e}")
             return ""
+
+    def _generate_sentence_variants(
+        self,
+        content: str,
+        target_length: int,
+        prev_context: str,
+        author_name: str,
+        n: int = 5,
+        slot_type: str = "moderate",
+        target_perspective: str = "first_person_singular",
+        perspective_pronouns: str = "I, Me, My, Myself, Mine",
+        style_palette: str = "",
+        system_prompt: str = "",
+        temperature: float = 0.8,
+        max_tokens: int = 1500,
+        verbose: bool = False
+    ) -> List[str]:
+        """Generate N variants of a sentence for a specific slot.
+
+        Args:
+            content: Content to express in this sentence
+            target_length: Target word count
+            prev_context: Previous sentences for flow
+            author_name: Author name
+            n: Number of variants to generate
+            slot_type: Sentence type (simple/moderate/complex)
+            target_perspective: Target POV
+            perspective_pronouns: Pronoun list for POV
+            style_palette: Style fragments
+            system_prompt: System prompt
+            temperature: Generation temperature
+            max_tokens: Max tokens
+            verbose: Verbose output
+
+        Returns:
+            List of variant strings
+        """
+        prompts_dir = Path(__file__).parent.parent.parent / "prompts"
+        try:
+            template_path = prompts_dir / "sentence_worker_user.md"
+            template = template_path.read_text().strip()
+        except FileNotFoundError:
+            # Fallback template
+            template = """# Task: Write ONE Sentence
+
+## Content to Express:
+{slot_content}
+
+## Target Length:
+{target_length} words (strict constraint)
+
+## Previous Context:
+{prev_context}
+
+{anti_echo_section}
+
+## Author Voice:
+Adopt the voice of {author_name}.
+
+## Instructions:
+1. Write exactly ONE sentence expressing the content above.
+2. The sentence must be approximately {target_length} words (within 15% tolerance).
+3. The sentence should flow naturally from the previous context.
+4. **ANTI-ECHO:** Do NOT start with the same words as the Previous Context.
+5. Use the author's distinctive voice and vocabulary.
+
+Output only the sentence, no explanations.
+"""
+
+        # Build prompt requesting N variants
+        user_content = f"""Generate {n} different variants of the sentence.
+Strictly follow the constraints below.
+**Output Format:** Output each variant on a new line starting with 'VAR:'. Do not number them.
+
+## Content to Express:
+{content}
+
+## Target Length:
+{target_length} words (strict constraint)
+
+## Previous Context:
+{prev_context}
+"""
+
+        # 1. Build the Constraint String (with safety fallback)
+        anti_echo_section = ""  # Default to empty string
+        if prev_context:
+            prev_words = prev_context.strip().split()
+            if len(prev_words) >= 3:
+                # Protect against Markdown injection in the previous text
+                clean_prev = " ".join(prev_words[:4]).replace("`", "").replace("*", "")
+                anti_echo_section = f"**DO NOT start with:** '{clean_prev}...'"
+
+        user_content += f"""
+{anti_echo_section}
+
+## Author Voice:
+Adopt the voice of {author_name}.
+
+## Instructions:
+1. Write exactly ONE sentence expressing the content above.
+2. The sentence must be approximately {target_length} words (within 15% tolerance).
+3. The sentence should flow naturally from the previous context.
+4. **ANTI-ECHO:** Do NOT start with the same words as the Previous Context.
+5. Use the author's distinctive voice and vocabulary.
+
+Output only the sentence, no explanations.
+"""
+
+        try:
+            response = self.llm_provider.call(
+                system_prompt=f"You are a sentence generator. Generate {n} variants. Output each on a new line with 'VAR:' prefix.",
+                user_prompt=user_content,
+                model_type="editor",
+                require_json=False,
+                temperature=temperature,
+                max_tokens=max_tokens
+            )
+
+            # Parse variants using shared utility
+            variants = parse_variants_from_response(response, verbose=verbose)
+
+            if variants:
+                return variants
+            else:
+                # Fallback: if no variants found, return empty list
+                if verbose:
+                    print(f"      ⚠ No variants parsed from response, using fallback")
+                return []
+
+        except Exception as e:
+            if verbose:
+                print(f"      ⚠ Error generating variants: {e}, using fallback")
+            return []
+
+    def _select_best_sentence_variant(
+        self,
+        variants: List[str],
+        target_length: int,
+        prev_context: str,
+        verbose: bool = False
+    ) -> Optional[str]:
+        """Select best sentence variant based on format compliance, zipper check, and length proximity.
+
+        Args:
+            variants: List of variant strings
+            target_length: Target word count
+            prev_context: Previous context for zipper check
+            verbose: Verbose output
+
+        Returns:
+            Best variant string, or None if no valid variants
+        """
+        if not variants:
+            return None
+
+        valid_candidates = []
+
+        for v in variants:
+            # 1. Format check (basic validation)
+            if not v or len(v.split()) < 3:
+                continue
+
+            # 2. ZIPPER CHECK (The Optimization)
+            # If this variant echoes the previous sentence, disqualify it immediately
+            if prev_context and check_zipper_merge(prev_context, v):
+                if verbose:
+                    print(f"      Variant filtered (Zipper Check): {v[:50]}...")
+                continue
+
+            valid_candidates.append(v)
+
+        if not valid_candidates:
+            # Fallback: ignore zipper check if all failed (let the main loop handle the retry)
+            if verbose:
+                print(f"      ⚠ All variants failed zipper check, using best anyway")
+            valid_candidates = variants
+
+        if not valid_candidates:
+            return None
+
+        # 3. Select by Length from VALID candidates only
+        best = min(valid_candidates, key=lambda v: abs(len(v.split()) - target_length))
+        return best
 
     def _refine_sentence(
         self,

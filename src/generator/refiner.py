@@ -10,6 +10,7 @@ from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from src.generator.llm_provider import LLMProvider
 from src.utils.parsing import extract_json_from_text
+from src.utils.text_processing import parse_variants_from_response
 
 
 class ParagraphRefiner:
@@ -406,19 +407,13 @@ Strictly follow the constraints below.
                 max_tokens=500
             )
 
-            # Parse delimiter-based format
-            variants = []
-            for line in response.splitlines():
-                line = line.strip()
-                if line.startswith("VAR:"):
-                    variant = line[4:].strip()  # Remove "VAR:" prefix
-                    if variant:  # Only add non-empty variants
-                        variants.append(variant)
+            # Parse variants using shared utility
+            variants = parse_variants_from_response(response, verbose=verbose)
 
             if variants:
                 return variants
             else:
-                # Fallback: if no variants found, return original sentence as single variant
+                # Final fallback: if no variants found, return original sentence as single variant
                 if verbose:
                     print(f"      ⚠ No variants parsed from response, using fallback")
                 return [sentence]

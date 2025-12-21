@@ -90,6 +90,8 @@
     "num_candidates": 6,
     "max_retries": 3,
     "compliance_threshold": 0.85,
+    "compliance_fuzziness": 0.05,
+    "sentence_variants_per_attempt": 5,
     "default_perspective": "first_person_singular"
   },
   "global_context": {

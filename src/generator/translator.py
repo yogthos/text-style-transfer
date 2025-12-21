@@ -37,6 +37,7 @@ from src.generator.content_planner import ContentPlanner
 from src.generator.refiner import ParagraphRefiner
 from src.validator.statistical_critic import StatisticalCritic
 from src.utils.nlp_manager import NLPManager
+from src.utils.text_processing import check_zipper_merge
 
 
 def _load_prompt_template(template_name: str) -> str:
@@ -4359,6 +4360,14 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                         print(f"    ⚠ Empty sentence generated, retrying...")
                     continue  # Skip empty results
 
+                # ZIPPER CHECK (Fail Fast - before expensive statistical validation)
+                if final_sentences:  # Only check if we have previous sentences
+                    prev_sentence = final_sentences[-1]
+                    if check_zipper_merge(prev_sentence, sentence):
+                        if verbose:
+                            print(f"    ⚠ Stitch Glitch detected (Echo), retrying...")
+                        continue  # Reject and retry immediately
+
                 # Validate strict compliance (math only)
                 score, feedback = self.statistical_critic.evaluate_sentence(
                     sentence, target_len
@@ -4814,12 +4823,25 @@ Adopt the voice of {author_name}.
 Output only the sentence, no explanations.
 """
 
-        user_prompt = template.format(
-            slot_content=content,
-            target_length=target_length,
-            prev_context=prev_context,
-            author_name=author_name
-        )
+        # 1. Build the Constraint String (with safety fallback)
+        anti_echo_section = ""  # Default to empty string
+        if prev_context:
+            prev_words = prev_context.strip().split()
+            if len(prev_words) >= 3:
+                # Protect against Markdown injection in the previous text
+                clean_prev = " ".join(prev_words[:4]).replace("`", "").replace("*", "")
+                anti_echo_section = f"**DO NOT start with:** '{clean_prev}...'"
+
+        # 2. Safe Formatting (use dictionary to ensure all keys present)
+        prompt_params = {
+            "slot_content": content,
+            "target_length": target_length,
+            "prev_context": prev_context,
+            "anti_echo_section": anti_echo_section,  # Must be present even if empty
+            "author_name": author_name
+        }
+
+        user_prompt = template.format(**prompt_params)
 
         try:
             result = self.llm_provider.call(

@@ -10,8 +10,8 @@ import ast
 from typing import Optional, Union, List, Dict
 
 
-def extract_json_from_text(text: str) -> Optional[Union[List, Dict]]:
-    """Extract and parse JSON from text that may contain formatting errors.
+def extract_json_from_text(text: str, verbose: bool = False) -> Optional[Union[List, Dict]]:
+    """Robustly extract JSON from text, handling single-quotes and Markdown.
 
     Handles common LLM output issues:
     - Single quotes instead of double quotes (Python dict format)
@@ -21,72 +21,73 @@ def extract_json_from_text(text: str) -> Optional[Union[List, Dict]]:
 
     Args:
         text: Text that may contain JSON
+        verbose: If True, print debug information on failure
 
     Returns:
         Parsed JSON object (list or dict), or None if parsing fails
     """
     if not text or not text.strip():
+        if verbose:
+            print(f"  ⚠ extract_json_from_text: Empty input")
         return None
 
-    # Step 1: Remove Markdown code blocks if present
-    text = re.sub(r'```json\s*', '', text, flags=re.IGNORECASE)
-    text = re.sub(r'```\s*', '', text)
+    original_text = text  # Keep for error reporting
 
-    # Step 2: Find JSON array or object pattern
-    # Look for first [ or { and matching closing bracket
-    array_match = re.search(r'(\[.*\])', text, re.DOTALL)
-    dict_match = re.search(r'(\{.*\})', text, re.DOTALL)
+    # 1. Clean Markdown
+    text = re.sub(r'```(\w+)?', '', text).strip()
 
-    json_str = None
-    if array_match:
-        json_str = array_match.group(1)
-    elif dict_match:
-        json_str = dict_match.group(1)
-
-    if not json_str:
+    # 2. Extract content between first [/{ and last ]/}
+    match = re.search(r'(\[.*\]|\{.*\})', text, re.DOTALL)
+    if not match:
+        if verbose:
+            print(f"  ⚠ extract_json_from_text: No JSON structure found in text")
+            print(f"  ⚠ Original response (first 200 chars): {original_text[:200]}")
         return None
+    candidate = match.group(1)
 
-    # Step 3: Fix common LLM formatting errors
-    # Replace single quotes around keys with double quotes
-    # Pattern: 'key': value -> "key": value
-    # Be careful not to replace apostrophes in text values
-    # Use a more sophisticated approach: only replace quotes around keys
-
-    # First, try to parse as-is
+    # 3. Try Standard JSON
     try:
-        return json.loads(json_str)
-    except json.JSONDecodeError:
+        result = json.loads(candidate)
+        if verbose:
+            print(f"  ✓ JSON parsed successfully (standard JSON)")
+        return result
+    except (json.JSONDecodeError, ValueError) as e:
+        if verbose:
+            print(f"  ⚠ Standard JSON parse failed: {e}")
         pass
 
-    # Second, try ast.literal_eval (handles Python dict syntax with single quotes)
-    # This is safer than aggressive regex replacement
+    # 4. Try Python Literal Eval (Handles {'key': 'val'}) - THIS FIXES THE BUG
     try:
-        return ast.literal_eval(json_str)
-    except (ValueError, SyntaxError):
+        result = ast.literal_eval(candidate)
+        if verbose:
+            print(f"  ✓ JSON parsed successfully (ast.literal_eval)")
+        return result
+    except (ValueError, SyntaxError) as e:
+        if verbose:
+            print(f"  ⚠ ast.literal_eval failed: {e}")
         pass
 
-    # Third, try fixing single quotes around keys
-    # Pattern: 'word': -> "word":
-    fixed_json = re.sub(r"'(\w+)':", r'"\1":', json_str)
-
-    # Also fix: 'word' : -> "word":
-    fixed_json = re.sub(r"'(\w+)'\s*:", r'"\1":', fixed_json)
-
+    # 5. Fallback: Regex replace single quotes
     try:
-        return json.loads(fixed_json)
-    except json.JSONDecodeError:
+        # Replace 'key': with "key":
+        candidate_fixed = re.sub(r"'([\w_]+)':", r'"\1":', candidate)
+        # Replace 'value' with "value"
+        candidate_fixed = re.sub(r":\s*'([^']*)'", r': "\1"', candidate_fixed)
+        result = json.loads(candidate_fixed)
+        if verbose:
+            print(f"  ✓ JSON parsed successfully (regex fix)")
+        return result
+    except (json.JSONDecodeError, ValueError) as e:
+        if verbose:
+            print(f"  ⚠ Regex fix failed: {e}")
         pass
 
-    # Last resort: try to fix single quotes in string values too
-    # This is more dangerous but sometimes necessary
-    # Only do this if we're sure it's a JSON structure
-    try:
-        # Replace all single quotes with double quotes (very aggressive)
-        # This might break things, but it's a last resort
-        fully_fixed = json_str.replace("'", '"')
-        return json.loads(fully_fixed)
-    except json.JSONDecodeError:
-        pass
+    # All parsing attempts failed - log the problematic text
+    if verbose:
+        print(f"  ⚠ CRITICAL: All JSON parsing attempts failed")
+        print(f"  ⚠ Original response (first 500 chars): {original_text[:500]}")
+        print(f"  ⚠ Extracted candidate (first 500 chars): {candidate[:500]}")
+        print(f"  ⚠ This suggests the LLM did not return valid JSON format")
 
     return None
 

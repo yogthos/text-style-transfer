@@ -142,7 +142,16 @@ Output ONLY the JSON array, no other text.
             # Parse JSON response using robust extractor
             plan = None
             if isinstance(response, str):
-                plan = extract_json_from_text(response)
+                plan = extract_json_from_text(response, verbose=True)  # Always verbose for debugging
+                if not plan:
+                    # Always log the full response for debugging JSON failures
+                    print(f"  ⚠ CRITICAL: Failed to extract JSON from repair plan response")
+                    print(f"  ⚠ Full response ({len(response)} chars):")
+                    print(f"  {'='*60}")
+                    print(f"  {response}")
+                    print(f"  {'='*60}")
+                    print(f"  ⚠ This suggests the LLM did not return valid JSON format")
+                    print(f"  ⚠ Check the repair_plan_user.md prompt to ensure JSON format is enforced")
             else:
                 plan = response
 
@@ -224,8 +233,26 @@ Output ONLY the JSON array, no other text.
         modified_sentences = sentences.copy()
 
         for instruction in repair_plan:
+            # Validate instruction structure
+            if not isinstance(instruction, dict):
+                if verbose:
+                    print(f"  ⚠ Skipping invalid instruction (not a dict): {instruction}")
+                continue
+
             # sent_index is 1-based in the plan, convert to 0-based
-            sent_index_1based = instruction.get('sent_index', -1)
+            sent_index_1based = instruction.get('sent_index')
+            if sent_index_1based is None:
+                if verbose:
+                    print(f"  ⚠ Instruction missing 'sent_index' field: {instruction}")
+                continue
+
+            try:
+                sent_index_1based = int(sent_index_1based)
+            except (ValueError, TypeError):
+                if verbose:
+                    print(f"  ⚠ Invalid 'sent_index' value (must be int): {instruction.get('sent_index')}")
+                continue
+
             sent_index = sent_index_1based - 1  # Convert to 0-based
 
             action = instruction.get('action', '')
@@ -234,7 +261,7 @@ Output ONLY the JSON array, no other text.
 
             if sent_index < 0 or sent_index >= len(modified_sentences):
                 if verbose:
-                    print(f"  ⚠ Invalid sentence index {sent_index_1based} (1-based), skipping")
+                    print(f"  ⚠ Invalid sentence index {sent_index_1based} (1-based, max={len(modified_sentences)}), skipping")
                 continue
 
             if verbose:

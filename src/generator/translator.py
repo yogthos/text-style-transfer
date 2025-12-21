@@ -4390,13 +4390,15 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         final_paragraph = " ".join(final_sentences)
 
         # BLUEPRINT-AWARE GRADING: Calculate targets from structure map, not archetype averages
-        # CRITICAL: Use archetype's burstiness to avoid low-sample noise (e.g., 2 sentences)
+        # CRITICAL: Skip burstiness check for short paragraphs (sentence_count < 3) to avoid low-sample noise
         # The burstiness is already baked into the structure map (e.g., [Short, Long])
+        sentence_count = len(structure_map)
         blueprint_target_stats = {
-            "avg_sents": len(structure_map),
-            "avg_len": sum(s['target_len'] for s in structure_map) / len(structure_map) if structure_map else 0,
-            # FORCE PASS: Copy burstiness from archetype to avoid unfair calculation for short paragraphs
-            "burstiness": archetype_desc.get("burstiness", "Low"),
+            "avg_sents": sentence_count,
+            "avg_len": sum(s['target_len'] for s in structure_map) / sentence_count if structure_map else 0,
+            # Skip burstiness check for short paragraphs (statistically noisy)
+            # For longer paragraphs, use archetype's burstiness
+            "burstiness": None if sentence_count < 3 else archetype_desc.get("burstiness", "Low"),
             "style": archetype_desc.get("style", ""),
             "id": archetype_desc.get("id", 0)
         }
@@ -4411,7 +4413,23 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         if verbose:
             print(f"  Final compliance score: {best_score:.2f}")
 
-        # Check if refinement is needed (flow/coherence issues)
+        # LEXICAL DIVERSITY GUARD: Check for repetitive phrasing
+        repetition_issues = self.statistical_critic.check_repetition(final_paragraph)
+        if repetition_issues:
+            if verbose:
+                print(f"  ⚠ Lexical repetition detected: {len(repetition_issues)} issues")
+                for issue in repetition_issues[:3]:  # Show first 3 issues
+                    print(f"    - {issue}")
+            # Add repetition issues to feedback - repair loop will handle it
+            if qualitative_feedback:
+                qualitative_feedback += " " + " ".join(repetition_issues)
+            else:
+                qualitative_feedback = " ".join(repetition_issues)
+            # Optionally lower score slightly to ensure repair is triggered if close to threshold
+            if best_score >= 0.85:
+                best_score = min(best_score, 0.84)  # Force repair for repetition issues
+
+        # Check if refinement is needed (flow/coherence issues OR repetition issues)
         compliance_threshold = self.generation_config.get("compliance_threshold", 0.85)
         if best_score < compliance_threshold and qualitative_feedback:
             if verbose:
@@ -4431,22 +4449,45 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     verbose
                 )
 
-                # Re-validate refined text
-                refined_text, refined_score, _ = self.statistical_critic.select_best_candidate(
-                    [refined_text], blueprint_target_stats
-                )
-
-                if refined_score > best_score:
+                if not refined_text or refined_text == best_text:
                     if verbose:
-                        print(f"  ✓ Repair improved score: {refined_score:.2f} (was {best_score:.2f})")
-                    best_text = refined_text
-                    best_score = refined_score
+                        print(f"  Repair did not produce changes, keeping original")
                 else:
-                    if verbose:
-                        print(f"  Repair did not improve score ({refined_score:.2f} <= {best_score:.2f}), keeping original")
+                    # Re-validate refined text
+                    refined_text, refined_score, _ = self.statistical_critic.select_best_candidate(
+                        [refined_text], blueprint_target_stats
+                    )
+
+                    if refined_score > best_score:
+                        if verbose:
+                            print(f"  ✓ Repair improved score: {refined_score:.2f} (was {best_score:.2f})")
+                        best_text = refined_text
+                        best_score = refined_score
+                    else:
+                        if verbose:
+                            print(f"  Repair did not improve score ({refined_score:.2f} <= {best_score:.2f}), keeping original")
             except Exception as e:
+                import traceback
+                error_msg = str(e)
+                error_type = type(e).__name__
+
+                # Always log repair failures with full context
+                print(f"  ⚠ Repair failed ({error_type}): {error_msg}")
+
                 if verbose:
-                    print(f"  ⚠ Repair failed: {e}, keeping original")
+                    print(f"  ⚠ Full traceback:")
+                    traceback.print_exc()
+
+                # Check for JSON-related errors
+                if "JSON" in str(e) or "json" in str(e).lower() or "sent_index" in str(e):
+                    print(f"  ⚠ JSON parsing/access error detected")
+                    print(f"  ⚠ This usually means the LLM did not return valid JSON format")
+                    print(f"  ⚠ Check the repair_plan_user.md prompt and LLM provider JSON enforcement")
+
+                # Truncate for final message if needed
+                if len(error_msg) > 100:
+                    error_msg = error_msg[:100] + "..."
+                print(f"  ⚠ Keeping original text due to repair failure")
 
         return best_text, target_arch_id, best_score
 

@@ -5,6 +5,8 @@ archetype parameters (sentence length, burstiness, etc.) using spaCy.
 """
 
 import json
+import re
+from collections import Counter
 from pathlib import Path
 from typing import Dict, Tuple, Optional, List
 
@@ -407,4 +409,60 @@ class StatisticalCritic:
             return 0.0, f"Too long ({word_count} words). Cut to {target_length} words."
         else:
             return 0.0, f"Too short ({word_count} words). Expand to {target_length} words."
+
+    def check_repetition(self, text: str) -> List[str]:
+        """Detect repetitive phrasing in text.
+
+        Scans for repeated n-grams (2-3 word phrases) and proximal word repetition.
+        This is a code-based check to catch vocabulary "echoes" that the Assembly Line
+        might miss when building sentences in isolation.
+
+        Args:
+            text: Text to check for repetition
+
+        Returns:
+            List of issue strings describing repetitions found
+        """
+        if not text or not text.strip():
+            return []
+
+        issues = []
+        text_lower = text.lower()
+        words = re.findall(r'\b\w+\b', text_lower)
+
+        if len(words) < 4:  # Need at least 4 words for meaningful checks
+            return []
+
+        # 1. Check for Repeated N-grams (2-3 words)
+        for n in [2, 3]:
+            ngrams = [' '.join(words[i:i+n]) for i in range(len(words)-n+1)]
+            counts = Counter(ngrams)
+            for phrase, count in counts.items():
+                if count > 1:
+                    issues.append(f"Repeated phrase: '{phrase}' (appears {count} times)")
+
+        # 2. Check for Proximal Word Repetition (Same word twice within 10 words)
+        # Filter out common stopwords to avoid false positives
+        stopwords = {
+            'the', 'a', 'an', 'and', 'or', 'but', 'in', 'on', 'at', 'to', 'for', 'of', 'with', 'by',
+            'is', 'are', 'was', 'were', 'be', 'been', 'have', 'has', 'had', 'do', 'does', 'did',
+            'will', 'would', 'could', 'should', 'may', 'might', 'must', 'can', 'this', 'that',
+            'these', 'those', 'it', 'its', 'they', 'them', 'their', 'there', 'then', 'than'
+        }
+
+        seen_words = set()
+        for i in range(len(words)):
+            word = words[i]
+            if word in stopwords:
+                continue
+            if word in seen_words:
+                continue  # Already reported this word
+
+            # Check next 10 words for repetition
+            window = words[i+1:min(i+11, len(words))]
+            if word in window:
+                issues.append(f"Repeated word: '{word}' appears twice within 10 words")
+                seen_words.add(word)  # Only report once per word
+
+        return issues
 

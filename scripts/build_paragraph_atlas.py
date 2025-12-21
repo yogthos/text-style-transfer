@@ -321,10 +321,12 @@ def main():
     args = parser.parse_args()
 
     # Apply relaxed mode if requested
+    relaxed_sentences_default = 2
+    relaxed_min_style_score = 3
     if args.relaxed:
-        args.min_sentences = 1
-        args.min_style_score = 3
-        print("⚠️  Using RELAXED mode: min-sentences=1, min-style-score=3")
+        args.min_sentences = relaxed_sentences_default
+        args.min_style_score = relaxed_min_style_score
+        print(f"⚠️  Using RELAXED mode: min-sentences={args.min_sentences}, min-style-score={args.min_style_score}")
 
     # Validate inputs
     if not os.path.exists(args.corpus_file):

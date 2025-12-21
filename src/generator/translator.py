@@ -623,6 +623,61 @@ class StyleTranslator:
             # Default to third person if no clear indicators
             return "third_person"
 
+    def verify_perspective(self, generated_text: str, expected_perspective: str) -> bool:
+        """Verify that generated text matches expected perspective.
+
+        Uses spaCy to extract all pronouns and checks that they match the expected perspective.
+        Returns True if all pronouns match expected perspective, False otherwise.
+
+        Args:
+            generated_text: Generated text to verify
+            expected_perspective: Expected perspective ('first_person_singular', 'first_person_plural', or 'third_person')
+
+        Returns:
+            True if all pronouns match expected perspective, False otherwise
+        """
+        if not generated_text or not generated_text.strip():
+            return True  # Empty text passes
+
+        from tests.utils.linguistic_helpers import extract_perspective_pronouns
+        from src.utils.nlp_manager import NLPManager
+
+        try:
+            nlp = NLPManager.get_nlp()
+            doc = nlp(generated_text)
+            pronouns = extract_perspective_pronouns(doc)
+
+            # Check which perspectives are present
+            has_first_singular = len(pronouns["first_singular"]) > 0
+            has_first_plural = len(pronouns["first_plural"]) > 0
+            has_third_singular = len(pronouns["third_singular"]) > 0
+            has_third_plural = len(pronouns["third_plural"]) > 0
+
+            # Verify based on expected perspective
+            if expected_perspective == "first_person_singular":
+                # Should have first singular, no third person
+                return has_first_singular and not (has_third_singular or has_third_plural)
+            elif expected_perspective == "first_person_plural":
+                # Should have first plural, no third person
+                return has_first_plural and not (has_third_singular or has_third_plural)
+            elif expected_perspective == "third_person":
+                # Should have third person, no first person
+                return (has_third_singular or has_third_plural) and not (has_first_singular or has_first_plural)
+            else:
+                # Unknown perspective, default to True
+                return True
+
+        except Exception as e:
+            # If spaCy fails, fallback to basic check
+            text_lower = generated_text.lower()
+            if expected_perspective == "first_person_singular":
+                return any(pronoun in text_lower for pronoun in ["i", "me", "my", "mine", "myself"])
+            elif expected_perspective == "first_person_plural":
+                return any(pronoun in text_lower for pronoun in ["we", "us", "our", "ours", "ourselves"])
+            elif expected_perspective == "third_person":
+                return any(pronoun in text_lower for pronoun in ["he", "she", "it", "him", "her", "his", "they", "them", "their"])
+            return True
+
     def _normalize_perspective(self, pov: str, pov_breakdown: Optional[Dict] = None) -> str:
         """Normalize perspective string to standard format.
 

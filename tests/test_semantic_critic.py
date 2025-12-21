@@ -832,7 +832,7 @@ def test_evaluate_paragraph_mode_with_coherence_check():
     from unittest.mock import Mock, patch
     import json
     import numpy as np
-    from src.analysis.semantic_analyzer import PropositionExtractor
+    from src.ingestion.blueprint import BlueprintExtractor
 
     critic = SemanticCritic()
 
@@ -851,9 +851,10 @@ def test_evaluate_paragraph_mode_with_coherence_check():
     # Use text that will have high proposition recall but is still gibberish
     generated_text = "I spent my childhood scavenging in the ruins of the Soviet Union to turing complete and the violent shift."
 
-    # Extract propositions
-    extractor = PropositionExtractor()
-    propositions = extractor.extract_atomic_propositions(original_text)
+    # Extract propositions using BlueprintExtractor (replaces PropositionExtractor)
+    extractor = BlueprintExtractor()
+    blueprint = extractor.extract(original_text)
+    propositions = blueprint.core_keywords  # Use keywords as proxy for propositions
 
     # Create blueprint
     from src.ingestion.blueprint import BlueprintExtractor
@@ -903,7 +904,7 @@ def test_evaluate_paragraph_mode_coherent_text():
     """Test _evaluate_paragraph_mode with coherent text (should pass)."""
     from unittest.mock import Mock
     import json
-    from src.analysis.semantic_analyzer import PropositionExtractor
+    from src.ingestion.blueprint import BlueprintExtractor
 
     critic = SemanticCritic()
 
@@ -921,14 +922,11 @@ def test_evaluate_paragraph_mode_coherent_text():
     original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
     generated_text = "During my youth, I searched through the remains of the Soviet Union."
 
-    # Extract propositions
-    extractor = PropositionExtractor()
-    propositions = extractor.extract_atomic_propositions(original_text)
-
-    # Create blueprint
+    # Extract propositions using BlueprintExtractor (replaces PropositionExtractor)
     from src.ingestion.blueprint import BlueprintExtractor
     blueprint_extractor = BlueprintExtractor()
     blueprint = blueprint_extractor.extract(original_text)
+    propositions = list(blueprint.core_keywords)  # Use keywords as proxy for propositions
 
     # Evaluate in paragraph mode
     result = critic._evaluate_paragraph_mode(
@@ -953,7 +951,7 @@ def test_evaluate_paragraph_mode_score_normalization():
     """Test that _evaluate_paragraph_mode properly normalizes weights so score is in [0, 1] range."""
     from unittest.mock import Mock
     import json
-    from src.analysis.semantic_analyzer import PropositionExtractor
+    from src.ingestion.blueprint import BlueprintExtractor
 
     critic = SemanticCritic()
 
@@ -971,14 +969,11 @@ def test_evaluate_paragraph_mode_score_normalization():
     original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
     generated_text = "During my youth, I searched through the remains of the Soviet Union."
 
-    # Extract propositions
-    extractor = PropositionExtractor()
-    propositions = extractor.extract_atomic_propositions(original_text)
-
-    # Create blueprint
+    # Extract propositions using BlueprintExtractor (replaces PropositionExtractor)
     from src.ingestion.blueprint import BlueprintExtractor
     blueprint_extractor = BlueprintExtractor()
     blueprint = blueprint_extractor.extract(original_text)
+    propositions = list(blueprint.core_keywords)  # Use keywords as proxy for propositions
 
     # Evaluate in paragraph mode without style vector
     # The score should still be normalized even if expensive checks don't run
@@ -1026,7 +1021,7 @@ def test_evaluate_paragraph_mode_sanity_gate_score_zero():
     """Test that sanity gate correctly sets score=0.0 when coherence < 0.6, and applies penalty for 0.6-0.8 range."""
     from unittest.mock import Mock
     import json
-    from src.analysis.semantic_analyzer import PropositionExtractor
+    from src.ingestion.blueprint import BlueprintExtractor
 
     critic = SemanticCritic()
 
@@ -1045,14 +1040,11 @@ def test_evaluate_paragraph_mode_sanity_gate_score_zero():
     # Use text that will have high proposition recall but low coherence
     generated_text = "I spent my childhood scavenging in the ruins of the Soviet Union to turing complete and the violent shift."
 
-    # Extract propositions
-    extractor = PropositionExtractor()
-    propositions = extractor.extract_atomic_propositions(original_text)
-
-    # Create blueprint
+    # Extract propositions using BlueprintExtractor (replaces PropositionExtractor)
     from src.ingestion.blueprint import BlueprintExtractor
     blueprint_extractor = BlueprintExtractor()
     blueprint = blueprint_extractor.extract(original_text)
+    propositions = list(blueprint.core_keywords)  # Use keywords as proxy for propositions
 
     # Evaluate in paragraph mode
     result = critic._evaluate_paragraph_mode(
@@ -1082,7 +1074,7 @@ def test_evaluate_paragraph_mode_coherence_penalty():
     """Test that coherence in 0.6-0.8 range applies penalty (score *= 0.5) but doesn't kill."""
     from unittest.mock import Mock
     import json
-    from src.analysis.semantic_analyzer import PropositionExtractor
+    from src.ingestion.blueprint import BlueprintExtractor
 
     critic = SemanticCritic()
 
@@ -1100,14 +1092,11 @@ def test_evaluate_paragraph_mode_coherence_penalty():
     original_text = "I spent my childhood scavenging in the ruins of the Soviet Union."
     generated_text = "During my youth, I searched through the remains of the Soviet Union, though the phrasing is somewhat awkward."
 
-    # Extract propositions
-    extractor = PropositionExtractor()
-    propositions = extractor.extract_atomic_propositions(original_text)
-
-    # Create blueprint
+    # Extract propositions using BlueprintExtractor (replaces PropositionExtractor)
     from src.ingestion.blueprint import BlueprintExtractor
     blueprint_extractor = BlueprintExtractor()
     blueprint = blueprint_extractor.extract(original_text)
+    propositions = list(blueprint.core_keywords)  # Use keywords as proxy for propositions
 
     # Evaluate in paragraph mode
     result = critic._evaluate_paragraph_mode(

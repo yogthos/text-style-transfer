@@ -47,8 +47,8 @@ def check_zipper_merge(prev_sent: str, new_sent: str) -> bool:
         start_trigram = " ".join(n_words[:3])
         # Check last 6 words of previous sentence
         prev_tail = " ".join(p_words[-6:]) if len(p_words) >= 6 else " ".join(p_words)
-    if start_trigram in prev_tail:
-        return True
+        if start_trigram in prev_tail:
+            return True
 
     return False
 

@@ -644,20 +644,155 @@ The current implementation uses **Statistical Archetype Generation**:
 
 ## Testing
 
-Run tests:
+The project includes comprehensive test suites for both code quality and linguistic quality validation.
+
+### Quick Validation (No Dependencies Required)
+
+Validate test syntax and structure without installing dependencies:
+```bash
+python3 tests/run_integration_tests.py
+```
+
+### Running Tests
+
+**Prerequisites:**
+```bash
+# Ensure dependencies are installed
+pip install -r requirements.txt
+
+# Download spaCy model (required for linguistic tests)
+python3 -m spacy download en_core_web_sm
+```
+
+**Run All Tests:**
 ```bash
 # Activate virtual environment first
 source venv/bin/activate  # On Windows: venv\Scripts\activate
 
-# Run individual test files
-python3 tests/test_paragraph_rhythm_extraction.py
-python3 tests/test_translate_paragraph_contract.py
-python3 tests/test_pipeline_fallback_contract.py
-python3 tests/test_quality_improvements.py
+# Run all tests with pytest
+pytest tests/ -v
 
-# Or run all tests with pytest
-pytest tests/
+# Run with coverage report
+pytest tests/ --cov=src --cov-report=html
 ```
+
+### Test Suites
+
+#### 1. Linguistic Quality Tests
+
+Tests that validate linguistic rules and quality:
+```bash
+# Run all linguistic quality tests
+pytest tests/integration/test_linguistic_quality.py -v
+
+# Run specific test classes
+pytest tests/integration/test_linguistic_quality.py::TestAntiStutterZipperMerge -v
+pytest tests/integration/test_linguistic_quality.py::TestActionEchoDetection -v
+pytest tests/integration/test_linguistic_quality.py::TestGroundingValidation -v
+pytest tests/integration/test_linguistic_quality.py::TestPerspectiveLock -v
+```
+
+**Coverage:**
+- Anti-stutter (zipper merge) detection
+- Action echo detection using spaCy lemmatization
+- Grounding validation (anti-moralizing)
+- Perspective lock verification
+
+#### 2. Structural Integrity Tests
+
+Tests for edge cases and error handling:
+```bash
+# Run structural integrity tests
+pytest tests/integration/test_structural_integrity.py -v
+```
+
+**Coverage:**
+- Impossible constraint handling (e.g., 50-word sentence in 5-word slot)
+- Empty slot marking and handling
+- Sledgehammer convergence (programmatic split after max retries)
+
+#### 3. Narrative Flow Tests
+
+Parametrized tests for perspective locking:
+```bash
+# Run narrative flow tests
+pytest tests/integration/test_narrative_flow.py -v
+```
+
+**Coverage:**
+- Perspective detection and verification
+- Edge cases (empty text, no pronouns, mixed perspectives)
+
+#### 4. Golden Paragraph Regression
+
+Regression tests to catch quality drift:
+```bash
+# Run golden set regression tests
+pytest tests/golden_set/test_golden_regression.py -v
+
+# Run specific golden examples
+pytest tests/golden_set/test_golden_regression.py -k "golden_001" -v
+```
+
+**Note:** Golden regression tests compare new outputs against cached golden examples using semantic similarity. No LLM API calls are needed for comparison.
+
+#### 5. Unit Tests
+
+Individual component tests:
+```bash
+# Run specific unit test files
+pytest tests/test_paragraph_rhythm_extraction.py -v
+pytest tests/test_translate_paragraph_contract.py -v
+pytest tests/test_pipeline_fallback_contract.py -v
+pytest tests/test_quality_improvements.py -v
+pytest tests/test_semantic_critic.py -v
+pytest tests/test_validator.py -v
+```
+
+### Test Organization
+
+```
+tests/
+├── integration/           # Integration tests (linguistic quality, structural integrity)
+│   ├── test_linguistic_quality.py
+│   ├── test_structural_integrity.py
+│   ├── test_narrative_flow.py
+│   └── conftest.py        # Shared fixtures
+├── golden_set/            # Golden paragraph regression tests
+│   ├── test_golden_regression.py
+│   └── examples/          # Golden example JSON files
+├── metrics/               # Performance tracking
+│   └── track_llm_calls.py
+├── mocks/                 # Mock LLM responses
+│   ├── mock_llm_provider.py
+│   └── llm_responses.json
+└── utils/                 # Test utilities
+    └── linguistic_helpers.py
+```
+
+### Test Features
+
+- **No LLM API Required**: All tests use mocked LLM responses
+- **Fast Execution**: Deterministic tests run quickly
+- **CI/CD Ready**: Tests run automatically in GitHub Actions
+- **Comprehensive Coverage**: Tests cover linguistic rules, edge cases, and regression scenarios
+
+### CI/CD Integration
+
+Tests run automatically on pull requests and pushes via GitHub Actions:
+- **Stage 1**: Deterministic unit tests (no LLM)
+- **Stage 2**: Mocked integration tests (mocked LLM)
+
+See `.github/workflows/linguistic_quality.yml` for details.
+
+### Writing New Tests
+
+1. **Linguistic Quality Tests**: Add to `tests/integration/test_linguistic_quality.py`
+2. **Structural Tests**: Add to `tests/integration/test_structural_integrity.py`
+3. **Unit Tests**: Add to appropriate `tests/test_*.py` file
+4. **Golden Examples**: Add JSON files to `tests/golden_set/examples/`
+
+For more details, see `tests/integration/README.md`.
 
 ## Troubleshooting
 

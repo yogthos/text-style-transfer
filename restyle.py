@@ -156,6 +156,10 @@ Note: Author styles must be loaded into ChromaDB first using:
     except KeyboardInterrupt:
         print("\n\nInterrupted by user", file=sys.stderr)
         sys.exit(130)
+    except FileNotFoundError as e:
+        # Display FileNotFoundError messages clearly (they already contain helpful instructions)
+        print(str(e), file=sys.stderr)
+        sys.exit(1)
     except Exception as e:
         print(f"\nError: {e}", file=sys.stderr)
         if args.verbose:

@@ -31,7 +31,21 @@ class ParagraphAtlas:
         # Load archetypes
         archetypes_path = self.author_dir / "archetypes.json"
         if not archetypes_path.exists():
-            raise FileNotFoundError(f"Archetypes file not found: {archetypes_path}")
+            error_msg = (
+                f"\n{'='*70}\n"
+                f"ERROR: Paragraph Atlas not found for author '{self.author}'\n"
+                f"{'='*70}\n"
+                f"Missing file: {archetypes_path}\n\n"
+                f"To fix this, build the paragraph atlas for '{self.author}':\n\n"
+                f"  Option 1 (Recommended - sets up everything):\n"
+                f"    python3 scripts/init_author.py --author \"{self.author}\" --style-file styles/sample_{self.author.lower()}.txt\n\n"
+                f"  Option 2 (Just build the atlas):\n"
+                f"    python3 scripts/build_paragraph_atlas.py styles/sample_{self.author.lower()}.txt --author \"{self.author}\"\n\n"
+                f"  If you get 'No valid paragraphs found', try:\n"
+                f"    python3 scripts/build_paragraph_atlas.py styles/sample_{self.author.lower()}.txt --author \"{self.author}\" --relaxed\n"
+                f"{'='*70}\n"
+            )
+            raise FileNotFoundError(error_msg)
 
         with open(archetypes_path, 'r') as f:
             archetypes_data = json.load(f)
@@ -45,7 +59,19 @@ class ParagraphAtlas:
         # Load transition matrix
         transition_path = self.author_dir / "transition_matrix.json"
         if not transition_path.exists():
-            raise FileNotFoundError(f"Transition matrix file not found: {transition_path}")
+            error_msg = (
+                f"\n{'='*70}\n"
+                f"ERROR: Transition matrix not found for author '{self.author}'\n"
+                f"{'='*70}\n"
+                f"Missing file: {transition_path}\n\n"
+                f"This file should be created when building the paragraph atlas.\n"
+                f"To fix this, rebuild the paragraph atlas:\n\n"
+                f"    python3 scripts/build_paragraph_atlas.py styles/sample_{self.author.lower()}.txt --author \"{self.author}\"\n\n"
+                f"Or use the turnkey script:\n"
+                f"    python3 scripts/init_author.py --author \"{self.author}\" --style-file styles/sample_{self.author.lower()}.txt\n"
+                f"{'='*70}\n"
+            )
+            raise FileNotFoundError(error_msg)
 
         with open(transition_path, 'r') as f:
             transition_data = json.load(f)

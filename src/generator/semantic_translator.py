@@ -5,7 +5,7 @@ meaning without style interference.
 """
 
 from pathlib import Path
-from typing import Optional
+from typing import Optional, Dict
 from src.generator.llm_provider import LLMProvider
 
 
@@ -46,7 +46,7 @@ class SemanticTranslator:
         self.temperature = self.semantic_config.get("temperature", 0.3)
         self.max_tokens = self.semantic_config.get("max_tokens", 1000)
 
-    def extract_neutral_summary(self, text: str, target_perspective: str = "auto") -> str:
+    def extract_neutral_summary(self, text: str, target_perspective: str = "auto", global_context: Optional[Dict] = None) -> str:
         """Extract neutral logical summary from text.
 
         Args:
@@ -56,6 +56,7 @@ class SemanticTranslator:
                 - "first_person_plural": Use We/Us/Our
                 - "third_person": Use The subject/The narrator
                 - "auto": Detect from input text
+            global_context: Optional global context dictionary with thesis, counter_arguments, stance_markers
 
         Returns:
             Neutral logical summary string
@@ -89,12 +90,31 @@ class SemanticTranslator:
             # Fallback prompt
             system_prompt = "You are a semantic neutralizer. Extract logical meaning without style."
 
+        # Build global context section if available
+        global_context_section = ""
+        if global_context:
+            thesis = global_context.get('thesis', '')
+            counter_arguments = global_context.get('counter_arguments', [])
+            stance_markers = global_context.get('stance_markers', [])
+
+            context_parts = []
+            if thesis:
+                context_parts.append(f"**Global Thesis:** {thesis}")
+            if counter_arguments:
+                context_parts.append(f"**Counter-Arguments:** {', '.join(counter_arguments[:3])}")
+            if stance_markers:
+                context_parts.append(f"**Stance Markers:** {', '.join(stance_markers[:3])}")
+
+            if context_parts:
+                global_context_section = "\n\n".join(context_parts) + "\n\n"
+
         try:
             user_template = _load_prompt_template("semantic_translator_user.md")
             user_prompt = user_template.format(
                 text=text,
                 target_perspective=target_perspective,
-                pronoun_guidance=pronoun_guidance
+                pronoun_guidance=pronoun_guidance,
+                global_context_section=global_context_section
             )
         except (FileNotFoundError, KeyError):
             # Fallback prompt
@@ -104,6 +124,10 @@ class SemanticTranslator:
 You must write this summary from the **{target_perspective}** point of view.
 {pronoun_guidance}
 Do NOT use 'The text says' or 'The author describes'. Be direct. Preserve the subject's agency and perspective.
+
+{global_context_section}**CRITICAL: Stance Awareness**
+- If the text describes an opposing view, make it clear the author is critiquing it
+- Do NOT present counter-arguments as facts
 
 Text:
 {text}"""

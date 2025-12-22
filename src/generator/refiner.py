@@ -9,6 +9,7 @@ import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
 from src.generator.llm_provider import LLMProvider
+from src.validator.statistical_critic import StatisticalCritic
 from src.utils.parsing import extract_json_from_text
 from src.utils.text_processing import parse_variants_from_response
 
@@ -26,6 +27,7 @@ class ParagraphRefiner:
         with open(config_path, 'r') as f:
             self.config = json.load(f)
         self.llm_provider = LLMProvider(config_path=config_path)
+        self.statistical_critic = StatisticalCritic(config_path=config_path)
 
     def refine_via_repair_plan(
         self,
@@ -53,10 +55,14 @@ class ParagraphRefiner:
         if not draft or not draft.strip():
             return draft, 0
 
+        # Calculate repetition count for compression bias logic
+        repetition_issues = self.statistical_critic.check_repetition(draft)
+        repetition_count = len(repetition_issues)
+
         # Step 1: Holistic Audit -> Repair Plan
         if verbose:
             print(f"  Performing holistic audit...")
-        repair_plan = self._generate_repair_plan(draft, feedback, structure_map, author_name, verbose)
+        repair_plan = self._generate_repair_plan(draft, feedback, structure_map, author_name, verbose, repetition_count=repetition_count)
 
         if not repair_plan:
             if verbose:
@@ -88,13 +94,84 @@ class ParagraphRefiner:
 
         return refined, structure_delta
 
+    def _refine_repair_strategy(
+        self,
+        instructions: List[Dict],
+        repetition_count: int,
+        total_sentences: int,
+        verbose: bool = False
+    ) -> List[Dict]:
+        """
+        Applies 'Compression Bias' if repetition is high.
+        Converts SPLIT -> MERGE/KEEP and REWRITE -> CONDENSE.
+
+        Args:
+            instructions: Raw repair instructions from LLM
+            repetition_count: Number of repetition issues detected
+            total_sentences: Total number of sentences in the draft
+            verbose: Enable verbose output
+
+        Returns:
+            Refined instructions list with compression bias applied
+        """
+        refinement_config = self.config.get("refinement", {})
+        if not refinement_config.get("prefer_compression_on_repetition", False):
+            return instructions
+
+        threshold = refinement_config.get("repetition_trigger_threshold", 5)
+
+        # If repetition is low, or we are already very short, don't compress
+        if repetition_count < threshold or total_sentences < 3:
+            return instructions
+
+        # Log compression mode activation
+        if verbose:
+            print(f"  📉 High Repetition ({repetition_count}) detected. Enforcing Compression Strategy.")
+
+        refined_instructions = []
+
+        for instr in instructions:
+            action = instr.get("action", "").lower()
+            instruction_text = instr.get("instruction", "").lower()
+            reason = instr.get("reason", "").lower() if "reason" in instr else ""
+
+            # VETO: Never split when we are already repeating ourselves
+            if action == "split":
+                if verbose:
+                    print(f"    - Swapped SPLIT -> REWRITE (Compression Mode)")
+                instr["action"] = "rewrite"
+                original_instruction = instr.get("instruction", "")
+                instr["instruction"] = (original_instruction + " Condense content to remove repetition.").strip()
+                refined_instructions.append(instr)
+
+            # MODIFY: If rewriting due to repetition, try to merge
+            elif action == "rewrite" and ("repetition" in reason or "repetition" in instruction_text):
+                # Check if we can merge (not the last sentence)
+                sent_index = instr.get("sent_index", 0)
+                if sent_index < total_sentences:
+                    if verbose:
+                        print(f"    - Swapped REWRITE -> MERGE_WITH_NEXT (Compression Mode)")
+                    instr["action"] = "merge_with_next"
+                    refined_instructions.append(instr)
+                else:
+                    original_instruction = instr.get("instruction", "")
+                    instr["instruction"] = (original_instruction + " Condense and remove repeated phrases.").strip()
+                    refined_instructions.append(instr)
+
+            # Keep other useful instructions (like remove, shorten, etc.)
+            else:
+                refined_instructions.append(instr)
+
+        return refined_instructions
+
     def _generate_repair_plan(
         self,
         draft: str,
         feedback: str,
         structure_map: List[Dict],
         author_name: str,
-        verbose: bool = False
+        verbose: bool = False,
+        repetition_count: Optional[int] = None
     ) -> List[Dict]:
         """Generate a repair plan from holistic audit.
 
@@ -104,6 +181,7 @@ class ParagraphRefiner:
             structure_map: Original blueprint structure map
             author_name: Author name
             verbose: Verbose output
+            repetition_count: Optional repetition count for compression bias logic
 
         Returns:
             List of repair instructions: [{"sent_index": 1, "action": "...", "instruction": "..."}, ...]
@@ -203,6 +281,31 @@ Output ONLY the JSON array, no other text.
 
             if verbose and len(validated_plan) < len(plan):
                 print(f"  ⚠ Validated {len(validated_plan)}/{len(plan)} instructions")
+
+            # Apply compression bias if repetition is high
+            if repetition_count is not None:
+                # Calculate total sentence count from draft
+                try:
+                    import spacy
+                    try:
+                        nlp = spacy.load("en_core_web_sm")
+                    except OSError:
+                        from spacy.cli import download
+                        download("en_core_web_sm")
+                        nlp = spacy.load("en_core_web_sm")
+                    doc = nlp(draft)
+                    total_sentences = len(list(doc.sents))
+                except Exception:
+                    # Fallback: simple split
+                    sentences = [s.strip() for s in draft.split('.') if s.strip()]
+                    total_sentences = len(sentences)
+
+                validated_plan = self._refine_repair_strategy(
+                    validated_plan,
+                    repetition_count,
+                    total_sentences,
+                    verbose=verbose
+                )
 
             return validated_plan
 

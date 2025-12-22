@@ -1240,10 +1240,21 @@ class SemanticCritic:
         # Build user prompt from template
         user_template = _load_prompt_template("semantic_critic_meaning_user.md")
 
-        # Build context section
+        # Build context section with stance information
         global_context_section = ""
-        if global_context and global_context.get('thesis'):
-            global_context_section = f"\n\nCONTEXT: The document is about {global_context['thesis']}. Verify that the generated text aligns with this context and doesn't introduce off-topic content."
+        if global_context:
+            context_parts = []
+            if global_context.get('thesis'):
+                context_parts.append(f"CONTEXT: The document is about {global_context['thesis']}. Verify that the generated text aligns with this context and doesn't introduce off-topic content.")
+            if global_context.get('counter_arguments'):
+                counter_args = ', '.join(global_context['counter_arguments'][:3])
+                context_parts.append(f"COUNTER-ARGUMENTS: The author opposes these views: {counter_args}. Ensure the generated text does NOT accidentally endorse these positions.")
+            if global_context.get('stance_markers'):
+                stance_markers = ', '.join(global_context['stance_markers'][:3])
+                context_parts.append(f"STANCE MARKERS: The author uses these patterns: {stance_markers}. Preserve the author's critical stance.")
+
+            if context_parts:
+                global_context_section = "\n\n" + "\n".join(context_parts)
 
         # Build intent task
         intent_task = ""
@@ -1291,9 +1302,23 @@ Does the generated text align with the intent '{intent}'? Consider:
                     return True, 0.5, "LLM response parsing failed"
 
             meaning_preserved = result.get("meaning_preserved", True)
-            confidence = float(result.get("confidence", 0.5))
+            original_confidence = float(result.get("confidence", 0.5))
+            stance_score = float(result.get("stance_score", 1.0))  # Default to 1.0 if not provided
             intent_score = float(result.get("intent_score", 1.0)) if intent else 1.0
             explanation = result.get("explanation", "")
+
+            # Apply stance penalty to confidence (CRITICAL: Keep return signature unchanged)
+            # If stance fails, heavily penalize confidence even if meaning is preserved
+            if stance_score < 0.5:
+                # Stance inversion detected - apply heavy penalty
+                confidence = stance_score * 0.5  # Tanks the score
+                explanation = f"[STANCE FAILURE] {explanation}" if explanation else "[STANCE FAILURE] Argumentative stance inverted (criticism became endorsement or vice versa)"
+                # Optionally also penalize intent_score if stance failure is severe
+                if stance_score < 0.3:
+                    intent_score = min(intent_score, 0.5)
+            elif stance_score >= 0.5:
+                # Weight stance into confidence
+                confidence = (original_confidence * 0.5) + (stance_score * 0.5)
 
             return meaning_preserved, confidence, intent_score, explanation
         except Exception as e:
@@ -1329,11 +1354,11 @@ Does the generated text align with the intent '{intent}'? Consider:
                 # Fallback: use default weight if not in config
                 # This handles backward compatibility
                 default_weights = {
-                    "accuracy": self.accuracy_weight if hasattr(self, 'accuracy_weight') else 0.7,
-                    "fluency": self.fluency_weight if hasattr(self, 'fluency_weight') else 0.3,
-                    "style": 0.0,
-                    "thesis_alignment": 0.0,
-                    "intent_compliance": 0.0,
+                    "accuracy": self.accuracy_weight if hasattr(self, 'accuracy_weight') else 0.50,
+                    "fluency": self.fluency_weight if hasattr(self, 'fluency_weight') else 0.10,
+                    "style": 0.10,
+                    "thesis_alignment": 0.20,
+                    "intent_compliance": 0.10,
                     "keyword_coverage": 0.0
                 }
                 active_weights[key] = default_weights.get(key, 0.0)

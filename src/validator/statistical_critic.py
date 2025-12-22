@@ -383,7 +383,10 @@ class StatisticalCritic:
         return feedback
 
     def evaluate_sentence(self, sentence: str, target_length: int, tolerance: float = None) -> Tuple[float, str]:
-        """Evaluate a single sentence against target length.
+        """Evaluate a single sentence against target length using Hybrid Logic.
+
+        Uses Absolute Tolerance for micro-sentences (<6 words) and Percentage Tolerance
+        for standard sentences to prevent false rejections of very short sentences.
 
         Args:
             sentence: The sentence text to evaluate
@@ -408,7 +411,27 @@ class StatisticalCritic:
         if target_length <= 0:
             return 1.0, "Sentence length matches target."
 
-        # Calculate difference ratio
+        # HYBRID LOGIC: Use Absolute Tolerance for micro-sentences
+        length_gate_config = self.config.get("length_gate", {})
+        micro_threshold = length_gate_config.get("micro_sentence_threshold", 6)
+        abs_tolerance = length_gate_config.get("micro_sentence_absolute_tolerance", 2)
+
+        if target_length < micro_threshold:
+            # MICRO-SENTENCE CHECK: Use Absolute Tolerance
+            diff = abs(word_count - target_length)
+
+            # Pass if within absolute range (e.g., Target 2 allows 1, 2, 3, 4)
+            # Also ensure we don't allow 0 words
+            if diff <= abs_tolerance and word_count > 0:
+                return 1.0, "Sentence length matches target."
+
+            # Generate specific feedback for micro-sentences
+            if word_count > target_length:
+                return 0.0, f"Too long ({word_count} words). Cut to {target_length} words."
+            else:
+                return 0.0, f"Too short ({word_count} words). Expand to {target_length} words."
+
+        # STANDARD CHECK: Use Percentage Tolerance (Existing Logic)
         diff_ratio = abs(word_count - target_length) / target_length
 
         if diff_ratio <= tolerance:

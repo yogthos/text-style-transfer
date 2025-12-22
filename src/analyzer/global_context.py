@@ -51,16 +51,18 @@ class GlobalContextAnalyzer:
         - Thesis: Main argument (max 2 sentences)
         - Intent: One of "persuading", "informing", "narrating"
         - Keywords: List of 5 central concepts that must remain consistent
+        - Counter-Arguments: List of positions/views the author opposes
+        - Stance Markers: List of phrases showing how author positions cited figures
 
         Args:
             full_text: Full input document text.
             verbose: Whether to print debug information.
 
         Returns:
-            Dict with keys: 'thesis', 'intent', 'keywords'
+            Dict with keys: 'thesis', 'intent', 'keywords', 'counter_arguments', 'stance_markers'
         """
         if not full_text or not full_text.strip():
-            return {'thesis': '', 'intent': 'informing', 'keywords': []}
+            return {'thesis': '', 'intent': 'informing', 'keywords': [], 'counter_arguments': [], 'stance_markers': []}
 
         # Truncate if text is too long (>50k chars) - keep first 10k and last 5k
         text_to_analyze = full_text
@@ -98,12 +100,14 @@ class GlobalContextAnalyzer:
             except json.JSONDecodeError:
                 if verbose:
                     print(f"  ⚠ Failed to parse JSON response, using defaults")
-                return {'thesis': '', 'intent': 'informing', 'keywords': []}
+                return {'thesis': '', 'intent': 'informing', 'keywords': [], 'counter_arguments': [], 'stance_markers': []}
 
             # Validate and normalize response
             thesis = context.get('thesis', '').strip()
             intent = context.get('intent', 'informing').strip().lower()
             keywords = context.get('keywords', [])
+            counter_arguments = context.get('counter_arguments', [])
+            stance_markers = context.get('stance_markers', [])
 
             # Ensure intent is valid
             if intent not in ['persuading', 'informing', 'narrating']:
@@ -116,15 +120,25 @@ class GlobalContextAnalyzer:
             # Limit keywords to 5
             keywords = keywords[:5]
 
+            # Ensure counter_arguments is a list (backward compatibility)
+            if not isinstance(counter_arguments, list):
+                counter_arguments = []
+
+            # Ensure stance_markers is a list (backward compatibility)
+            if not isinstance(stance_markers, list):
+                stance_markers = []
+
             return {
                 'thesis': thesis,
                 'intent': intent,
-                'keywords': keywords
+                'keywords': keywords,
+                'counter_arguments': counter_arguments,
+                'stance_markers': stance_markers
             }
 
         except Exception as e:
             if verbose:
                 print(f"  ⚠ Global context extraction failed: {e}, using defaults")
             # Return default context on failure
-            return {'thesis': '', 'intent': 'informing', 'keywords': []}
+            return {'thesis': '', 'intent': 'informing', 'keywords': [], 'counter_arguments': [], 'stance_markers': []}
 

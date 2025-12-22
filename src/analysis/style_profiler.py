@@ -22,6 +22,57 @@ class StyleProfiler:
         # Cache for word filtering to avoid redundant NLP calls
         self._word_filter_cache = {}
 
+    def _sanitize_text(self, text: str) -> str:
+        """Sanitize and normalize input text before analysis.
+
+        Removes artifacts like literal newline sequences, normalizes whitespace,
+        and ensures clean text for processing.
+
+        Args:
+            text: Raw input text
+
+        Returns:
+            Sanitized text ready for analysis
+        """
+        if not text:
+            return ""
+
+        # 1. Replace literal "\n" strings with actual newlines (in case they're escaped)
+        text = text.replace("\\n", "\n")
+        text = text.replace("\\r", "\r")
+        text = text.replace("\\t", "\t")
+
+        # 2. Normalize line breaks (Windows, Mac, Unix)
+        text = text.replace("\r\n", "\n")
+        text = text.replace("\r", "\n")
+
+        # 3. Replace multiple newlines with single newline (preserve paragraph breaks)
+        text = re.sub(r'\n{3,}', '\n\n', text)
+
+        # 4. Replace multiple spaces with single space
+        text = re.sub(r' +', ' ', text)
+
+        # 5. Replace tabs with spaces
+        text = text.replace("\t", " ")
+
+        # 6. Remove control characters (except newlines and tabs which we've handled)
+        text = ''.join(char for char in text if ord(char) >= 32 or char in '\n\t')
+
+        # 7. Strip leading/trailing whitespace from each line
+        lines = text.split('\n')
+        lines = [line.strip() for line in lines]
+        text = '\n'.join(lines)
+
+        # 8. Remove empty lines at start/end
+        text = text.strip()
+
+        # 9. Final cleanup: ensure no literal "\n" strings remain
+        text = text.replace("\\n", " ")
+        text = text.replace("\\r", " ")
+        text = text.replace("\\t", " ")
+
+        return text
+
     def analyze_style(self, text: str) -> Dict[str, Any]:
         """Analyze style characteristics from text corpus.
 
@@ -38,6 +89,12 @@ class StyleProfiler:
         Returns:
             Dictionary containing all style characteristics
         """
+        if not text or not text.strip():
+            return self._empty_profile()
+
+        # Sanitize and normalize text before processing
+        text = self._sanitize_text(text)
+
         if not text or not text.strip():
             return self._empty_profile()
 
@@ -130,6 +187,17 @@ class StyleProfiler:
             if token.is_stop or token.is_punct or token.is_digit or token.like_num:
                 return False
 
+            # 2.5. Filter out whitespace-only tokens and artifacts
+            token_text = token.text.strip()
+            if not token_text or len(token_text) < 2:
+                return False
+            # Filter out tokens that are only whitespace, newlines, or control characters
+            if token_text.isspace() or any(ord(c) < 32 and c not in '\n\t' for c in token_text):
+                return False
+            # Filter out literal escape sequences
+            if '\\n' in token_text or '\\r' in token_text or '\\t' in token_text:
+                return False
+
             # 3. Fallback POS Check (in case NER missed it but it's tagged PROPN)
             if token.pos_ == "PROPN":
                 return False
@@ -141,6 +209,13 @@ class StyleProfiler:
             return True
 
         # For string input, use the old method (for backward compatibility)
+        # Additional checks for string input
+        if not text_lower or text_lower.isspace():
+            return False
+        # Filter out literal escape sequences in string input
+        if '\\n' in text_lower or '\\r' in text_lower or '\\t' in text_lower:
+            return False
+
         # Check cache first
         cache_key = f"{text_lower}:{bool(blocklist)}"
         if cache_key in self._word_filter_cache:
@@ -342,11 +417,21 @@ class StyleProfiler:
 
             # Get top 30 keywords with frequencies
             top_keywords = word_counts.most_common(30)
-            keywords = [word for word, count in top_keywords]
-            keyword_frequencies = {
-                word: count / total_words
-                for word, count in top_keywords
-            }
+            # Filter out any remaining artifacts (whitespace, escape sequences, etc.)
+            keywords = []
+            keyword_frequencies = {}
+            for word, count in top_keywords:
+                # Final sanitization check
+                word_clean = word.strip()
+                if (word_clean and
+                    len(word_clean) >= 2 and
+                    not word_clean.isspace() and
+                    '\\n' not in word_clean and
+                    '\\r' not in word_clean and
+                    '\\t' not in word_clean and
+                    not any(ord(c) < 32 and c not in '\n\t' for c in word_clean)):
+                    keywords.append(word_clean)
+                    keyword_frequencies[word_clean] = count / total_words
 
             return {
                 "keywords": keywords,

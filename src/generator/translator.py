@@ -4212,7 +4212,8 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         prev_archetype_id: Optional[int] = None,
         perspective: Optional[str] = None,
         verbose: bool = False,
-        vocabulary_budget: Optional['VocabularyBudget'] = None
+        vocabulary_budget: Optional['VocabularyBudget'] = None,
+        global_context: Optional[Dict] = None
     ) -> tuple[str, int, float]:
         """Translate paragraph using statistical archetype generation with iterative refinement.
 
@@ -4270,7 +4271,11 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         # Step 1: Neutralize with perspective
         if verbose:
             print(f"  Extracting neutral summary with perspective: {target_pov}...")
-        neutral_text = self.semantic_translator.extract_neutral_summary(paragraph, target_perspective=target_pov)
+        neutral_text = self.semantic_translator.extract_neutral_summary(
+            paragraph,
+            target_perspective=target_pov,
+            global_context=global_context
+        )
         if verbose:
             print(f"  Neutral summary: {neutral_text[:100]}{'...' if len(neutral_text) > 100 else ''}")
 

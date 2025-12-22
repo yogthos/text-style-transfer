@@ -442,6 +442,7 @@ def process_text(
             prev_archetype_id=prev_archetype_id,
             perspective=perspective,
             verbose=verbose,
+            global_context=global_context,
             vocabulary_budget=vocabulary_budget
         )
 
@@ -493,7 +494,8 @@ def process_text(
                     prev_archetype_id=prev_archetype_id,
                     perspective=perspective,
                     verbose=verbose,
-                    vocabulary_budget=vocabulary_budget
+                    vocabulary_budget=vocabulary_budget,
+                    global_context=global_context
                 )
                 prev_archetype_id = arch_id
                 vocab_retry_count += 1

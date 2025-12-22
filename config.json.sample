@@ -25,10 +25,10 @@
     "persist_path": "atlas_cache/",
     "num_clusters": 5,
     "min_structure_words": 4,
-    "max_length_ratio": 5.0,
-    "min_length_ratio": 0.2,
+    "max_length_ratio": 2.0,
+    "min_length_ratio": 0.5,
     "early_exit_threshold": 0.1,
-    "length_tolerance": 0.3
+    "length_tolerance": 0.2
   },
   "length_gate": {
     "default_min_ratio": 0.6,
@@ -39,10 +39,12 @@
     "very_different_threshold_high": 2.0,
     "moderate_different_threshold_low": 0.67,
     "moderate_different_threshold_high": 1.5,
-    "skip_gate_when_very_different": true
+    "skip_gate_when_very_different": true,
+    "micro_sentence_threshold": 6,
+    "micro_sentence_absolute_tolerance": 2
   },
   "critic": {
-    "stat_tolerance": 0.20,
+    "stat_tolerance": 0.2,
     "min_score": 0.75,
     "max_retries": 5,
     "fallback_pass_threshold": 0.75,
@@ -58,23 +60,26 @@
     "high_semantic_similarity_threshold": 0.8
   },
   "scorer": {
-    "meaning_threshold": 0.80,
-    "style_threshold": 0.70,
+    "meaning_threshold": 0.8,
+    "style_threshold": 0.7,
     "hallucination_threshold": 0.1,
     "llm_style_threshold": 0.75,
     "evaluation_temperature": 0.2,
     "evaluation_max_tokens": 300
   },
   "blend": {
-    "authors": ["Mao"],
+    "authors": [
+      "Langan",
+      "Mao"
+    ],
     "ratio": 0.6
   },
   "translator": {
-    "temperature": 0.8,
+    "temperature": 0.6,
     "max_tokens": 3000,
     "literal_temperature": 0.3,
     "literal_max_tokens": 200,
-    "batch_temperature": 0.8,
+    "batch_temperature": 0.6,
     "breeding_temperature": 0.7,
     "repair_temperature": 0.2,
     "classification_temperature": 0.3,
@@ -83,19 +88,19 @@
     "fallback_max_tokens": 200
   },
   "semantic_critic": {
-    "recall_threshold": 0.85,
-    "precision_threshold": 0.60,
+    "recall_threshold": 0.9,
+    "precision_threshold": 0.6,
     "similarity_threshold": 0.5,
     "fluency_threshold": 0.75,
-    "accuracy_weight": 0.8,
-    "fluency_weight": 0.2,
+    "accuracy_weight": 0.50,
+    "fluency_weight": 0.10,
     "weights": {
-      "accuracy": 0.8,
-      "fluency": 0.1,
-      "style": 0.1,
-      "thesis_alignment": 0.05,
-      "intent_compliance": 0.05,
-      "keyword_coverage": 0.05
+      "accuracy": 0.50,
+      "fluency": 0.10,
+      "style": 0.10,
+      "thesis_alignment": 0.20,
+      "intent_compliance": 0.10,
+      "keyword_coverage": 0.0
     },
     "evaluation_temperature": 0.2,
     "batch_evaluation_temperature": 0.1,
@@ -105,7 +110,8 @@
     "evaluation_timeout": 30,
     "entailment_timeout": 20,
     "meaning_preservation_timeout": 20,
-    "paragraph_mode_similarity_threshold": 0.30
+    "paragraph_mode_similarity_threshold": 0.3,
+    "use_llm_verification": false
   },
   "paragraph_atlas": {
     "path": "atlas_cache/paragraph_atlas"
@@ -115,14 +121,14 @@
     "max_tokens": 1000
   },
   "generation": {
-    "temperature": 0.85,
+    "temperature": 0.7,
     "max_tokens": 1500,
     "num_candidates": 6,
     "max_retries": 10,
     "compliance_threshold": 0.85,
     "compliance_fuzziness": 0.05,
     "sentence_variants_per_attempt": 5,
-    "default_perspective": "first_person_singular"
+    "default_perspective": "third_person"
   },
   "global_context": {
     "enabled": true,
@@ -133,7 +139,7 @@
     "max_generations": 10,
     "pass_threshold": 0.9,
     "patience_threshold": 5,
-    "patience_min_score": 0.80,
+    "patience_min_score": 0.8,
     "initial_temperature": 0.4,
     "temperature_increment": 0.1,
     "max_temperature": 0.95,
@@ -142,7 +148,9 @@
     "repair_execution_temperature": 0.5,
     "repair_plan_max_tokens": 1000,
     "repair_execution_max_tokens": 500,
-    "repair_variants_per_attempt": 5
+    "repair_variants_per_attempt": 5,
+    "prefer_compression_on_repetition": true,
+    "repetition_trigger_threshold": 5
   },
   "evolutionary": {
     "batch_size": 40,

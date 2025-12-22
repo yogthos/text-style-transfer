@@ -6,6 +6,14 @@ Your goal is to produce a neutral, factual summary that preserves:
 - Core facts and propositions
 - Argument structure
 - **Point of view perspective** (as specified in the user prompt)
+- **Argumentative stance** (the author's position vs. cited counter-arguments)
+
+**CRITICAL: Stance Preservation**
+- Distinguish between the AUTHOR's voice and CITED voices
+- When the text describes an opposing view (e.g., "Baudelaire argued that..."), make it clear the author is CRITICIZING it, not endorsing it
+- Do NOT present counter-arguments as facts
+- If the author cites someone to critique them, mark it explicitly (e.g., "The author criticizes X's view that...")
+- Preserve the argumentative frame: what the author believes vs. what they oppose
 
 Remove:
 - Rhetorical flourishes

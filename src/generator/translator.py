@@ -5497,6 +5497,12 @@ Output only the sentence, no explanations.
         Returns:
             Refined sentence (string, never dict)
         """
+        # Extract feedback string for logic checks (handle both string and dict)
+        if isinstance(feedback, dict):
+            feedback_str = feedback.get("reason", "") + " " + feedback.get("directive", "")
+        else:
+            feedback_str = str(feedback)
+
         prompts_dir = Path(__file__).parent.parent.parent / "prompts"
         try:
             template_path = prompts_dir / "sentence_refinement_user.md"
@@ -5524,10 +5530,23 @@ Output only the corrected sentence.
 
         user_prompt = template.format(
             current_sentence=sentence,
-            feedback=feedback,
+            feedback=feedback_str,
             target_length=target_length,
             prev_context=prev_context
         )
+
+        # Add expansion guidance if needed
+        if "too short" in feedback_str.lower():
+            user_prompt += "\n\nEXPANSION TIP: Do not just pad with fluff. Add a subordinate clause, a descriptive adjective, or clarify the causal link to increase word count naturally."
+
+        # Get repetition penalties from config
+        presence_penalty = self.generation_config.get("presence_penalty", 0.0)
+        frequency_penalty = self.generation_config.get("frequency_penalty", 0.0)
+
+        # Adaptive relaxation: If expanding, relax penalties to allow functional words (the, of, and)
+        if "too short" in feedback_str.lower() or "expand" in feedback_str.lower():
+            presence_penalty *= 0.5
+            frequency_penalty *= 0.5
 
         try:
             result = self.llm_provider.call(
@@ -5536,7 +5555,9 @@ Output only the corrected sentence.
                 model_type="editor",
                 require_json=False,
                 temperature=temperature,
-                max_tokens=max_tokens
+                max_tokens=max_tokens,
+                presence_penalty=presence_penalty,
+                frequency_penalty=frequency_penalty
             )
             # CRITICAL: Return string, never dict
             refined = result.strip() if result else sentence

@@ -48,53 +48,130 @@ class StyleProfiler:
         if not sentences:
             return self._empty_profile()
 
+        # Build entity blocklist first (from original case-sensitive text)
+        entity_blocklist = self._build_entity_blocklist(doc)
+
         # Extract all dimensions
         pov_data = self._analyze_pov(doc)
         burstiness_data = self._analyze_burstiness(sentences)
-        keywords_data = self._analyze_keywords(text)
-        openers_data = self._analyze_sentence_starters(sentences)
+        keywords_data = self._analyze_keywords(doc, entity_blocklist)
+        openers_data = self._analyze_sentence_starters(sentences, entity_blocklist)
         punctuation_data = self._analyze_punctuation(doc, len(sentences))
+        vocabulary_palette = self._extract_vocabulary_palette(doc)
 
         return {
             **pov_data,
             **burstiness_data,
             **keywords_data,
             **openers_data,
-            **punctuation_data
+            **punctuation_data,
+            "vocabulary_palette": vocabulary_palette
         }
 
-    def _is_general_word(self, word: str) -> bool:
+    def _build_entity_blocklist(self, doc) -> set:
+        """
+        Scans the document for Proper Nouns and Named Entities to create a
+        strict blocklist for keyword extraction.
+
+        Args:
+            doc: spaCy Doc object (must be from original case-sensitive text)
+
+        Returns:
+            Set of lowercase words/lemmas to block
+        """
+        blocklist = set()
+
+        for token in doc:
+            # 1. Catch Standard Proper Nouns
+            if token.pos_ == "PROPN":
+                blocklist.add(token.text.lower())
+                blocklist.add(token.lemma_.lower())
+
+            # 2. Catch Named Entities (PERSON, ORG, GPE, etc.)
+            # ent_type_ is often more accurate than POS for names
+            if token.ent_type_ in {"PERSON", "ORG", "GPE", "LOC", "PRODUCT", "NORP"}:
+                blocklist.add(token.text.lower())
+                blocklist.add(token.lemma_.lower())
+
+        return blocklist
+
+    def _is_general_word(self, word: str, blocklist: set = None) -> bool:
         """Check if a word is a general word (not a proper noun or specific term).
 
         Args:
-            word: Word to check (lowercase)
+            word: Word to check (lowercase string) OR token object
+            blocklist: Set of lowercase words/lemmas to block (from _build_entity_blocklist)
 
         Returns:
             True if word is general (should be kept), False if it's a proper noun/specific term (should be filtered)
         """
-        if not word or len(word) < 2:
-            return False
+        # Handle both string and token inputs
+        if hasattr(word, 'text'):
+            # It's a token object
+            token = word
+            text_lower = token.text.lower()
+            lemma_lower = token.lemma_.lower()
+        else:
+            # It's a string
+            if not word or len(word) < 3:
+                return False
+            text_lower = word.lower()
+            lemma_lower = text_lower  # For string input, use word as lemma
+            token = None
 
+        # 1. Check strict blocklist first (Names detected by NER from original text)
+        if blocklist:
+            if text_lower in blocklist or lemma_lower in blocklist:
+                return False
+
+        # If we have a token, use direct checks (more accurate)
+        if token is not None:
+            # 2. Standard Filters
+            if token.is_stop or token.is_punct or token.is_digit or token.like_num:
+                return False
+
+            # 3. Fallback POS Check (in case NER missed it but it's tagged PROPN)
+            if token.pos_ == "PROPN":
+                return False
+
+            # 4. Named Entity Check (double-check)
+            if token.ent_type_ in {"PERSON", "ORG", "GPE", "LOC", "PRODUCT", "NORP"}:
+                return False
+
+            return True
+
+        # For string input, use the old method (for backward compatibility)
         # Check cache first
-        if word in self._word_filter_cache:
-            return self._word_filter_cache[word]
+        cache_key = f"{text_lower}:{bool(blocklist)}"
+        if cache_key in self._word_filter_cache:
+            return self._word_filter_cache[cache_key]
 
         # Default to True (conservative: include if unsure)
         result = True
 
         try:
             # Process word in minimal sentence context to get accurate POS tags
-            # Use lowercase version for context
-            test_sentence = f"The {word}."
+            test_sentence = f"The {text_lower}."
             doc = self.nlp(test_sentence)
 
             # Find the word token (skip "The" and punctuation)
             for token in doc:
-                if token.text.lower() == word.lower() and not token.is_punct:
-                    # Filter out proper nouns (PROPN tag indicates names/specific entities)
+                if token.text.lower() == text_lower and not token.is_punct:
+                    # 1. Basic Filters
+                    if token.is_stop or token.is_punct or token.is_digit or token.like_num:
+                        result = False
+                        break
+
+                    # 2. Part of Speech Filter (Exclude Proper Nouns)
                     if token.pos_ == "PROPN":
                         result = False
                         break
+
+                    # 3. Named Entity Filter
+                    if token.ent_type_ in {"PERSON", "ORG", "GPE", "LOC", "PRODUCT", "NORP"}:
+                        result = False
+                        break
+
                     # Keep common parts of speech (general vocabulary)
                     if token.pos_ in ["NOUN", "VERB", "ADJ", "ADV", "PRON", "DET", "CONJ", "SCONJ", "ADP", "PART"]:
                         result = True
@@ -107,7 +184,7 @@ class StyleProfiler:
             result = True
 
         # Cache the result
-        self._word_filter_cache[word] = result
+        self._word_filter_cache[cache_key] = result
         return result
 
     def _empty_profile(self) -> Dict[str, Any]:
@@ -124,7 +201,13 @@ class StyleProfiler:
             "semicolons_per_100": 0.0,
             "dashes_per_100": 0.0,
             "exclamations_per_100": 0.0,
-            "punctuation_preference": "Standard"
+            "punctuation_preference": "Standard",
+            "vocabulary_palette": {
+                "general": [],
+                "sensory_verbs": [],
+                "connectives": [],
+                "intensifiers": []
+            }
         }
 
     def _analyze_pov(self, doc) -> Dict[str, Any]:
@@ -224,78 +307,139 @@ class StyleProfiler:
             "rhythm_desc": rhythm_desc
         }
 
-    def _analyze_keywords(self, text: str) -> Dict[str, Any]:
-        """Extract signature vocabulary using TF-IDF.
+    def _analyze_keywords(self, doc, entity_blocklist: set) -> Dict[str, Any]:
+        """Extract signature vocabulary using token-level frequency analysis.
 
         Args:
-            text: Full corpus text
+            doc: spaCy Doc object (from original case-sensitive text)
+            entity_blocklist: Set of lowercase words/lemmas to block
 
         Returns:
             Dictionary with keywords and frequencies
         """
-        if not text or len(text.strip()) < 50:
+        if not doc or len(doc) < 10:
             return {
                 "keywords": [],
                 "keyword_frequencies": {}
             }
 
         try:
-            # Use TF-IDF to find distinctive words
-            # Split text into sentences for document frequency calculation
-            sentences = re.split(r'[.!?]+\s+', text)
-            sentences = [s.strip() for s in sentences if s.strip() and len(s.strip()) > 10]
+            # Count words using token-level filtering with blocklist
+            word_counts = Counter()
+            for token in doc:
+                # Use token-level check with blocklist
+                if self._is_general_word(token, entity_blocklist):
+                    lemma = token.lemma_.lower()
+                    word_counts[lemma] += 1
 
-            if len(sentences) < 2:
-                # Fallback: treat entire text as one document
-                sentences = [text]
+            # Calculate frequencies (Total clean words)
+            total_words = sum(word_counts.values())
+            if total_words == 0:
+                return {
+                    "keywords": [],
+                    "keyword_frequencies": {}
+                }
 
-            # Initialize vectorizer with safety parameters
-            vectorizer = TfidfVectorizer(
-                stop_words='english',
-                max_features=50,
-                min_df=2,  # Filter rare words/typos
-                max_df=0.8,  # Filter generic words (appear in >80% of sentences)
-                token_pattern=r'\b[a-zA-Z]{3,}\b'  # Only words with 3+ letters
-            )
-
-            # Fit and transform
-            tfidf_matrix = vectorizer.fit_transform(sentences)
-            feature_names = vectorizer.get_feature_names_out()
-
-            # Get mean TF-IDF scores across all documents
-            mean_scores = np.mean(tfidf_matrix.toarray(), axis=0)
-
-            # Get top 30 keywords
-            top_indices = np.argsort(mean_scores)[-30:][::-1]
-            raw_keywords = [feature_names[i] for i in top_indices if mean_scores[i] > 0]
-            raw_keyword_frequencies = {feature_names[i]: float(mean_scores[i]) for i in top_indices if mean_scores[i] > 0}
-
-            # Filter out proper nouns and specific terms
-            keywords = []
-            keyword_frequencies = {}
-            for keyword in raw_keywords:
-                # Check if it's a general word (not a proper noun or specific term)
-                if self._is_general_word(keyword.lower()):
-                    keywords.append(keyword)
-                    if keyword in raw_keyword_frequencies:
-                        keyword_frequencies[keyword] = raw_keyword_frequencies[keyword]
+            # Get top 30 keywords with frequencies
+            top_keywords = word_counts.most_common(30)
+            keywords = [word for word, count in top_keywords]
+            keyword_frequencies = {
+                word: count / total_words
+                for word, count in top_keywords
+            }
 
             return {
-                "keywords": keywords[:30],  # Top 30 (after filtering)
+                "keywords": keywords,
                 "keyword_frequencies": keyword_frequencies
             }
         except Exception as e:
-            # Fallback: return empty if TF-IDF fails
+            # Fallback: return empty if processing fails
             return {
                 "keywords": [],
                 "keyword_frequencies": {}
             }
 
-    def _analyze_sentence_starters(self, sentences: List) -> Dict[str, Any]:
+    def _extract_vocabulary_palette(self, doc) -> Dict[str, List[str]]:
+        """
+        Extracts the author's preferred words categorized by function.
+
+        Args:
+            doc: spaCy Doc object
+
+        Returns:
+            Dictionary with categorized vocabulary lists (lemmas)
+        """
+        palette = {
+            "general": [],      # High-frequency content words (Nouns/Adjs/Verbs)
+            "sensory_verbs": [], # Verbs related to perception
+            "connectives": [],   # Transition words
+            "intensifiers": []  # Adverbs modifying adjectives
+        }
+
+        # Specialized lists
+        sensory_lemmas = {'see', 'hear', 'feel', 'grasp', 'watch', 'listen', 'touch', 'smell', 'sense', 'perceive'}
+        connective_deps = {'cc', 'mark', 'advmod'}
+
+        word_counts = Counter()
+
+        for token in doc:
+            # 1. Basic Filters
+            if token.is_stop or token.is_punct or token.is_digit or token.like_num:
+                continue
+
+            # 2. Part of Speech Filter (Exclude Proper Nouns)
+            # PROPN = Proper Noun (e.g., "Rainer", "London")
+            if token.pos_ == "PROPN":
+                continue
+
+            # 3. Named Entity Filter (Double-check)
+            # Sometimes 'Rainer' might be tagged as NOUN if lowercased,
+            # so we check if it's part of a named entity (PERSON, ORG, GPE).
+            if token.ent_type_ in {"PERSON", "ORG", "GPE", "LOC", "PRODUCT"}:
+                continue
+
+            lemma = token.lemma_.lower()
+
+            # Note: We skip the _is_general_word check here because we've already
+            # done all the necessary filtering directly on the token (PROPN, named entities, etc.).
+            # The _is_general_word method is used for keyword extraction where we only have
+            # the word string and need to test it in isolation.
+
+            # 1. Sensory Verbs
+            if token.pos_ == "VERB" and lemma in sensory_lemmas:
+                if lemma not in palette["sensory_verbs"]:
+                    palette["sensory_verbs"].append(lemma)
+
+            # 2. Connectives (simplified heuristic)
+            if token.dep_ in connective_deps and token.pos_ in {'ADV', 'CCONJ', 'SCONJ'}:
+                if lemma not in palette["connectives"]:
+                    palette["connectives"].append(lemma)
+
+            # 3. Intensifiers (adverbs modifying adjectives)
+            if token.dep_ == "advmod" and token.head.pos_ == "ADJ":
+                if lemma not in palette["intensifiers"]:
+                    palette["intensifiers"].append(lemma)
+
+            # 4. General Palette (Nouns/Adjs/Verbs)
+            if token.pos_ in {'NOUN', 'VERB', 'ADJ'}:
+                word_counts[lemma] += 1
+
+        # Keep top N for general palette
+        palette["general"] = [w for w, c in word_counts.most_common(50)]
+
+        # Deduplicate lists (already done above, but ensure)
+        palette["sensory_verbs"] = list(set(palette["sensory_verbs"]))
+        palette["connectives"] = list(set(palette["connectives"]))
+        palette["intensifiers"] = list(set(palette["intensifiers"]))
+
+        return palette
+
+    def _analyze_sentence_starters(self, sentences: List, entity_blocklist: set) -> Dict[str, Any]:
         """Extract common sentence openers (smart extraction skipping punctuation).
 
         Args:
             sentences: List of spaCy sentence spans
+            entity_blocklist: Set of lowercase words/lemmas to block
 
         Returns:
             Dictionary with common openers and pattern classification
@@ -307,17 +451,15 @@ class StyleProfiler:
             }
 
         openers = []
-        # Smart extraction: skip leading punctuation/quotes
-        opener_pattern = re.compile(r'^\W*(\w+)', re.IGNORECASE)
-
+        # Use token-level extraction to get accurate POS and entity info
         for sent in sentences:
-            sent_text = sent.text.strip()
-            match = opener_pattern.search(sent_text)
-            if match:
-                first_word = match.group(1).lower()
-                # Skip very short words that are likely artifacts
-                if len(first_word) >= 2:
-                    openers.append(first_word)
+            # Get first non-punctuation token
+            for token in sent:
+                if not token.is_punct:
+                    # Check if it's a general word (not a name) using blocklist
+                    if self._is_general_word(token, entity_blocklist):
+                        openers.append(token.text.lower())
+                    break  # Only take the first valid token
 
         if not openers:
             return {
@@ -327,23 +469,7 @@ class StyleProfiler:
 
         # Count and get top 10
         opener_counts = Counter(openers)
-        raw_top_openers = [word for word, count in opener_counts.most_common(10)]
-
-        # Filter out proper nouns and specific terms
-        top_openers = []
-        for opener in raw_top_openers:
-            if self._is_general_word(opener):
-                top_openers.append(opener)
-
-        # If we filtered out too many, try to get more from the original list
-        if len(top_openers) < 5:
-            # Get more candidates and filter them
-            all_openers = [word for word, count in opener_counts.most_common(20)]
-            for opener in all_openers:
-                if opener not in top_openers and self._is_general_word(opener):
-                    top_openers.append(opener)
-                    if len(top_openers) >= 10:
-                        break
+        top_openers = [word for word, count in opener_counts.most_common(10)]
 
         # Classify pattern
         from src.utils.spacy_linguistics import get_discourse_markers, get_conjunctions

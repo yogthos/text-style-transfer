@@ -1,7 +1,7 @@
 """Text processing utilities for style transfer pipeline."""
 
 import re
-from typing import List
+from typing import List, Dict, Optional
 
 def check_zipper_merge(prev_sent: str, new_sent: str) -> bool:
     """
@@ -180,4 +180,112 @@ def parse_variants_from_response(response: str, verbose: bool = False) -> List[s
         cleaned_variants.append(variant)
 
     return cleaned_variants
+
+
+def get_semantic_replacement(forbidden_word: str, author_palette: Dict[str, List[str]], nlp_model) -> Optional[str]:
+    """
+    Finds a replacement for 'forbidden_word' using the author's vocabulary palette.
+    Enforces POS matching to preserve grammar.
+
+    Args:
+        forbidden_word: Word to replace (case-insensitive)
+        author_palette: Dictionary with categorized vocabulary lists:
+            - "general": List of general vocabulary words
+            - "sensory_verbs": List of sensory verb lemmas
+            - "connectives": List of connective words
+            - "intensifiers": List of intensifier adverbs
+        nlp_model: spaCy language model for POS tagging and vector similarity
+
+    Returns:
+        Best matching replacement word (as lemma/base form), or None if no good match found
+    """
+    if not forbidden_word or not author_palette or not nlp_model:
+        return None
+
+    # Parse forbidden word with spaCy to get POS tag
+    try:
+        target_doc = nlp_model(forbidden_word)
+        if not target_doc:
+            return None
+        target_token = target_doc[0]
+        target_pos = target_token.pos_
+    except Exception:
+        return None
+
+    # 1. Determine which palette category to check
+    candidates = []
+
+    if target_pos == "VERB":
+        # Note: verbs will be skipped in cleanup, but we still provide candidates
+        candidates = author_palette.get("sensory_verbs", []) + author_palette.get("general", [])
+    elif target_pos in ["ADV", "SCONJ", "CCONJ"]:
+        # Check if it's an intensifier (advmod dependency on ADJ head)
+        if target_token.dep_ == "advmod":
+            candidates = author_palette.get("intensifiers", []) + author_palette.get("connectives", [])
+        else:
+            candidates = author_palette.get("connectives", [])
+    else:
+        # Default: general palette
+        candidates = author_palette.get("general", [])
+
+    # Fallback if author palette is empty for this category
+    if not candidates:
+        # Generic safe fallbacks by POS
+        fallbacks = {
+            "ADJ": ["clear", "simple", "real", "human", "dark", "light", "heavy"],
+            "NOUN": ["thing", "part", "system", "way", "fact", "world"],
+            "VERB": ["is", "make", "go", "see", "know", "use"],
+            "ADV": ["now", "then", "just", "well"]
+        }
+        candidates = fallbacks.get(target_pos, ["thing"])
+
+    # 2. Vector Search
+    best_word = None
+    best_score = -1.0
+
+    for cand_str in candidates:
+        if not cand_str:
+            continue
+
+        try:
+            cand_doc = nlp_model(cand_str)
+            if not cand_doc:
+                continue
+            cand_token = cand_doc[0]
+
+            # STRICT Constraint: Must match Part of Speech (prevent "vast" -> "ocean")
+            if cand_token.pos_ != target_pos:
+                continue
+
+            # Don't suggest the forbidden word itself
+            if cand_str.lower() == forbidden_word.lower():
+                continue
+
+            # Calculate similarity using spaCy vectors
+            # Both tokens must have vectors for similarity to work
+            if target_token.has_vector and cand_token.has_vector:
+                similarity = target_token.similarity(cand_token)
+
+                # We want "similar meaning" but not "identical synonym" if the original was bad.
+                # But here we just want the closest valid author word.
+                if similarity > best_score:
+                    best_score = similarity
+                    best_word = cand_str
+        except Exception:
+            # Skip candidate if processing fails
+            continue
+
+    # 3. Threshold Check (Don't pick random junk)
+    if best_score < 0.3:
+        # If no author word is close enough, use a very neutral stopgap
+        if target_pos == "ADV":
+            return None  # Return None for adverbs to trigger deletion
+        elif target_pos == "NOUN":
+            return "structure"
+        elif target_pos == "ADJ":
+            return "large"
+        else:
+            return None
+
+    return best_word
 

@@ -519,10 +519,10 @@ def process_text(
 
             if should_apply_cleanup:
                 if verbose:
-                    print(f"  🔨 Applying programmatic cleanup (sledgehammer) to remove violations...")
+                    print(f"  🔨 Applying programmatic cleanup (semantic scalpel) to remove violations...")
                 # Extract just the words from violations (which are tuples of (word, reason))
                 violation_words = [v[0] if isinstance(v, tuple) else v for v in violations]
-                generated_paragraph = translator._programmatic_cleanup(generated_paragraph, violation_words)
+                generated_paragraph = translator._programmatic_cleanup(generated_paragraph, violation_words, author_name=author_name)
                 # Re-check after cleanup to verify violations are gone
                 found_words = vocabulary_budget.find_restricted_words(generated_paragraph)
                 violations = []

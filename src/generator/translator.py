@@ -4753,6 +4753,32 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
 
         return best_text, target_arch_id, best_score
 
+    def _load_style_profile(self, author_name: str) -> Optional[Dict]:
+        """Load style profile JSON for vocabulary palette access.
+
+        Args:
+            author_name: Name of the author
+
+        Returns:
+            Style profile dictionary, or None if not found
+        """
+        try:
+            # Use lowercase author name for directory lookup
+            author_lower = author_name.lower()
+            style_profile_path = Path(self.atlas_path) / author_lower / "style_profile.json"
+
+            if not style_profile_path.exists():
+                # Fallback: try exact case
+                style_profile_path = Path(self.atlas_path) / author_name / "style_profile.json"
+                if not style_profile_path.exists():
+                    return None
+
+            with open(style_profile_path, 'r') as f:
+                profile = json.load(f)
+                return profile
+        except Exception:
+            return None
+
     def _build_style_constraints(self, author_name: str) -> str:
         """Build style constraints from forensic profile.
 
@@ -4765,18 +4791,9 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
             Formatted style constraints string, or empty string if profile not found
         """
         try:
-            # Use lowercase author name for directory lookup
-            author_lower = author_name.lower()
-            style_profile_path = Path(self.atlas_path) / author_lower / "style_profile.json"
-
-            if not style_profile_path.exists():
-                # Fallback: try exact case
-                style_profile_path = Path(self.atlas_path) / author_name / "style_profile.json"
-                if not style_profile_path.exists():
-                    return ""
-
-            with open(style_profile_path, 'r') as f:
-                profile = json.load(f)
+            profile = self._load_style_profile(author_name)
+            if not profile:
+                return ""
 
             # Format constraints
             pov = profile.get("pov", "Third Person")
@@ -5234,34 +5251,96 @@ Output only the sentence, no explanations.
         best = min(valid_candidates, key=lambda v: abs(len(v.split()) - target_length))
         return best
 
-    def _programmatic_cleanup(self, text: str, violations: List[str]) -> str:
+    def _programmatic_cleanup(self, text: str, violations: List[str], author_name: Optional[str] = None) -> str:
         """
-        The 'Sledgehammer': Forcibly removes banned words when the LLM refuses to fix them.
-        Handles spacing and capitalization to keep the sentence grammatically reasonable.
+        The 'Semantic Scalpel': Replaces forbidden words with Author-Aligned synonyms.
+        Handles case preservation, verb safety, and noun plurality.
 
         Args:
             text: Text to clean
             violations: List of restricted words that were found (violations)
+            author_name: Optional author name for loading style profile
 
         Returns:
-            Cleaned text with violations removed
+            Cleaned text with violations replaced or removed
         """
+        from src.utils.text_processing import get_semantic_replacement
+
         cleaned_text = text
         violation_words = [v[0] if isinstance(v, tuple) else v for v in violations]  # Extract word from (word, reason) tuples
 
-        for word in violation_words:
-            # Regex explanation:
-            # \b - Word boundary (prevents matching 'profound' inside 'profoundly' if strictly matching)
-            # (?i) - Case insensitive (handled by re.IGNORECASE flag)
-            # \s* - Match optional trailing whitespace (so "vast network" becomes "network", not " network")
+        # Load style profile for vocabulary palette
+        author_palette = {}
+        if author_name:
+            profile = self._load_style_profile(author_name)
+            if profile:
+                author_palette = profile.get("vocabulary_palette", {})
 
-            # Strategy 1: Remove adverbs completely (e.g., "profoundly")
-            if word.endswith("ly"):
+        # Get NLP model
+        nlp = self._get_nlp()
+        if not nlp:
+            # Fallback to deletion if NLP not available
+            print(f"  ⚠ NLP model not available, falling back to deletion")
+            for word in violation_words:
                 pattern = re.compile(fr'\b{re.escape(word)}\b\s*', re.IGNORECASE)
                 cleaned_text = pattern.sub("", cleaned_text)
+            cleaned_text = re.sub(r'\s+', ' ', cleaned_text).strip()
+            cleaned_text = re.sub(r'\s+([.,;?!])', r'\1', cleaned_text)
+            return cleaned_text
 
-            # Strategy 2: Remove adjectives (e.g., "vast")
+        replacements_made = []
+        skipped_verbs = []
+
+        for word in violation_words:
+            # Get semantic replacement
+            replacement = get_semantic_replacement(word, author_palette, nlp)
+
+            # Parse original word to get POS and other info
+            try:
+                word_doc = nlp(word)
+                if not word_doc:
+                    # Fallback to deletion if parsing fails
+                    pattern = re.compile(fr'\b{re.escape(word)}\b\s*', re.IGNORECASE)
+                    cleaned_text = pattern.sub("", cleaned_text)
+                    continue
+                word_token = word_doc[0]
+                word_pos = word_token.pos_
+                word_tag = word_token.tag_
+            except Exception:
+                # Fallback to deletion if parsing fails
+                pattern = re.compile(fr'\b{re.escape(word)}\b\s*', re.IGNORECASE)
+                cleaned_text = pattern.sub("", cleaned_text)
+                continue
+
+            # 2. VERB SAFETY GUARD (Skip verbs to prevent "He see" errors)
+            if word_pos == "VERB":
+                print(f"  ⚠ Skipping verb replacement for '{word}' to avoid conjugation errors.")
+                skipped_verbs.append(word)
+                continue
+
+            # 1. CASE PRESERVATION
+            if replacement:
+                # Find the actual word in the text to check its original casing
+                pattern_find = re.compile(fr'\b{re.escape(word)}\b', re.IGNORECASE)
+                match = pattern_find.search(cleaned_text)
+                original_word = match.group() if match else word
+
+                # Preserve capitalization based on the actual word in the text
+                if original_word and original_word[0].isupper():
+                    replacement = replacement.capitalize()
+
+                # 3. NOUN PLURALITY CHECK
+                # If original is Plural (NNS) and replacement is Singular, add "s"
+                if word_tag == "NNS" and not replacement.endswith('s'):
+                    # Naive pluralization (works for 90% of cases)
+                    replacement += "s"
+
+                # Perform substitution
+                pattern = re.compile(fr'\b{re.escape(word)}\b', re.IGNORECASE)
+                cleaned_text = pattern.sub(replacement, cleaned_text)
+                replacements_made.append(f"'{word}' -> '{replacement}'")
             else:
+                # Fallback to deletion if no replacement found
                 pattern = re.compile(fr'\b{re.escape(word)}\b\s*', re.IGNORECASE)
                 cleaned_text = pattern.sub("", cleaned_text)
 
@@ -5271,7 +5350,14 @@ Output only the sentence, no explanations.
         # Cleanup space before punctuation (e.g. "network ." -> "network.")
         cleaned_text = re.sub(r'\s+([.,;?!])', r'\1', cleaned_text)
 
-        print(f"  🔨 Sledgehammer applied. Forcibly removed: {violation_words}")
+        # Log results
+        if replacements_made:
+            print(f"  🎨 Semantic Scalpel applied. Replacements: {', '.join(replacements_made)}")
+        if skipped_verbs:
+            print(f"  ⚠ Skipped verbs (conjugation safety): {', '.join(skipped_verbs)}")
+        if not replacements_made and not skipped_verbs:
+            print(f"  🔨 Sledgehammer applied. Forcibly removed: {violation_words}")
+
         return cleaned_text
 
     def _refine_sentence(

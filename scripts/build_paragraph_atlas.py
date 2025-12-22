@@ -321,11 +321,9 @@ def main():
     args = parser.parse_args()
 
     # Apply relaxed mode if requested
-    relaxed_sentences_default = 2
-    relaxed_min_style_score = 3
     if args.relaxed:
-        args.min_sentences = relaxed_sentences_default
-        args.min_style_score = relaxed_min_style_score
+        args.min_sentences = 1
+        args.min_style_score = 3
         print(f"⚠️  Using RELAXED mode: min-sentences={args.min_sentences}, min-style-score={args.min_style_score}")
 
     # Validate inputs
@@ -357,12 +355,44 @@ def main():
     # 1. Analyze & Audit
     raw_data, feature_matrix = analyzer.analyze_corpus([args.corpus_file])
 
-    if len(raw_data) == 0:
+    # Auto-retry with relaxed settings if strict filtering fails
+    if len(raw_data) == 0 and not args.relaxed:
+        print(f"\n⚠️  No paragraphs found with strict filters (min-sentences={args.min_sentences}, min-style-score={args.min_style_score})")
+        print("   Automatically retrying with relaxed settings (min-sentences=1, min-style-score=3)...")
+
+        # Retry with relaxed settings
+        analyzer = ParagraphAnalyzer(
+            config_path=args.config,
+            author_name=args.author,
+            min_sentences=1,
+            min_style_score=3
+        )
+        raw_data, feature_matrix = analyzer.analyze_corpus([args.corpus_file])
+
+        if len(raw_data) == 0:
+            error_msg = (
+                f"No valid paragraphs found even with relaxed filters.\n"
+                f"  Tried: min-sentences=1, min-style-score=3\n"
+                f"  This usually means:\n"
+                f"    - The corpus file is empty or has no valid paragraphs\n"
+                f"    - All paragraphs are too short (< 1 sentence)\n"
+                f"    - All paragraphs failed style scoring (< 3/5)\n"
+                f"  Check your corpus file and try lowering thresholds further with:\n"
+                f"    --min-sentences 1 --min-style-score 1"
+            )
+            raise ValueError(error_msg)
+        else:
+            print(f"   ✓ Found {len(raw_data)} paragraphs with relaxed settings")
+    elif len(raw_data) == 0:
         error_msg = (
             f"No valid paragraphs found.\n"
             f"  Current filters: min-sentences={args.min_sentences}, min-style-score={args.min_style_score}\n"
-            f"  Try using --relaxed flag or lower thresholds with:\n"
-            f"    --min-sentences 1 --min-style-score 3"
+            f"  This usually means:\n"
+            f"    - The corpus file is empty or has no valid paragraphs\n"
+            f"    - All paragraphs are too short (< {args.min_sentences} sentences)\n"
+            f"    - All paragraphs failed style scoring (< {args.min_style_score}/5)\n"
+            f"  Try lowering thresholds with:\n"
+            f"    --min-sentences 1 --min-style-score 1"
         )
         raise ValueError(error_msg)
 

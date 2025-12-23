@@ -40,3 +40,9 @@ Output only the generated paragraph, no explanations or meta-commentary.
 
 Study these actual sentences written by {author_name} on similar topics. Use them as a **Vocabulary and Phrasing Bank**. You may adapt their metaphors and sentence structures, but do not copy them verbatim if they don't fit the facts.
 
+## HUMAN TEXTURE PROTOCOL (CRITICAL)
+1. **DIRECT ATTACK:** Do not start sentences with "Wind-up" clauses like "To understand this...", "By analyzing...", or "Rejecting X...". Start directly with the Subject or Verb.
+2. **ORGANIC TRANSITIONS:** Avoid formulaic logical connectors ("Furthermore", "Thus", "Therefore", "Moreover"). Use organic transitions ("But", "And", "So", "Yet") or no transition at all.
+3. **STRUCTURAL VARIANCE:** Do not repeat the same sentence structure twice in a row. Mix short, punchy sentences with longer, flowing ones.
+4. **CONCRETE LANGUAGE:** Avoid vacuous academic summaries. Use specific, concrete nouns and active verbs.
+

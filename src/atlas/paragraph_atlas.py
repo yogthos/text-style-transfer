@@ -374,12 +374,14 @@ class ParagraphAtlas:
 
         current_group = []
         current_word_count = 0
+        complex_streak = 0  # NEW: Track streak of complex sentences
 
         for i, sent in enumerate(sentences):
             if not sent.strip():
                 continue
 
             sent_len = len(sent.split())
+            potential_len = current_word_count + sent_len
 
             # Elastic Grouping Logic with Burstiness Variation:
             # If target_density is high (>25), introduce variation to create natural rhythm
@@ -392,20 +394,33 @@ class ParagraphAtlas:
             else:
                 adjusted_capacity = target_density * 1.5
 
-            # If adding this sentence keeps us under adjusted capacity, merge it
-            # Hard cap at 200% to prevent monster sentences
-            if current_word_count + sent_len < adjusted_capacity:
+            # RHYTHM BREAKER: Check if we need to force a break
+            # If we have 2 complex slots in a row, don't let the next one get too big.
+            # "Moderate" threshold is roughly 60% of target density.
+            force_break = False
+            if complex_streak >= 2:
+                if potential_len > (target_density * 0.6):
+                    force_break = True
+
+            # Modified Merge Logic
+            if not force_break and (current_word_count == 0 or potential_len < adjusted_capacity):
                 # Merge: Add to current group
                 current_group.append(sent)
                 current_word_count += sent_len
             else:
-                # Current group is full. Push it and start a new one.
+                # FLUSH GROUP
                 if current_group:
                     # Create slot with inflation applied
                     slot = create_slot(current_word_count, current_group)
                     structure_map.append(slot)
                     content_map.append(" ".join(current_group))
                     total_words += current_word_count
+
+                    # Update Streak Logic
+                    if slot['type'] == 'complex':
+                        complex_streak += 1
+                    else:
+                        complex_streak = 0  # Reset streak on simple/moderate slots
 
                 # Start new group with current sentence
                 current_group = [sent]
@@ -417,6 +432,7 @@ class ParagraphAtlas:
             structure_map.append(slot)
             content_map.append(" ".join(current_group))
             total_words += current_word_count
+            # Note: Final slot streak tracking not needed as this is the last slot
 
         avg_words = total_words / len(structure_map) if structure_map else 0
 

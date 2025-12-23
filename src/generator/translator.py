@@ -4280,6 +4280,9 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         if not paragraph or not paragraph.strip():
             return paragraph, 0, 1.0
 
+        # Constants
+        HIGH_ENTROPY_TEMP = 0.88  # Increased temperature for syntactic irregularity and natural variation
+
         # Detect if this is a header (short text without terminal punctuation)
         # Headers should not be inflated or receive sensory grounding constraints
         is_header = False
@@ -4288,6 +4291,28 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
             is_header = True
             if verbose:
                 print(f"  Detected header: {word_count} words, no terminal punctuation")
+
+            # Check if header is in title case - if so, return as-is without processing
+            skip_title_case_headers = self.generation_config.get("skip_title_case_headers", True)
+            if skip_title_case_headers:
+                # Detect title case: most words (excluding short words like "of", "and", "the") start with capital letters
+                words = paragraph.split()
+                # Count words that are likely to be capitalized in title case
+                # Skip very short words (articles, prepositions) which may be lowercase in title case
+                short_words = {'a', 'an', 'the', 'of', 'in', 'on', 'at', 'to', 'for', 'and', 'or', 'but', 'nor', 'so', 'yet', 'as', 'by'}
+                significant_words = [w for w in words if len(w) > 2 or w.lower() not in short_words]
+
+                if significant_words:
+                    # Count how many significant words start with capital letters
+                    capitalized_count = sum(1 for w in significant_words if w and w[0].isupper())
+                    title_case_ratio = capitalized_count / len(significant_words)
+
+                    # If 80%+ of significant words are capitalized, treat as title case header
+                    if title_case_ratio >= 0.8:
+                        if verbose:
+                            print(f"  Detected title-case header, returning as-is: {paragraph[:50]}{'...' if len(paragraph) > 50 else ''}")
+                        # Return as-is with perfect compliance score
+                        return paragraph, 0, 1.0
 
         # Initialize ParagraphAtlas for this author if needed
         if self.paragraph_atlas is None or getattr(self.paragraph_atlas, 'author', None) != author_name:
@@ -4424,12 +4449,13 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     print(f"  ⚠ Archetype mismatch ({input_beats} vs {match_beats}). Using synthetic fallback to preserve meaning.")
 
                 # Load author profile for dynamic inflation calculation
-                # For headers, disable inflation by using neutral density and no profile
+                # For headers, disable inflation by using exact input length and no profile
                 if is_header:
                     author_profile = None
-                    target_density = 15.0  # Neutral baseline
+                    input_word_count = len(paragraph.split())
+                    target_density = float(max(input_word_count, 3))  # Exact match, minimum 3 words for validator safety
                     if verbose:
-                        print(f"  Header detected: Disabling style inflation (target_density=15.0, author_profile=None)")
+                        print(f"  Header detected: Disabling style inflation (target_density={target_density:.1f}, author_profile=None)")
                 else:
                     author_profile = self._load_style_profile(author_name)
                     # Get target author density for elastic reshaping
@@ -4496,12 +4522,13 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                 print(f"  ⚠ No structure map available. Using synthetic fallback.")
 
             # Load author profile for dynamic inflation calculation
-            # For headers, disable inflation by using neutral density and no profile
+            # For headers, disable inflation by using exact input length and no profile
             if is_header:
                 author_profile = None
-                target_density = 15.0  # Neutral baseline
+                input_word_count = len(paragraph.split())
+                target_density = float(max(input_word_count, 3))  # Exact match, minimum 3 words for validator safety
                 if verbose:
-                    print(f"  Header detected: Disabling style inflation (target_density=15.0, author_profile=None)")
+                    print(f"  Header detected: Disabling style inflation (target_density={target_density:.1f}, author_profile=None)")
             else:
                 author_profile = self._load_style_profile(author_name)
                 # Get target author density for elastic reshaping
@@ -4633,7 +4660,7 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
 
         # Get generation config
         max_sentence_retries = self.generation_config.get("max_retries", 3)
-        generation_temp = self.generation_config.get("temperature", 0.8)
+        generation_temp = HIGH_ENTROPY_TEMP  # Override with high entropy temperature for syntactic irregularity
         generation_max_tokens = self.generation_config.get("max_tokens", 1500)
         compliance_fuzziness = self.generation_config.get("compliance_fuzziness", 0.05)
         sentence_variants_per_attempt = self.generation_config.get("sentence_variants_per_attempt", 5)
@@ -4671,13 +4698,16 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
 
                 # 2. Imagery
                 if style_dna.get("sensory_grounding"):
-                    human_texture_instructions.append("- **SENSORY GROUNDING:** Ground every abstract concept in physical reality (rust, iron, blood, sweat, mud). Avoid purely theoretical jargon.")
+                    human_texture_instructions.append("- **SENSORY GROUNDING:** Occasionally ground abstract concepts in physical reality (rust, iron, mud), but ONLY if it fits naturally. Do not force a metaphor at the end of a sentence.")
 
                 # 3. Banned Words (The "Robotic Filter")
                 banned = style_dna.get("banned_transitions", [])
                 if banned:
                     banned_str = ", ".join(f'"{w}"' for w in banned)
                     human_texture_instructions.append(f"- **BANNED TRANSITIONS:** Never use these robotic connectors: {banned_str}. Start sentences directly with the Subject or Action.")
+
+                # 4. Vocabulary (The Anti-Thesaurus)
+                human_texture_instructions.append("- **VOCABULARY DOWNGRADE:** Reject 'smart' words. Use 'use' not 'utilize', 'show' not 'demonstrate', 'try' not 'endeavor'. Prefer simple, punchy Anglo-Saxon words over complex Latinate ones.")
 
                 # Replace or augment existing HUMAN TEXTURE PROTOCOL section
                 if human_texture_instructions:
@@ -4716,8 +4746,11 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
         if is_header:
             # Strip the specific line causing hallucinations
             current_system_prompt = system_prompt.replace("- **SENSORY GROUNDING:**", "# (Disabled for Header):")
+            # Inject HEADER MODE instruction to explicitly tell LLM this is a title
+            header_instruction = "\n\n## HEADER MODE ACTIVE\nThe input text is a Title/Header. You must output a Title/Header.\n- NO full sentences.\n- NO verbs if possible.\n- NO sensory imagery or metaphors.\n- Keep it abstract and concise."
+            current_system_prompt += header_instruction
             if verbose:
-                print(f"  Header detected: Disabled sensory grounding constraint")
+                print(f"  Header detected: Disabled sensory grounding constraint and enabled HEADER MODE")
         else:
             current_system_prompt = system_prompt
 
@@ -4790,7 +4823,8 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     temperature=generation_temp,
                     max_tokens=generation_max_tokens,
                     is_last_sentence=is_last_sentence,
-                    verbose=verbose and attempt == 0
+                    verbose=verbose and attempt == 0,
+                    current_attempt=attempt + 1  # Pass attempt number (1-indexed)
                 )
 
                 if verbose and attempt == 0:
@@ -4806,7 +4840,8 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     variants, target_len, context_so_far,
                     raw_length=raw_len,  # NEW: Pass raw_length
                     verbose=verbose and attempt == 0,
-                    global_context=global_context
+                    global_context=global_context,
+                    current_attempt=attempt + 1  # Pass attempt number (1-indexed) for repetition safety valve
                 )
 
                 if not sentence:
@@ -5434,7 +5469,8 @@ Output only the sentence, no explanations.
         max_tokens: int = 1500,
         is_last_sentence: bool = False,
         verbose: bool = False,
-        raw_length: Optional[int] = None  # NEW: Add parameter (for consistency)
+        raw_length: Optional[int] = None,  # NEW: Add parameter (for consistency)
+        current_attempt: int = 1  # NEW: Current attempt number for repetition safety valve
     ) -> List[str]:
         """Generate N variants of a sentence for a specific slot.
 
@@ -5612,7 +5648,8 @@ Output only the sentence, no explanations.
         prev_context: str,
         verbose: bool = False,
         global_context: Optional[Dict] = None,
-        raw_length: Optional[int] = None  # NEW: Add parameter
+        raw_length: Optional[int] = None,  # NEW: Add parameter
+        current_attempt: int = 1  # NEW: Current attempt number for repetition safety valve
     ) -> Optional[str]:
         """Select best sentence variant based on format compliance, zipper check, and length proximity.
 
@@ -5704,59 +5741,68 @@ Output only the sentence, no explanations.
                     continue
             else:
                 # 3. 3-GRAM REPETITION CHECK (Differential)
-                # CRITICAL: Check against entire paragraph generated so far, not just current sentence
-                # This catches cross-sentence repetition (e.g., phrase in sentence 1 and sentence 4)
-                combined_text = prev_context + " " + v if prev_context else v
+                # Safety Valve: If we are on attempt 3 or higher, ignore 3-gram repetitions.
+                # This prevents getting stuck on functional phrases like "the system's" when they're necessary for meaning.
+                strict_repetition = current_attempt < 3
 
-                # Check repeats in the COMBINED text
-                current_repeats = self.statistical_critic.check_phrase_repetition(
-                    combined_text,
-                    n_gram_size=3,
-                    whitelist=whitelist
-                )
+                if strict_repetition:
+                    # CRITICAL: Check against entire paragraph generated so far, not just current sentence
+                    # This catches cross-sentence repetition (e.g., phrase in sentence 1 and sentence 4)
+                    combined_text = prev_context + " " + v if prev_context else v
 
-                if current_repeats:
-                    # CRITICAL FIX: Check if these repeats existed BEFORE this sentence.
-                    # If the repeat is entirely inside prev_context, this variant didn't cause it.
+                    # Check repeats in the COMBINED text
+                    current_repeats = self.statistical_critic.check_phrase_repetition(
+                        combined_text,
+                        n_gram_size=3,
+                        whitelist=whitelist
+                    )
 
-                    # 1. Get repeats just from the context
-                    if prev_context:
-                        context_repeats = self.statistical_critic.check_phrase_repetition(
-                            prev_context,
-                            n_gram_size=3,
-                            whitelist=whitelist
-                        )
+                    if current_repeats:
+                        # CRITICAL FIX: Check if these repeats existed BEFORE this sentence.
+                        # If the repeat is entirely inside prev_context, this variant didn't cause it.
 
-                        # 2. Filter out repeats that were already there
-                        # We only care if the variant ADDED a new repeat instance
-                        new_repeats = []
-                        for r in current_repeats:
-                            # If it wasn't in context, it's new -> Reject
-                            if r not in context_repeats:
-                                new_repeats.append(r)
-                            else:
-                                # It WAS in context. Did we increase the count?
-                                # CRITICAL: check_phrase_repetition returns normalized phrases (lowercase, no punctuation),
-                                # so we must normalize both strings before counting to match tokenizer behavior
-                                norm_combined = _normalize_for_counting(combined_text)
-                                norm_context = _normalize_for_counting(prev_context)
+                        # 1. Get repeats just from the context
+                        if prev_context:
+                            context_repeats = self.statistical_critic.check_phrase_repetition(
+                                prev_context,
+                                n_gram_size=3,
+                                whitelist=whitelist
+                            )
 
-                                count_combined = norm_combined.count(r)
-                                count_context = norm_context.count(r)
-
-                                if count_combined > count_context:
+                            # 2. Filter out repeats that were already there
+                            # We only care if the variant ADDED a new repeat instance
+                            new_repeats = []
+                            for r in current_repeats:
+                                # If it wasn't in context, it's new -> Reject
+                                if r not in context_repeats:
                                     new_repeats.append(r)
+                                else:
+                                    # It WAS in context. Did we increase the count?
+                                    # CRITICAL: check_phrase_repetition returns normalized phrases (lowercase, no punctuation),
+                                    # so we must normalize both strings before counting to match tokenizer behavior
+                                    norm_combined = _normalize_for_counting(combined_text)
+                                    norm_context = _normalize_for_counting(prev_context)
 
-                        # If we have actual NEW repeats, reject.
-                        if new_repeats:
+                                    count_combined = norm_combined.count(r)
+                                    count_context = norm_context.count(r)
+
+                                    if count_combined > count_context:
+                                        new_repeats.append(r)
+
+                            # If we have actual NEW repeats, reject.
+                            if new_repeats:
+                                if verbose:
+                                    print(f"      Variant filtered (3-Gram Repetition): {v[:50]}... (repeats: {new_repeats[:2]})")
+                                continue
+                        else:
+                            # No context, so any repeat is the variant's fault
                             if verbose:
-                                print(f"      Variant filtered (3-Gram Repetition): {v[:50]}... (repeats: {new_repeats[:2]})")
+                                print(f"      Variant filtered (3-Gram Repetition): {v[:50]}... (repeats: {current_repeats[:2]})")
                             continue
-                    else:
-                        # No context, so any repeat is the variant's fault
-                        if verbose:
-                            print(f"      Variant filtered (3-Gram Repetition): {v[:50]}... (repeats: {current_repeats[:2]})")
-                        continue
+                else:
+                    # Safety Valve: On attempt 3+, skip strict repetition check
+                    if verbose:
+                        print(f"      Repetition check disabled (Safety Valve active on attempt {current_attempt})")
 
             # 4. NEW: LENGTH VALIDATION (Safe Range Check)
             # Filter out variants that don't meet Safe Range criteria

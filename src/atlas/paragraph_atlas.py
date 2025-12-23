@@ -372,8 +372,14 @@ class ParagraphAtlas:
             # Apply Inflation
             adjusted_target = int(word_count * inflation_factor)
 
-            # Ensure reasonable bounds (don't shrink below 3 or grow beyond 60)
-            final_target = max(3, min(adjusted_target, 60))
+            # --- THE SAFETY CAP ---
+            # Current LLMs struggle to maintain coherence beyond ~60 words.
+            # Even if the author writes 100-word sentences, we cap at 60 to ensure success.
+            # This prevents infinite retry loops when targets exceed model capabilities.
+            MAX_SENTENCE_CEILING = 60
+
+            # Ensure reasonable bounds (don't shrink below 3 or grow beyond ceiling)
+            final_target = max(3, min(adjusted_target, MAX_SENTENCE_CEILING))
 
             # Determine slot type based on FINAL target
             if final_target < 10:

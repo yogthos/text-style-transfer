@@ -4707,7 +4707,12 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
                     human_texture_instructions.append(f"- **BANNED TRANSITIONS:** Never use these robotic connectors: {banned_str}. Start sentences directly with the Subject or Action.")
 
                 # 4. Vocabulary (The Anti-Thesaurus)
-                human_texture_instructions.append("- **VOCABULARY DOWNGRADE:** Reject 'smart' words. Use 'use' not 'utilize', 'show' not 'demonstrate', 'try' not 'endeavor'. Prefer simple, punchy Anglo-Saxon words over complex Latinate ones.")
+                human_texture_instructions.append("- **VOCABULARY DOWNGRADE:** Reject 'smart' words where simple ones work. Use 'use' not 'utilize', 'show' not 'demonstrate'. Prefer Anglo-Saxon roots.")
+
+                # 5. Syntax Hazards (The AI Kill-List)
+                human_texture_instructions.append("- **ANTI-ROBOTIC SYNTAX:** Do not use the 'Comma + Participle' pattern (e.g., ', causing X, resulting in Y'). This is the #1 marker of AI. Use independent clauses instead: ', and this causes X' or '; the result is Y'.")
+                human_texture_instructions.append("- **ACTIVE VOICE:** Be authoritative. 'Three laws rule the system,' NOT 'The system is governed by three laws.'")
+                human_texture_instructions.append("- **STRONG CONNECTORS:** Avoid weak academic transitions ('Moreover', 'Furthermore', 'Thus'). Use strong, direct connectors ('But', 'And', 'Yet') or simply start a new sentence.")
 
                 # Replace or augment existing HUMAN TEXTURE PROTOCOL section
                 if human_texture_instructions:

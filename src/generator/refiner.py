@@ -8,6 +8,7 @@ import json
 import re
 from pathlib import Path
 from typing import List, Dict, Optional, Tuple
+from nltk.tokenize import sent_tokenize
 from src.generator.llm_provider import LLMProvider
 from src.validator.statistical_critic import StatisticalCritic
 from src.utils.parsing import extract_json_from_text
@@ -761,11 +762,22 @@ Output only the fixed sentence(s), no explanations.
                 failed_word_count = len(best_variant.split())
                 delta = abs(failed_word_count - target_len)
 
+                # Check if this is a micro-sentence (target < 10 words)
+                is_micro = target_len < 10
+
                 # Add specific feedback about previous failure
                 if failed_word_count > target_len:
-                    feedback_msg = f"\n\n**PREVIOUS ATTEMPT FAILED:** You generated {failed_word_count} words (target: {target_len}). You were {delta} words too long. You MUST shorten by removing approximately {delta} words this time."
+                    if is_micro:
+                        # Exact instruction for short sentences
+                        feedback_msg = f"\n\n**PREVIOUS ATTEMPT FAILED:** You generated {failed_word_count} words (target: {target_len}). You were {delta} words too long. You MUST remove exactly {delta} word(s)."
+                    else:
+                        # Approximate instruction for normal sentences
+                        feedback_msg = f"\n\n**PREVIOUS ATTEMPT FAILED:** You generated {failed_word_count} words (target: {target_len}). You were {delta} words too long. You MUST shorten by removing approximately {delta} words this time."
                 else:
-                    feedback_msg = f"\n\n**PREVIOUS ATTEMPT FAILED:** You generated {failed_word_count} words (target: {target_len}). You were {delta} words too short. You MUST expand by adding approximately {delta} words this time."
+                    if is_micro:
+                        feedback_msg = f"\n\n**PREVIOUS ATTEMPT FAILED:** You generated {failed_word_count} words (target: {target_len}). You were {delta} words too short. You MUST add exactly {delta} word(s)."
+                    else:
+                        feedback_msg = f"\n\n**PREVIOUS ATTEMPT FAILED:** You generated {failed_word_count} words (target: {target_len}). You were {delta} words too short. You MUST expand by adding approximately {delta} words this time."
 
                 current_instruction += feedback_msg
 
@@ -787,16 +799,33 @@ Output only the fixed sentence(s), no explanations.
                     print(f"      ⚠ No valid variant found, using first variant as fallback")
                 best_candidate = variants[0] if variants else sentence
 
-            if verbose and target_len:
-                word_count = len(best_candidate.split())
-                print(f"      Selected best variant: {word_count} words (target: {target_len}) from {len(variants)} candidates")
-
             # UPDATE: Store best_variant for next iteration's feedback (before validation)
             best_variant = best_candidate
 
             # 3. Validate candidate (existing validation logic)
             fixed = best_candidate
             is_split = action.lower() == "split"
+
+            if verbose and target_len:
+                if is_split:
+                    # For split, calculate and show average length for clarity
+                    try:
+                        sentences_list = sent_tokenize(best_candidate)
+                        if sentences_list:
+                            lens = [len(s.split()) for s in sentences_list]
+                            avg_val = sum(lens) / len(lens)
+                            print(f"      Selected best variant: {avg_val:.1f} words avg (target: {target_len}) from {len(variants)} candidates")
+                        else:
+                            # Fallback
+                            word_count = len(best_candidate.split())
+                            print(f"      Selected best variant: {word_count} words (target: {target_len}) from {len(variants)} candidates")
+                    except:
+                        word_count = len(best_candidate.split())
+                        print(f"      Selected best variant: {word_count} words (target: {target_len}) from {len(variants)} candidates")
+                else:
+                    # Standard behavior
+                    word_count = len(best_candidate.split())
+                    print(f"      Selected best variant: {word_count} words (target: {target_len}) from {len(variants)} candidates")
 
             try:
                 # STRICT VALIDATION: Check Split Compliance

@@ -416,7 +416,7 @@ class StatisticalCritic:
         micro_threshold = length_gate_config.get("micro_sentence_threshold", 6)
         abs_tolerance = length_gate_config.get("micro_sentence_absolute_tolerance", 2)
 
-        if target_length < micro_threshold:
+        if target_length <= micro_threshold:
             # MICRO-SENTENCE CHECK: Use Absolute Tolerance
             diff = abs(word_count - target_length)
 

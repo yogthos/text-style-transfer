@@ -4397,21 +4397,115 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
             if divergence > 1:
                 if verbose:
                     print(f"  ⚠ Archetype mismatch ({input_beats} vs {match_beats}). Using synthetic fallback to preserve meaning.")
-                synthetic_archetype = self.paragraph_atlas._create_synthetic_archetype(paragraph)
+
+                # Get target author density for elastic reshaping
+                target_density = self.paragraph_atlas.get_author_avg_sentence_length()
+                if verbose:
+                    print(f"  Target author density: {target_density:.1f} words/sentence")
+
+                synthetic_archetype = self.paragraph_atlas._create_synthetic_archetype(
+                    paragraph,
+                    target_density=target_density
+                )
                 structure_map = synthetic_archetype['structure_map']
                 # Update archetype_desc for logging - mark as synthetic
                 archetype_desc = synthetic_archetype['stats']
                 archetype_desc['id'] = "synthetic_fallback"  # Mark for direct mapping
+                # Store content_map for elastic mapping
+                archetype_desc['content_map'] = synthetic_archetype.get('content_map', [])
+
+                # --- NEW: STYLE GRAFTING ---
+                # Find a real archetype closest to this length to steal its "Vibes"
+                style_donor_id = self.paragraph_atlas.find_style_matched_archetype(
+                    target_sentence_count=len(structure_map),
+                    tolerance=3
+                )
+
+                if style_donor_id is not None:
+                    if verbose:
+                        print(f"  🎨 Grafting style metadata from Archetype {style_donor_id}")
+
+                    # Get the donor archetype's description
+                    donor_desc = self.paragraph_atlas.get_archetype_description(style_donor_id)
+
+                    # 1. Copy style metadata (Burstiness, Style Label)
+                    archetype_desc['burstiness'] = donor_desc.get('burstiness', 'Medium')
+                    archetype_desc['style'] = donor_desc.get('style', 'neutral')
+
+                    # 2. Update target_arch_id to the style donor
+                    target_arch_id = style_donor_id
+
+                    # 3. RE-FETCH IMMEDIATELY (Cleaner than downstream logic)
+                    if verbose:
+                        print(f"  🔄 Re-fetching rhythm reference from style donor {target_arch_id}...")
+
+                    # Overwrite the variable 'rhythm_reference' used later
+                    rhythm_reference = self.paragraph_atlas.get_example_paragraph(target_arch_id)
+
+                    # Safety fallback if example is missing
+                    if not rhythm_reference:
+                        rhythm_reference = donor_desc.get('example', '')
+
+                    if verbose:
+                        print(f"  Style metadata: {archetype_desc['burstiness']} burstiness, {archetype_desc['style']} style")
+                else:
+                    if verbose:
+                        print(f"  ⚠ No style-matched archetype found within tolerance, using synthetic metadata only")
+                # ---------------------------
+
                 if verbose:
                     print(f"  Synthetic structure: {len(structure_map)} sentences")
         else:
             # No structure map available - use synthetic
             if verbose:
                 print(f"  ⚠ No structure map available. Using synthetic fallback.")
-            synthetic_archetype = self.paragraph_atlas._create_synthetic_archetype(paragraph)
+
+            # Get target author density for elastic reshaping
+            target_density = self.paragraph_atlas.get_author_avg_sentence_length()
+            if verbose:
+                print(f"  Target author density: {target_density:.1f} words/sentence")
+
+            synthetic_archetype = self.paragraph_atlas._create_synthetic_archetype(
+                paragraph,
+                target_density=target_density
+            )
             structure_map = synthetic_archetype['structure_map']
             archetype_desc = synthetic_archetype['stats']
             archetype_desc['id'] = "synthetic_fallback"  # Mark for direct mapping
+            # Store content_map for elastic mapping
+            archetype_desc['content_map'] = synthetic_archetype.get('content_map', [])
+
+            # --- NEW: STYLE GRAFTING (same logic as above) ---
+            style_donor_id = self.paragraph_atlas.find_style_matched_archetype(
+                target_sentence_count=len(structure_map),
+                tolerance=3
+            )
+
+            if style_donor_id is not None:
+                if verbose:
+                    print(f"  🎨 Grafting style metadata from Archetype {style_donor_id}")
+
+                # Get the donor archetype's description
+                donor_desc = self.paragraph_atlas.get_archetype_description(style_donor_id)
+
+                # 1. Copy style metadata (Burstiness, Style Label)
+                archetype_desc['burstiness'] = donor_desc.get('burstiness', 'Medium')
+                archetype_desc['style'] = donor_desc.get('style', 'neutral')
+
+                # 2. Update target_arch_id to the style donor
+                target_arch_id = style_donor_id
+
+                # 3. RE-FETCH IMMEDIATELY (Cleaner than downstream logic)
+                if verbose:
+                    print(f"  🔄 Re-fetching rhythm reference from style donor {target_arch_id}...")
+
+                # Overwrite the variable 'rhythm_reference' used later
+                rhythm_reference = self.paragraph_atlas.get_example_paragraph(target_arch_id)
+
+                # Safety fallback if example is missing
+                if not rhythm_reference:
+                    rhythm_reference = donor_desc.get('example', '')
+            # ---------------------------
 
         if not structure_map:
             if verbose:
@@ -4439,32 +4533,52 @@ Example: ["Observation of material conditions", "Theoretical implication", "Fina
             if verbose:
                 print(f"  ⚡ Using Direct Sentence Mapping (Lossless Mode)")
 
-            # 1. Tokenize input into sentences
-            try:
-                from nltk.tokenize import sent_tokenize
-                input_sentences = sent_tokenize(paragraph)
-            except (ImportError, Exception):
-                # Fallback: split by periods
-                input_sentences = [s.strip() for s in paragraph.split('.') if len(s.strip()) > 5]
+            # Use the pre-calculated grouped content from the Atlas
+            # This contains merged/split sentences based on target author density
+            grouped_content = archetype_desc.get("content_map", [])
 
-            # 2. Map 1:1 to structure (direct mapping)
-            content_slots = []
-            for i, slot in enumerate(structure_map):
-                # Safety: Ensure we don't go out of bounds
-                if i < len(input_sentences):
-                    source_sent = input_sentences[i].strip()
-                    # Use original sentence as content (will be rewritten in author's style)
-                    content_slots.append(source_sent)
-                else:
-                    # If structure has more slots than input sentences, mark as EMPTY
+            if grouped_content:
+                try:
+                    from nltk.tokenize import sent_tokenize
+                    input_sentence_count = len(sent_tokenize(paragraph))
+                except (ImportError, Exception):
+                    input_sentence_count = len([s.strip() for s in paragraph.split('.') if len(s.strip()) > 5])
+
+                if verbose:
+                    print(f"  Using elastic content mapping: {len(grouped_content)} slots from {input_sentence_count} input sentences")
+
+                content_slots = []
+                for i, slot in enumerate(structure_map):
+                    if i < len(grouped_content):
+                        content_slots.append(grouped_content[i])
+                    else:
+                        content_slots.append("EMPTY")
+
+                # Ensure we have the right number of slots
+                while len(content_slots) < len(structure_map):
+                    content_slots.append("EMPTY")
+            else:
+                # Fallback to old 1:1 mapping if content_map not available
+                if verbose:
+                    print(f"  ⚠ No content_map available, falling back to 1:1 mapping")
+                try:
+                    from nltk.tokenize import sent_tokenize
+                    input_sentences = sent_tokenize(paragraph)
+                except (ImportError, Exception):
+                    input_sentences = [s.strip() for s in paragraph.split('.') if len(s.strip()) > 5]
+
+                content_slots = []
+                for i, slot in enumerate(structure_map):
+                    if i < len(input_sentences):
+                        content_slots.append(input_sentences[i].strip())
+                    else:
+                        content_slots.append("EMPTY")
+
+                while len(content_slots) < len(structure_map):
                     content_slots.append("EMPTY")
 
-            # Ensure we have the right number of slots
-            while len(content_slots) < len(structure_map):
-                content_slots.append("EMPTY")
-
             if verbose:
-                print(f"  Direct mapped {len([s for s in content_slots if s != 'EMPTY'])} sentences to {len(structure_map)} slots")
+                print(f"  Direct mapped {len([s for s in content_slots if s != 'EMPTY'])} content groups to {len(structure_map)} slots")
         else:
             # Standard LLM Planning for Library Archetypes
             content_planner = ContentPlanner(self.config_path)
@@ -5418,19 +5532,65 @@ Output only the sentence, no explanations.
                     print(f"      Variant filtered (Zipper Check): {v[:50]}...")
                 continue
 
-            # 3. 3-GRAM REPETITION CHECK (Context-Aware with Whitelist)
-            # CRITICAL: Check against entire paragraph generated so far, not just current sentence
-            # This catches cross-sentence repetition (e.g., phrase in sentence 1 and sentence 4)
-            combined_text = prev_context + " " + v if prev_context else v
-            phrase_repeats = self.statistical_critic.check_phrase_repetition(
-                combined_text,
-                n_gram_size=3,
-                whitelist=whitelist
-            )
-            if phrase_repeats:
+            # --- NEW: STRICT SENTENCE COUNT GUARD ---
+            # Parse with spaCy to count real sentences
+            try:
+                nlp = self._get_nlp()
+                if nlp:
+                    doc = nlp(v)
+                    sentence_count = len(list(doc.sents))
+
+                    # Allow 2 sentences only if target length is very long (>50 words)
+                    # or if the second "sentence" is actually a fragment/dialogue tag.
+                    # Otherwise, STRICT 1-sentence limit for a single slot.
+                    if sentence_count > 1:
+                        # Check if it's just a parsing error (e.g. "Mr. Smith") or distinct sentences
+                        if target_length < 50:  # Standard slots must be singletons
+                            if verbose:
+                                print(f"      Variant filtered (Multiple Sentences): {v[:50]}... ({sentence_count} sentences)")
+                            continue  # Skip this variant
+                else:
+                    # Fallback: Check for sentence terminators followed by spaces and capital letters
+                    # Matches ". " or "? " or "! " followed by a capital letter inside the string
+                    # This is safer than counting periods (avoids false positives from "Mr. Smith")
+                    import re
+                    sentence_terminators = len(re.findall(r'[.!?]\s+[A-Z]', v))
+                    if sentence_terminators > 0 and target_length < 50:
+                        # Found internal punctuation followed by a capital letter -> Likely 2+ sentences
+                        if verbose:
+                            print(f"      Variant filtered (Multiple Sentences - fallback): {v[:50]}... ({sentence_terminators + 1} sentences detected)")
+                        continue
+            except Exception as e:
+                # If NLP parsing fails, continue with other checks
                 if verbose:
-                    print(f"      Variant filtered (3-Gram Repetition): {v[:50]}... (repeats: {phrase_repeats[:2]})")
-                continue
+                    print(f"      ⚠ Sentence count check failed: {e}, continuing...")
+            # ---------------------------
+
+            # 3. REPETITION CHECK (Context-Aware with Whitelist)
+            # SKIP 3-gram check for very short sentences (often just connectors/affirmations)
+            # Micro-sentences (< 4 words) often consist of stop words that will naturally repeat
+            word_count = len(v.split())
+            if word_count < 4:
+                # For micro-sentences, only check if they're an exact duplicate of previous sentence ending
+                # This prevents immediate stutter (e.g., "It failed. It failed.")
+                if prev_context and prev_context.strip().endswith(v.strip()):
+                    if verbose:
+                        print(f"      Variant filtered (Micro-Sentence Duplicate): {v[:50]}...")
+                    continue
+            else:
+                # Perform standard 3-GRAM REPETITION CHECK for normal sentences
+                # CRITICAL: Check against entire paragraph generated so far, not just current sentence
+                # This catches cross-sentence repetition (e.g., phrase in sentence 1 and sentence 4)
+                combined_text = prev_context + " " + v if prev_context else v
+                phrase_repeats = self.statistical_critic.check_phrase_repetition(
+                    combined_text,
+                    n_gram_size=3,
+                    whitelist=whitelist
+                )
+                if phrase_repeats:
+                    if verbose:
+                        print(f"      Variant filtered (3-Gram Repetition): {v[:50]}... (repeats: {phrase_repeats[:2]})")
+                    continue
 
             valid_candidates.append(v)
 

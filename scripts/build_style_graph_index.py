@@ -224,6 +224,8 @@ class StyleGraphIndexer:
         # Match [NODE_ID] patterns
         placeholder_pattern = r'\[([A-Z_][A-Z0-9_]*)\]'
         matches = re.findall(placeholder_pattern, skeleton)
+        # Filter out invalid single-underscore placeholders (parsing artifacts)
+        matches = [m for m in matches if m != '_']
         return matches
 
     def _strip_markdown_code_blocks(self, text: str) -> str:

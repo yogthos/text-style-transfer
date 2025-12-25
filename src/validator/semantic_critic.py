@@ -105,7 +105,7 @@ def _get_content_keywords(text: str) -> Set[str]:
         text: Text to extract keywords from.
 
     Returns:
-        Set of lemmatized nouns and verbs (content keywords).
+        Set of lemmatized nouns and verbs (content keywords), normalized (lowercase, punctuation stripped).
     """
     global _spacy_nlp
 
@@ -118,8 +118,12 @@ def _get_content_keywords(text: str) -> Set[str]:
             _spacy_nlp = False  # Mark as unavailable
 
     if not _spacy_nlp or _spacy_nlp is False:
-        # Fallback: extract all non-stop words
-        words = text.lower().split()
+        # Fallback: extract all non-stop words, normalize punctuation
+        import string
+        # Remove punctuation and lowercase
+        translator = str.maketrans('', '', string.punctuation)
+        normalized_text = text.translate(translator).lower()
+        words = normalized_text.split()
         # Simple heuristic: assume most content words are nouns/verbs
         return set(w for w in words if len(w) > 2)
 
@@ -128,12 +132,38 @@ def _get_content_keywords(text: str) -> Set[str]:
     for token in doc:
         # Extract nouns (NOUN, PROPN) and verbs (VERB)
         if token.pos_ in ["NOUN", "PROPN", "VERB"] and not token.is_stop and not token.is_punct:
-            content_keywords.add(token.lemma_)
+            # Normalize: strip punctuation from lemma and lowercase
+            import string
+            lemma = token.lemma_.lower()
+            # Remove any remaining punctuation (handles cases like "toolset" vs '"toolset"')
+            lemma = lemma.strip(string.punctuation)
+            if lemma:  # Only add non-empty lemmas
+                content_keywords.add(lemma)
     return content_keywords
 
 
 class SemanticCritic:
     """Validates generated text using precision/recall semantic checks."""
+
+    def _normalize_token(self, text: str) -> str:
+        """Aggressive normalization: Keeps only alphanumeric chars, lowercased.
+
+        Examples:
+        - ' "Diamat" ' -> 'diamat'
+        - 'tool-set' -> 'toolset'
+        - '"toolset"' -> 'toolset'
+        - '"dialectical materialism"' -> 'dialecticalmaterialism'
+
+        Args:
+            text: Token to normalize
+
+        Returns:
+            Normalized token (lowercase, only alphanumeric chars)
+        """
+        if not isinstance(text, str):
+            text = str(text)
+        # Filter: Keep only letters and numbers (removes all punctuation and spaces)
+        return "".join(c for c in text if c.isalnum()).lower()
 
     def __init__(self, similarity_threshold: float = None, config_path: str = "config.json"):
         """Initialize the semantic critic.
@@ -699,24 +729,38 @@ class SemanticCritic:
         Uses two-gate validation system:
         - Gate 1: Template Fit (skeleton adherence) - if skeleton provided
         - Gate 2: Meaning Preservation (recall)
-        - Final Heuristic: LLM meaning verification
 
-        Args:
-            generated_text: Generated text to evaluate.
-            input_blueprint: Original input blueprint to compare against.
-            allowed_style_words: Optional list of style words to whitelist.
-            skeleton: Optional skeleton template for adherence checking.
-
-        Returns:
-            Dict with:
-            - pass: bool
-            - recall_score: float (0-1)
-            - precision_score: float (0-1)
-            - adherence_score: float (0-1)
-            - llm_meaning_score: float (0-1)
-            - score: float (0-1, weighted: adherence * 0.5 + recall * 0.5)
-            - feedback: str
+        CRITICAL: Type Safety - Ensure propositions are strings
         """
+        # CRITICAL: Type Safety - Ensure propositions are strings
+        if propositions and isinstance(propositions, list):
+            normalized_propositions = []
+            for p in propositions:
+                if isinstance(p, dict) and 'text' in p:
+                    normalized_propositions.append(str(p['text']))
+                elif isinstance(p, str):
+                    normalized_propositions.append(p)
+                else:
+                    normalized_propositions.append(str(p))
+            propositions = normalized_propositions
+
+            # Debug Logging: Print first 5 keywords from Input and Output
+            if verbose and propositions:
+                input_keywords = set()
+                for prop in propositions[:3]:  # Check first 3 propositions
+                    keywords = _get_content_keywords(prop)
+                    input_keywords.update(keywords)
+                output_keywords = _get_content_keywords(generated_text[:200])  # First 200 chars
+
+                input_keywords_list = list(input_keywords)[:5]
+                output_keywords_list = list(output_keywords)[:5]
+
+                print(f"      [DEBUG] Keyword Extraction:")
+                print(f"        Input keywords (first 5): {input_keywords_list}")
+                print(f"        Output keywords (first 5): {output_keywords_list}")
+                print(f"        Input keywords count: {len(input_keywords)}")
+                print(f"        Output keywords count: {len(output_keywords)}")
+
         # CRITICAL: Copy-Paste Check - reject exact copies of original text
         # This forces the system to transform the style, not just copy verbatim
         if generated_text.strip() == input_blueprint.original_text.strip():
@@ -760,8 +804,45 @@ class SemanticCritic:
 
         # PARAGRAPH MODE: Use proposition-based evaluation
         if is_paragraph and propositions:
+            # CRITICAL: Type check and normalize propositions to strings
+            if verbose:
+                print(f"      [DEBUG] Evaluate (Paragraph Mode):")
+                print(f"        Propositions type: {type(propositions)}")
+                print(f"        Propositions count: {len(propositions) if propositions else 0}")
+                if propositions:
+                    print(f"        First proposition type: {type(propositions[0])}")
+                    print(f"        First proposition: {str(propositions[0])[:50]}...")
+
+            # Normalize propositions to strings if needed
+            normalized_propositions = []
+            if propositions:
+                for prop in propositions:
+                    if isinstance(prop, str):
+                        normalized_propositions.append(prop)
+                    elif isinstance(prop, dict):
+                        # Extract text from dict if it's a structured proposition
+                        normalized_propositions.append(str(prop.get('text', prop.get('proposition', str(prop)))))
+                    else:
+                        # Convert to string
+                        normalized_propositions.append(str(prop))
+
+            if verbose and normalized_propositions:
+                # Extract keywords for debugging
+                input_keywords = set()
+                for prop in normalized_propositions:
+                    keywords = _get_content_keywords(prop)
+                    input_keywords.update(keywords)
+                output_keywords = _get_content_keywords(generated_text)
+                intersection = input_keywords.intersection(output_keywords)
+
+                print(f"        Input keywords (first 10): {list(input_keywords)[:10]}")
+                print(f"        Output keywords (first 10): {list(output_keywords)[:10]}")
+                print(f"        Intersection count: {len(intersection)}")
+                if intersection:
+                    print(f"        Intersection (first 10): {list(intersection)[:10]}")
+
             return self._evaluate_paragraph_mode(
-                generated_text, original_text, propositions, author_style_vector,
+                generated_text, original_text, normalized_propositions, author_style_vector,
                 style_lexicon=style_lexicon,
                 secondary_author_vector=secondary_author_vector,
                 blend_ratio=blend_ratio,
@@ -1560,20 +1641,43 @@ Does the generated text align with the intent '{intent}'? Consider:
             return 1.0, ""
 
         if not self.semantic_model:
-            # Fallback: simple set intersection
+            # Fallback: simple set intersection with NORMALIZATION
+            # Normalize both sets to handle punctuation mismatches (e.g., "toolset" vs toolset)
             input_keywords = input_blueprint.core_keywords
             generated_keywords = generated_blueprint.core_keywords
-            overlap = len(input_keywords & generated_keywords)
-            recall_ratio = overlap / len(input_keywords) if input_keywords else 1.0
+
+            # 1. Normalize Sets - Aggressive normalization
+            input_norm = {self._normalize_token(k) for k in input_keywords if k}
+            generated_norm = {self._normalize_token(k) for k in generated_keywords if k}
+
+            # 2. Calculate Overlap
+            overlap = input_norm.intersection(generated_norm)
+
+            # 3. Calculate Score
+            recall_ratio = len(overlap) / len(input_norm) if input_norm else 1.0
+
+            # 4. Debug Logging
+            if verbose:
+                print(f"      [CRITIC] Input Norm: {sorted(list(input_norm))[:5]}")
+                print(f"      [CRITIC] Output Norm: {sorted(list(generated_norm))[:5]}")
+                missing = input_norm - generated_norm
+                if missing:
+                    print(f"      [CRITIC] Missing: {sorted(list(missing))[:5]}")
+                print(f"      [CRITIC] Score: {recall_ratio:.3f}")
 
             if recall_ratio < self.recall_threshold:
-                missing = input_keywords - generated_keywords
+                missing = input_norm - generated_norm
                 return recall_ratio, f"CRITICAL: Missing concepts: {', '.join(list(missing)[:5])}. Preserve all input meaning."
             return recall_ratio, ""
 
         # Encode keywords as vectors
-        input_keywords = list(input_blueprint.core_keywords)
-        generated_keywords = list(generated_blueprint.core_keywords)
+        # Normalize keywords before encoding to handle punctuation mismatches (e.g., "toolset" vs toolset)
+        input_keywords_raw = list(input_blueprint.core_keywords)
+        generated_keywords_raw = list(generated_blueprint.core_keywords)
+
+        # Normalize for encoding (preserves semantic meaning but removes punctuation differences)
+        input_keywords = [self._normalize_token(k) for k in input_keywords_raw if k]
+        generated_keywords = [self._normalize_token(k) for k in generated_keywords_raw if k]
 
         if not generated_keywords:
             return 0.0, "CRITICAL: Generated text has no keywords. Meaning lost."
@@ -1594,8 +1698,10 @@ Does the generated text align with the intent '{intent}'? Consider:
             recall_ratio = covered_count / len(input_keywords) if input_keywords else 1.0
 
             if recall_ratio < self.recall_threshold:
-                missing = [input_keywords[i] for i, score in enumerate(max_scores) if score.item() < self.similarity_threshold]
-                return recall_ratio, f"CRITICAL: Missing concepts: {', '.join(missing[:5])}. Preserve all input meaning."
+                # Use normalized keywords for missing list to show clean output
+                missing_indices = [i for i, score in enumerate(max_scores) if score.item() < self.similarity_threshold]
+                missing = [input_keywords[i] for i in missing_indices[:5]]  # Use normalized keywords
+                return recall_ratio, f"CRITICAL: Missing concepts: {', '.join(missing)}. Preserve all input meaning."
 
             return recall_ratio, ""
         except Exception:
@@ -1898,7 +2004,8 @@ Does the generated text align with the intent '{intent}'? Consider:
         """Validate that all citations and quotes from input are present in generated text.
 
         Citations must be present (position flexible).
-        Quotes must be present AND exact word-for-word match.
+        Quotes are validated by checking if the core concept/word is present
+        (does NOT require exact punctuation matching).
 
         Args:
             generated_text: Generated text to validate.
@@ -1922,32 +2029,26 @@ Does the generated text align with the intent '{intent}'? Consider:
                     f"Missing citations: {', '.join(sorted(missing_citations))}"
                 )
 
-        # Check quotes
+        # Check quotes - Relaxed validation: Check for concept presence, not exact punctuation
         if input_blueprint.quotes:
-            # Extract quotes from generated text
-            quotation_pattern = r'["\'](?:[^"\']|(?<=\\)["\'])*["\']'
-            generated_quotes = []
-            for match in re.finditer(quotation_pattern, generated_text):
-                quote_text = match.group(0)
-                if len(quote_text.strip('"\'')) > 2:
-                    generated_quotes.append(quote_text)
+            # Normalize the entire generated text once for efficient searching
+            generated_text_normalized = self._normalize_token(generated_text)
 
             # Check each input quote
             for input_quote_text, _ in input_blueprint.quotes:
-                # Normalize quotes for comparison (handle both single and double)
-                input_normalized = input_quote_text.strip('"\'').strip()
-                found = False
+                # Extract the core concept by normalizing the quote content
+                # e.g., '"Diamat"' -> 'diamat', '"toolset"' -> 'toolset'
+                quote_content_normalized = self._normalize_token(input_quote_text)
 
-                for gen_quote in generated_quotes:
-                    gen_normalized = gen_quote.strip('"\'').strip()
-                    # Exact match required (word-for-word)
-                    if input_normalized == gen_normalized:
-                        found = True
-                        break
-
-                if not found:
+                # Check if the normalized concept exists in the normalized generated text
+                # This allows "toolset" to match "toolset" even if quotes are missing
+                if quote_content_normalized and quote_content_normalized in generated_text_normalized:
+                    # Concept is present - validation passes for this quote
+                    continue
+                else:
+                    # Concept is missing entirely - flag as missing
                     feedback_parts.append(
-                        f"Missing or modified quote: {input_quote_text}"
+                        f"Missing quote content: {input_quote_text}"
                     )
 
         if feedback_parts:
@@ -1977,7 +2078,38 @@ Does the generated text align with the intent '{intent}'? Consider:
         Returns:
             Tuple of (recall_score: float, details_dict: Dict).
         """
+        # DEBUG: Sanity check - ensure propositions are strings
+        if verbose:
+            print(f"      [DEBUG] Proposition Recall Check:")
+            print(f"        Generated text length: {len(generated_text)} chars")
+            print(f"        Generated text (first 50): {generated_text[:50]}...")
+            print(f"        Propositions count: {len(propositions) if propositions else 0}")
+            if propositions:
+                print(f"        First proposition type: {type(propositions[0])}")
+                print(f"        First proposition (first 50): {str(propositions[0])[:50]}...")
+
+        # CRITICAL: Convert propositions to strings if they're not already
+        if propositions:
+            cleaned_propositions = []
+            for prop in propositions:
+                if isinstance(prop, str):
+                    cleaned_propositions.append(prop)
+                elif isinstance(prop, dict):
+                    # Extract text from dict if it's a structured proposition
+                    cleaned_propositions.append(str(prop.get('text', prop.get('proposition', str(prop)))))
+                else:
+                    # Convert to string
+                    cleaned_propositions.append(str(prop))
+            propositions = cleaned_propositions
+
+            if verbose:
+                print(f"        Cleaned propositions count: {len(propositions)}")
+                if propositions:
+                    print(f"        First cleaned proposition: {propositions[0][:50]}...")
+
         if not propositions:
+            if verbose:
+                print(f"        ⚠ No propositions provided, returning recall=1.0")
             return 1.0, {"preserved": [], "missing": [], "scores": {}}
 
         if not self.semantic_model:
@@ -2048,9 +2180,22 @@ Does the generated text align with the intent '{intent}'? Consider:
                 sent_keywords = _get_content_keywords(best_sentence)
 
                 if prop_keywords:
-                    # Calculate keyword overlap ratio
-                    overlap = len(prop_keywords.intersection(sent_keywords))
-                    keyword_overlap_ratio = overlap / len(prop_keywords) if prop_keywords else 0.0
+                    # NORMALIZE BEFORE COMPARISON: Handle punctuation mismatches (e.g., "toolset" vs toolset)
+                    prop_keywords_norm = {self._normalize_token(k) for k in prop_keywords}
+                    sent_keywords_norm = {self._normalize_token(k) for k in sent_keywords}
+
+                    # Calculate keyword overlap ratio on NORMALIZED sets
+                    overlap = prop_keywords_norm.intersection(sent_keywords_norm)
+                    keyword_overlap_ratio = len(overlap) / len(prop_keywords_norm) if prop_keywords_norm else 0.0
+
+                    # DEBUG LOGGING: Show exact sets being compared
+                    if verbose:
+                        print(f"\n        [CRITIC DEBUG] Keyword Matching:")
+                        print(f"          Prop Raw: {list(prop_keywords)[:5]}")
+                        print(f"          Prop Norm: {list(prop_keywords_norm)[:5]}")
+                        print(f"          Sent Norm: {list(sent_keywords_norm)[:5]}")
+                        print(f"          Overlap: {list(overlap)[:5]}")
+                        print(f"          Overlap Ratio: {keyword_overlap_ratio:.3f}")
 
                     # If 75%+ of keywords match, consider it preserved (saved by hybrid matching)
                     if keyword_overlap_ratio >= 0.75:
@@ -3130,6 +3275,22 @@ Return ONLY valid JSON, no additional text."""
         Returns:
             Dict with evaluation results (same format as sentence mode).
         """
+        # CRITICAL: Type check - ensure propositions are strings
+        if propositions:
+            for i, prop in enumerate(propositions):
+                if not isinstance(prop, str):
+                    if verbose:
+                        print(f"      ⚠ Proposition {i} is not a string (type: {type(prop)}), converting...")
+                    propositions[i] = str(prop)
+
+        if verbose:
+            print(f"      [DEBUG] _evaluate_paragraph_mode:")
+            print(f"        Generated text length: {len(generated_text)} chars")
+            print(f"        Generated text (first 50): {generated_text[:50]}...")
+            print(f"        Propositions count: {len(propositions) if propositions else 0}")
+            if propositions:
+                print(f"        All propositions are strings: {all(isinstance(p, str) for p in propositions)}")
+
         # Load paragraph fusion config
         with open(self.config_path, 'r') as f:
             config = json.load(f)

@@ -245,14 +245,14 @@ class TestCriticValidation(unittest.TestCase):
             quotes=[('"This is important"', 0)]
         )
 
-        generated = "He said something important."  # Missing quote
+        generated = "He said something important."  # Missing quote content
         result = self.critic.evaluate(generated, input_blueprint)
 
         self.assertFalse(result["pass"])
-        self.assertIn("Missing or modified quote", result["feedback"])
+        self.assertIn("Missing quote content", result["feedback"])
 
     def test_critic_fails_modified_quote(self):
-        """Test that critic fails when quote is modified."""
+        """Test that critic fails when quote content is modified (word changed)."""
         input_blueprint = SemanticBlueprint(
             original_text='He said "This is important".',
             svo_triples=[("he", "said", "")],
@@ -262,11 +262,11 @@ class TestCriticValidation(unittest.TestCase):
             quotes=[('"This is important"', 0)]
         )
 
-        generated = 'He said "This was important".'  # Modified quote
+        generated = 'He said "This was important".'  # Modified quote (is -> was)
         result = self.critic.evaluate(generated, input_blueprint)
 
         self.assertFalse(result["pass"])
-        self.assertIn("Missing or modified quote", result["feedback"])
+        self.assertIn("Missing quote content", result["feedback"])
 
     def test_critic_passes_with_exact_quote(self):
         """Test that critic passes when quote is exact."""
@@ -283,7 +283,24 @@ class TestCriticValidation(unittest.TestCase):
         result = self.critic.evaluate(generated, input_blueprint)
 
         # Should not fail due to missing/modified quotes
-        self.assertNotIn("Missing or modified quote", result["feedback"])
+        self.assertNotIn("Missing quote content", result["feedback"])
+
+    def test_critic_passes_with_quote_content_no_quotes(self):
+        """Test that critic passes when quote content exists without quotes (relaxed validation)."""
+        input_blueprint = SemanticBlueprint(
+            original_text='He said "toolset" is useful.',
+            svo_triples=[("he", "said", "")],
+            named_entities=[],
+            core_keywords={"he", "said", "toolset", "useful"},
+            citations=[],
+            quotes=[('"toolset"', 0)]
+        )
+
+        generated = 'He said toolset is useful.'  # Content present but no quotes
+        result = self.critic.evaluate(generated, input_blueprint)
+
+        # Should pass because the word "toolset" is present (relaxed validation)
+        self.assertNotIn("Missing quote content", result["feedback"])
 
 
 class TestPostProcessingProtection(unittest.TestCase):
@@ -382,20 +399,34 @@ class TestEndToEndPreservation(unittest.TestCase):
         self.assertEqual(result["score"], 0.0)  # Critical failure
 
     def test_critic_rejects_missing_quote_in_realistic_scenario(self):
-        """Test that critic correctly rejects text missing quotes in a realistic scenario."""
+        """Test that critic correctly rejects text missing quote content in a realistic scenario."""
         # Simulate a real sentence with quote
         input_text = 'He declared "A revolution is not a dinner party".'
         input_blueprint = self.extractor.extract(input_text)
 
-        # Generated text missing the quote
+        # Generated text missing the quote content entirely
+        generated = "He declared something else entirely."
+
+        result = self.critic.evaluate(generated, input_blueprint)
+
+        # Should fail because quote content is missing
+        self.assertFalse(result["pass"])
+        self.assertIn("Missing quote content", result["feedback"])
+        self.assertEqual(result["score"], 0.0)  # Critical failure
+
+    def test_critic_passes_quote_content_without_quotes_in_realistic_scenario(self):
+        """Test that critic passes when quote content exists without quotes (relaxed validation)."""
+        # Simulate a real sentence with quote
+        input_text = 'He declared "A revolution is not a dinner party".'
+        input_blueprint = self.extractor.extract(input_text)
+
+        # Generated text has the quote content but without quotes
         generated = "He declared that a revolution is not a dinner party."
 
         result = self.critic.evaluate(generated, input_blueprint)
 
-        # Should fail because quote is missing
-        self.assertFalse(result["pass"])
-        self.assertIn("Missing or modified quote", result["feedback"])
-        self.assertEqual(result["score"], 0.0)  # Critical failure
+        # Should pass because quote content is present (relaxed validation)
+        self.assertNotIn("Missing quote content", result["feedback"])
 
     def test_sentence_splitting_preserves_citations_in_real_text(self):
         """Test sentence splitting with real text containing citations."""

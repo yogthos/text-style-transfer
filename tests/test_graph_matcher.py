@@ -1027,6 +1027,101 @@ class TestTopologicalMatcher:
         assert result is not None
         assert 'node_mapping' in result
 
+    def test_build_where_clause_empty_list(self):
+        """Test _build_where_clause with empty conditions list."""
+        result = self.matcher._build_where_clause([])
+        assert result is None
+
+    def test_build_where_clause_single_condition(self):
+        """Test _build_where_clause with single condition."""
+        conditions = [{"signature": "CONTRAST"}]
+        result = self.matcher._build_where_clause(conditions)
+        assert result == {"signature": "CONTRAST"}
+        # Should not have $and operator for single condition
+        assert "$and" not in result
+
+    def test_build_where_clause_multiple_conditions(self):
+        """Test _build_where_clause with multiple conditions."""
+        conditions = [
+            {"signature": "CONTRAST"},
+            {"role": "INTRO"}
+        ]
+        result = self.matcher._build_where_clause(conditions)
+        assert result == {"$and": [{"signature": "CONTRAST"}, {"role": "INTRO"}]}
+        assert "$and" in result
+        assert len(result["$and"]) == 2
+
+    def test_build_where_clause_three_conditions(self):
+        """Test _build_where_clause with three conditions."""
+        conditions = [
+            {"signature": "DEFINITION"},
+            {"role": "BODY"},
+            {"paragraph_role": "body"}
+        ]
+        result = self.matcher._build_where_clause(conditions)
+        assert result == {
+            "$and": [
+                {"signature": "DEFINITION"},
+                {"role": "BODY"},
+                {"paragraph_role": "body"}
+            ]
+        }
+        assert "$and" in result
+        assert len(result["$and"]) == 3
+
+    def test_build_where_clause_filters_none(self):
+        """Test _build_where_clause filters out None values."""
+        conditions = [
+            {"signature": "CONTRAST"},
+            None,
+            {"role": "INTRO"}
+        ]
+        result = self.matcher._build_where_clause(conditions)
+        # Should filter out None and create $and with 2 conditions
+        assert result == {"$and": [{"signature": "CONTRAST"}, {"role": "INTRO"}]}
+        assert len(result["$and"]) == 2
+
+    def test_build_where_clause_filters_empty_dict(self):
+        """Test _build_where_clause filters out empty dicts."""
+        conditions = [
+            {"signature": "CONTRAST"},
+            {},
+            {"role": "INTRO"}
+        ]
+        result = self.matcher._build_where_clause(conditions)
+        # Empty dict is falsy, so should be filtered out
+        assert result == {"$and": [{"signature": "CONTRAST"}, {"role": "INTRO"}]}
+        assert len(result["$and"]) == 2
+
+    def test_build_where_clause_all_filtered(self):
+        """Test _build_where_clause returns None when all conditions are filtered."""
+        conditions = [None, {}, None]
+        result = self.matcher._build_where_clause(conditions)
+        assert result is None
+
+    def test_build_where_clause_real_world_scenario(self):
+        """Test _build_where_clause with real-world query scenario."""
+        # Simulate primary query: signature + role + paragraph_role
+        conditions = [
+            {"signature": "CONTRAST"},
+            {"role": "INTRO"},
+            {"paragraph_role": "opener"}
+        ]
+        result = self.matcher._build_where_clause(conditions)
+        assert "$and" in result
+        assert len(result["$and"]) == 3
+        # Verify all conditions are present
+        condition_dicts = result["$and"]
+        signatures = [c for c in condition_dicts if "signature" in c]
+        roles = [c for c in condition_dicts if "role" in c]
+        paragraph_roles = [c for c in condition_dicts if "paragraph_role" in c]
+        assert len(signatures) == 1
+        assert len(roles) == 1
+        assert len(paragraph_roles) == 1
+        assert signatures[0]["signature"] == "CONTRAST"
+        assert roles[0]["role"] == "INTRO"
+        assert paragraph_roles[0]["paragraph_role"] == "opener"
+
 
 if __name__ == "__main__":
     import pytest

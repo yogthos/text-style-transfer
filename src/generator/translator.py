@@ -91,7 +91,7 @@ def _normalize_for_counting(text: str) -> str:
     """Normalize text for counting by stripping punctuation and lowercasing.
 
     This matches the behavior of check_phrase_repetition which uses
-    re.findall(r'\b\w+\b', text.lower()) to extract words.
+    re.findall(r'\\b\\w+\\b', text.lower()) to extract words.
 
     Args:
         text: Text to normalize
@@ -167,6 +167,9 @@ class StyleTranslator:
 
         # Initialize statistical critic
         self.statistical_critic = StatisticalCritic(config_path=config_path)
+
+        # Initialize semantic critic for validation
+        self.semantic_critic = SemanticCritic(config_path=config_path)
 
         # Initialize skeleton cache for atlas memorization
         self._skeleton_cache = {}  # Key: (author, rhetorical_type, prop_count_bucket) -> (teacher_example, templates)
@@ -476,7 +479,7 @@ class StyleTranslator:
         return intersection / union if union > 0 else 0.0
 
     def _deduplicate_propositions(self, propositions: List[str]) -> List[str]:
-        """Deduplicate propositions by removing similar/redundant ones.
+        """Deduplicate propositions by removing similar/redundant ones using LLM.
 
         Args:
             propositions: List of proposition strings.
@@ -487,50 +490,96 @@ class StyleTranslator:
         if len(propositions) <= 1:
             return propositions
 
-        from difflib import SequenceMatcher
-        import re
+        # Try LLM-based deduplication first
+        try:
+            import json
+            import re
 
-        # Extract key words (proper nouns and verbs) from a proposition
-        def extract_key_words(text: str) -> set:
-            """Extract proper nouns and verbs as key words."""
-            # Simple heuristic: proper nouns (capitalized words) and common verbs
-            words = re.findall(r'\b[A-Z][a-z]+\b|\b\w+ed\b|\b\w+ing\b|\b(is|are|was|were|has|have|had|do|does|did|make|made|create|created|coined|coined)\b', text.lower())
-            return set(words)
+            # Format propositions as JSON list for the prompt
+            propositions_json = json.dumps(propositions, indent=2)
 
-        deduplicated = []
-        seen_indices = set()
+            system_prompt = "You are a Data Cleaner. Remove semantic duplicates."
 
-        for i, prop1 in enumerate(propositions):
-            if i in seen_indices:
-                continue
+            user_prompt = f"""Input: {propositions_json}
 
-            is_duplicate = False
-            for j, prop2 in enumerate(propositions[i+1:], start=i+1):
-                if j in seen_indices:
+Task: **Conservative Deduplication.** Only merge facts if they are **semantic duplicates** (stating the exact same thing). If they provide **distinct details** (e.g., 'Mysticism' vs 'Jargon'), KEEP BOTH.
+Keep distinct subjects separate. Only merge if the *exact same fact* is stated twice. Do not merge 'Stalin' facts with 'Essay' facts.
+Return a JSON list of deduplicated propositions. Preserve the most detailed version when duplicates are found.
+
+Example:
+Input: ["Stalin coined the term", "The term was coined by Stalin", "Dialectical Materialism is a method"]
+Output: ["Stalin coined the term", "Dialectical Materialism is a method"]
+
+Return JSON list:"""
+
+            response = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_type="fast",
+                require_json=False,  # We'll extract JSON ourselves
+                temperature=0.1,
+                max_tokens=1000
+            )
+
+            # Extract JSON from response (handle markdown code blocks or plain text)
+            # Try to find JSON array in the response
+            json_match = re.search(r'\[.*\]', response, re.DOTALL)
+            if json_match:
+                json_str = json_match.group(0)
+                deduplicated = json.loads(json_str)
+                # Validate that all items are strings
+                if isinstance(deduplicated, list) and all(isinstance(item, str) for item in deduplicated):
+                    # Ensure we didn't lose any unique propositions (safety check)
+                    if len(deduplicated) <= len(propositions):
+                        return deduplicated
+
+            # If JSON extraction failed, try parsing the whole response
+            try:
+                # Strip markdown code blocks if present
+                cleaned_response = re.sub(r'```json\s*\n?(.*?)\n?```', r'\1', response, flags=re.DOTALL)
+                cleaned_response = re.sub(r'```\s*\n?(.*?)\n?```', r'\1', cleaned_response, flags=re.DOTALL)
+                cleaned_response = cleaned_response.strip()
+
+                # Try to parse as JSON
+                deduplicated = json.loads(cleaned_response)
+                if isinstance(deduplicated, list) and all(isinstance(item, str) for item in deduplicated):
+                    if len(deduplicated) <= len(propositions):
+                        return deduplicated
+            except (json.JSONDecodeError, ValueError):
+                pass
+
+            # If LLM parsing failed, fall through to heuristic fallback
+            raise ValueError("LLM response parsing failed, using fallback")
+
+        except Exception as e:
+            # Fallback to heuristic-based deduplication
+            from difflib import SequenceMatcher
+            import re
+
+            # Extract key words (proper nouns and verbs) from a proposition
+            def extract_key_words(text: str) -> set:
+                """Extract proper nouns and verbs as key words."""
+                # Simple heuristic: proper nouns (capitalized words) and common verbs
+                words = re.findall(r'\b[A-Z][a-z]+\b|\b\w+ed\b|\b\w+ing\b|\b(is|are|was|were|has|have|had|do|does|did|make|made|create|created|coined|coined)\b', text.lower())
+                return set(words)
+
+            deduplicated = []
+            seen_indices = set()
+
+            for i, prop1 in enumerate(propositions):
+                if i in seen_indices:
                     continue
 
-                # Calculate similarity using SequenceMatcher
-                similarity = SequenceMatcher(None, prop1.lower(), prop2.lower()).ratio()
-
-                # Check if >80% similar
-                if similarity > 0.8:
-                    # Remove the shorter one
-                    if len(prop1) < len(prop2):
-                        seen_indices.add(i)
-                        is_duplicate = True
-                        break
-                    else:
-                        seen_indices.add(j)
+                is_duplicate = False
+                for j, prop2 in enumerate(propositions[i+1:], start=i+1):
+                    if j in seen_indices:
                         continue
 
-                # Also check for shared key proper nouns + verbs
-                key_words1 = extract_key_words(prop1)
-                key_words2 = extract_key_words(prop2)
+                    # Calculate similarity using SequenceMatcher
+                    similarity = SequenceMatcher(None, prop1.lower(), prop2.lower()).ratio()
 
-                if key_words1 and key_words2:
-                    shared_key_words = key_words1 & key_words2
-                    # If they share significant key words and are somewhat similar
-                    if len(shared_key_words) >= 2 and similarity > 0.5:
+                    # Check if >80% similar
+                    if similarity > 0.8:
                         # Remove the shorter one
                         if len(prop1) < len(prop2):
                             seen_indices.add(i)
@@ -540,10 +589,27 @@ class StyleTranslator:
                             seen_indices.add(j)
                             continue
 
-            if not is_duplicate:
-                deduplicated.append(prop1)
+                    # Also check for shared key proper nouns + verbs
+                    key_words1 = extract_key_words(prop1)
+                    key_words2 = extract_key_words(prop2)
 
-        return deduplicated
+                    if key_words1 and key_words2:
+                        shared_key_words = key_words1 & key_words2
+                        # If they share significant key words and are somewhat similar
+                        if len(shared_key_words) >= 2 and similarity > 0.5:
+                            # Remove the shorter one
+                            if len(prop1) < len(prop2):
+                                seen_indices.add(i)
+                                is_duplicate = True
+                                break
+                            else:
+                                seen_indices.add(j)
+                                continue
+
+                if not is_duplicate:
+                    deduplicated.append(prop1)
+
+            return deduplicated
 
     def _detect_voice(self, text: str) -> str:
         """Detect the voice/perspective of a text (1st, 2nd, 3rd person, or neutral).
@@ -4434,6 +4500,8 @@ Text: {text}"""
         style_metadata = blueprint.get('style_metadata', {})
         skeleton = style_metadata.get('skeleton', '')
         intent = style_metadata.get('intent', 'ARGUMENT')  # Default to ARGUMENT if not specified
+        # Extract effective signature from blueprint (may be different from input if fallback was used)
+        signature = blueprint.get('signature') or style_metadata.get('signature', 'DEFINITION')
 
         # Load style profile for dynamic style guidance
         style_profile = self._load_style_profile(author_name)
@@ -4574,8 +4642,53 @@ Text: {text}"""
             # Build previous sentence context if available
             previous_context = ""
             if previous_sentence:
-                previous_context = f"""**PREVIOUS SENTENCE:** '{previous_sentence}'
-**CONSTRAINT:** Do not repeat facts or names that were just mentioned in the previous sentence. Ensure a smooth transition.
+                previous_context = f"""**PREVIOUS CONTEXT:** '{previous_sentence}'
+**PRONOUN RULE:**
+1. If the subject of this sentence is the **SAME** as the previous one, use a pronoun (He/It) to improve flow.
+2. **CRITICAL:** If the subject is **DIFFERENT** from the previous sentence (e.g., Marx -> Stalin), **USE THE FULL NAME**. Do not use pronouns like 'He' across a subject change.
+
+**SUBJECT RULE:**
+Preserve Key Subjects. If the input is 'This Essay serves as...', ensure 'This Essay' appears as a Subject, not a modifier.
+
+"""
+
+            # Build signature-specific mapping instructions
+            signature_instructions = ""
+            if signature == 'CONTRAST':
+                signature_instructions = """**LOGIC MATCH: CONTRAST**
+- Identify the 'Negative/False' proposition in the input.
+- Identify the 'Positive/True' proposition in the input.
+- Map them strictly to the Contrast Skeleton: "It is not [Negative], but [Positive]."
+
+"""
+            elif signature == 'CAUSALITY':
+                signature_instructions = """**LOGIC MATCH: CAUSALITY**
+- Identify the Cause (P0) and Effect (P1).
+- Ensure the skeleton flows from Cause -> Effect.
+
+"""
+            elif signature == 'DEFINITION':
+                signature_instructions = """**LOGIC MATCH: DEFINITION**
+- Map the subject to the definition structure.
+- Ensure identity relationships are preserved.
+
+"""
+            elif signature == 'SEQUENCE':
+                signature_instructions = """**LOGIC MATCH: SEQUENCE**
+- Preserve temporal/process order.
+- Map propositions in sequence order.
+
+"""
+            elif signature == 'CONDITIONAL':
+                signature_instructions = """**LOGIC MATCH: CONDITIONAL**
+- Map condition (P0) to the "if" slot.
+- Map consequence (P1) to the "then" slot.
+
+"""
+            elif signature == 'LIST':
+                signature_instructions = """**LOGIC MATCH: LIST**
+- Map propositions as enumerated items.
+- Preserve enumeration structure.
 
 """
 
@@ -4585,7 +4698,8 @@ Text: {text}"""
 **INTENT:** {intent}
 (This blueprint has rhetorical intent: {intent}. Match this intent in your output.)
 
-{previous_context}**CONTENT MAPPING:**
+**LOGICAL SIGNATURE:** {signature}
+{signature_instructions}{previous_context}**CONTENT MAPPING:**
 {content_mapping_str}
 
 **INPUT PROPOSITIONS (Content):**
@@ -4618,6 +4732,15 @@ Text: {text}"""
 7. **Author Voice:** Follow the Style Traits provided above. Match the voice and style characteristics of {author_name} as described.
 8. **Intent Alignment:** Ensure your output matches the rhetorical intent ({intent}) of the blueprint.
 
+**FACTUAL INTEGRITY (CRITICAL - NO HALLUCINATION):**
+- You are a Translator, not a Fiction Writer.
+- Do NOT add quotes ('He said...', 'According to...') if they are not in the Input Propositions.
+- Do NOT add attribution or citations that are not present in the Input.
+- Do NOT use connectors ('For all...', 'In every case...') that imply relationships not explicitly stated in the Input.
+- Do NOT invent facts, examples, or details that are not in the Input Propositions.
+- If the Skeleton forces you to add content that contradicts the Input, **IGNORE THE SKELETON** and write the truth from the Input Propositions.
+- Preserve ONLY the facts from the Input Propositions. Style is adaptation, not invention.
+
 Generate the text:"""
 
         else:
@@ -4632,8 +4755,53 @@ Generate the text:"""
             # Build previous sentence context if available
             previous_context = ""
             if previous_sentence:
-                previous_context = f"""**PREVIOUS SENTENCE:** '{previous_sentence}'
-**CONSTRAINT:** Do not repeat facts or names that were just mentioned in the previous sentence. Ensure a smooth transition.
+                previous_context = f"""**PREVIOUS CONTEXT:** '{previous_sentence}'
+**PRONOUN RULE:**
+1. If the subject of this sentence is the **SAME** as the previous one, use a pronoun (He/It) to improve flow.
+2. **CRITICAL:** If the subject is **DIFFERENT** from the previous sentence (e.g., Marx -> Stalin), **USE THE FULL NAME**. Do not use pronouns like 'He' across a subject change.
+
+**SUBJECT RULE:**
+Preserve Key Subjects. If the input is 'This Essay serves as...', ensure 'This Essay' appears as a Subject, not a modifier.
+
+"""
+
+            # Build signature-specific mapping instructions for graph-walking mode
+            signature_instructions_graph = ""
+            if signature == 'CONTRAST':
+                signature_instructions_graph = """**LOGIC MATCH: CONTRAST**
+- Identify the 'Negative/False' proposition in the input.
+- Identify the 'Positive/True' proposition in the input.
+- Map them strictly to the Contrast structure: "It is not [Negative], but [Positive]."
+
+"""
+            elif signature == 'CAUSALITY':
+                signature_instructions_graph = """**LOGIC MATCH: CAUSALITY**
+- Identify the Cause and Effect nodes.
+- Ensure the graph traversal flows from Cause -> Effect.
+
+"""
+            elif signature == 'DEFINITION':
+                signature_instructions_graph = """**LOGIC MATCH: DEFINITION**
+- Map the subject to the definition structure.
+- Ensure identity relationships are preserved.
+
+"""
+            elif signature == 'SEQUENCE':
+                signature_instructions_graph = """**LOGIC MATCH: SEQUENCE**
+- Preserve temporal/process order in graph traversal.
+- Map propositions in sequence order.
+
+"""
+            elif signature == 'CONDITIONAL':
+                signature_instructions_graph = """**LOGIC MATCH: CONDITIONAL**
+- Map condition nodes to the "if" structure.
+- Map consequence nodes to the "then" structure.
+
+"""
+            elif signature == 'LIST':
+                signature_instructions_graph = """**LOGIC MATCH: LIST**
+- Map propositions as enumerated items.
+- Preserve enumeration structure.
 
 """
 
@@ -4643,7 +4811,8 @@ Generate the text:"""
 **INTENT:** {intent}
 (This blueprint has rhetorical intent: {intent}. Match this intent in your output.)
 
-{previous_context}Input Content (Style Node -> Actual Text):
+**LOGICAL SIGNATURE:** {signature}
+{signature_instructions_graph}{previous_context}Input Content (Style Node -> Actual Text):
 {json.dumps(resolved_content, indent=2)}
 
 Instructions:
@@ -4678,11 +4847,625 @@ Generate text matching the author's voice:"""
                 print(f"Warning: Graph generation failed: {e}")
             return ""
 
+    def _audit_skeleton(self, skeleton: str) -> str:
+        """Audit a skeleton to extract its logical signature.
+
+        Args:
+            skeleton: Skeleton string with placeholders (e.g., "It is not [P0], but [P1]").
+
+        Returns:
+            Signature string (CONTRAST, CAUSALITY, DEFINITION, etc.) or 'DEFINITION' as default.
+        """
+        if not skeleton or not skeleton.strip():
+            return 'DEFINITION'
+
+        system_prompt = "You are a Logical Structure Analyzer. Classify the logical signature of a sentence skeleton."
+
+        user_prompt = f"""Analyze this sentence skeleton and determine its Logical Signature:
+
+Skeleton: "{skeleton}"
+
+Classify the **Logical Signature** (Choose ONE):
+- CONTRAST (Conflict/Negation/Correction: Contains "not", "but", "however", "whereas")
+- CAUSALITY (Reasoning/Result: Contains "because", "leads to", "results in", "therefore")
+- DEFINITION (Description/Identity: Contains "is", "constitutes", "means", "refers to")
+- SEQUENCE (Time/Order: Contains "first", "then", "when", "after", "before")
+- CONDITIONAL (Hypothetical: Contains "if", "then", "unless", "provided that")
+- LIST (Grouping: Contains enumeration patterns, "and", "or", multiple items)
+
+Return JSON: {{"signature": "CONTRAST"}}"""
+
+        try:
+            response = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_type="fast",
+                require_json=True,
+                temperature=0.1,
+                max_tokens=200
+            )
+
+            # Strip markdown code blocks
+            import re
+            response = re.sub(r'```json\s*\n?(.*?)\n?```', r'\1', response, flags=re.DOTALL)
+            response = re.sub(r'```\s*\n?(.*?)\n?```', r'\1', response, flags=re.DOTALL)
+            response = response.replace('```', '').strip()
+
+            # Parse JSON
+            result = json.loads(response)
+            signature = result.get('signature', 'DEFINITION')
+
+            # Validate signature
+            valid_signatures = ['CONTRAST', 'CAUSALITY', 'DEFINITION', 'SEQUENCE', 'CONDITIONAL', 'LIST']
+            if signature not in valid_signatures:
+                return 'DEFINITION'
+
+            return signature
+
+        except Exception as e:
+            # Fail-safe: return DEFINITION
+            return 'DEFINITION'
+
+    def _validate_blueprint(self, blueprint: Dict, expected_signature: str, verbose: bool = False) -> bool:
+        """Validate that a blueprint's skeleton matches the expected logical signature.
+
+        Args:
+            blueprint: Blueprint dictionary with 'style_metadata' containing 'skeleton'.
+            expected_signature: Expected signature (CONTRAST, CAUSALITY, etc.).
+
+        Returns:
+            True if signature matches, False otherwise.
+        """
+        style_metadata = blueprint.get('style_metadata', {})
+        skeleton = style_metadata.get('skeleton', '')
+
+        if not skeleton:
+            if verbose:
+                print(f"     ⚠ Validation: No skeleton found in blueprint")
+            return False
+
+        # Audit the skeleton to get its actual signature
+        actual_signature = self._audit_skeleton(skeleton)
+
+        if actual_signature == expected_signature:
+            if verbose:
+                print(f"     ✓ Validation: Blueprint signature matches ({expected_signature})")
+            return True
+        else:
+            if verbose:
+                print(f"     ✗ Validation: Mismatch - Expected {expected_signature}, got {actual_signature}")
+            return False
+
+    def _repair_blueprint(
+        self,
+        blueprint: Dict,
+        expected_signature: str,
+        propositions: List[str],
+        input_intent: str,
+        document_context: Optional[Dict] = None,
+        style_profile: Optional[Dict] = None,
+        global_index: Optional[int] = None,
+        input_role: Optional[str] = None,
+        prev_paragraph_summary: Optional[str] = None,
+        verbose: bool = False
+    ) -> Dict:
+        """Repair a blueprint by forcing the Architect to match the expected signature.
+
+        Args:
+            blueprint: Original blueprint that failed validation.
+            expected_signature: Expected signature that must be matched.
+            propositions: Input propositions.
+            input_intent: Input rhetorical intent.
+            document_context: Document context.
+            style_profile: Style profile.
+            global_index: Global paragraph index.
+            input_role: Input narrative role.
+            prev_paragraph_summary: Previous paragraph summary.
+            verbose: Enable verbose logging.
+
+        Returns:
+            Repaired blueprint dictionary.
+        """
+        if verbose:
+            print(f"     🔧 Repairing blueprint to match signature: {expected_signature}")
+
+        # Call synthesize_match with explicit signature correction instruction
+        # We'll add a special flag or modify the prompt to emphasize signature matching
+        # For now, we'll just call synthesize_match again - the signature filter should help
+        # In a more sophisticated implementation, we could add a "strict_correction" mode
+
+        repaired_blueprint = self.graph_matcher.synthesize_match(
+            propositions,
+            input_intent,
+            document_context,
+            style_profile=style_profile,
+            input_signature=expected_signature,
+            global_index=global_index,
+            input_role=input_role,
+            prev_paragraph_summary=prev_paragraph_summary,
+            input_graph=None,  # Repair doesn't have input_graph, will generate structural_summary
+            verbose=verbose
+        )
+
+        # Validate the repaired blueprint
+        if self._validate_blueprint(repaired_blueprint, expected_signature, verbose=verbose):
+            if verbose:
+                print(f"     ✓ Repair successful: Blueprint now matches {expected_signature}")
+            return repaired_blueprint
+        else:
+            if verbose:
+                print(f"     ⚠ Repair attempted but validation still failed, using repaired blueprint anyway")
+            return repaired_blueprint
+
+    def _calculate_semantic_score(
+        self,
+        generated_text: str,
+        input_propositions: List[str],
+        verbose: bool = False
+    ) -> float:
+        """Calculate semantic compliance score for generated text.
+
+        Args:
+            generated_text: Generated text to evaluate.
+            input_propositions: List of input proposition strings.
+            verbose: Enable verbose logging.
+
+        Returns:
+            Semantic compliance score (0.0-1.0).
+        """
+        if not generated_text or not input_propositions:
+            return 0.0
+
+        try:
+            # Create SemanticBlueprint from input propositions
+            from src.ingestion.blueprint import BlueprintExtractor
+            extractor = BlueprintExtractor()
+
+            # Join propositions to create input text for blueprint
+            input_text = " ".join(input_propositions)
+            input_blueprint = extractor.extract(input_text)
+
+            # Evaluate generated text against input blueprint
+            result = self.semantic_critic.evaluate(generated_text, input_blueprint)
+
+            # Extract recall score (facts preserved / total facts)
+            recall_score = result.get("recall_score", 0.0)
+
+            if verbose:
+                print(f"     Semantic evaluation: recall={recall_score:.3f}")
+
+            return recall_score
+
+        except Exception as e:
+            if verbose:
+                print(f"     ⚠ Semantic score calculation failed: {e}, defaulting to 0.5")
+            # Default to 0.5 on error (neutral score)
+            return 0.5
+
+    def _generate_with_repair_loop(
+        self,
+        chunk: List[str],
+        blueprint: Dict,
+        input_node_map: Dict[str, str],
+        author_name: str,
+        verbose: bool = False,
+        previous_sentence: Optional[str] = None,
+        num_variants: int = 2,
+        max_repairs: int = 2
+    ) -> tuple[str, float]:
+        """Generate text with iterative repair loop: Generate variants, select best, repair.
+
+        Algorithm:
+        1. Generate multiple variants (Style-First, Safety-First)
+        2. Score all variants and select best
+        3. Perform surgical repairs to fix specific errors (missing keywords, hallucinations)
+        4. Iterate until score is good enough or max repairs reached
+
+        Args:
+            chunk: List of input proposition strings
+            blueprint: Blueprint dictionary with style metadata
+            input_node_map: Mapping of node IDs to proposition text
+            author_name: Target author name
+            verbose: Enable verbose logging
+            previous_sentence: Previous sentence for context
+            num_variants: Number of variants to generate (default: 2)
+            max_repairs: Maximum number of repair iterations (default: 2)
+
+        Returns:
+            Best generated text after repair loop
+        """
+        if not chunk:
+            return ""
+
+        # Phase 1: Diversity Generation - Generate multiple variants
+        candidates = []
+
+        if verbose:
+            print(f"     🔄 Generating {num_variants} variants...")
+
+        # Variant A: Style-First (Using blueprint exactly as is - High Style)
+        try:
+            variant_a = self._generate_from_graph(
+                blueprint,
+                input_node_map,
+                author_name,
+                verbose=False,  # Reduce noise during variant generation
+                previous_sentence=previous_sentence
+            )
+            if variant_a:
+                candidates.append({
+                    'text': variant_a,
+                    'mode': 'STYLE',
+                    'blueprint': blueprint
+                })
+                if verbose:
+                    print(f"       Variant A (Style-First): {variant_a[:60]}...")
+        except Exception as e:
+            if verbose:
+                print(f"       ⚠ Variant A generation failed: {e}")
+
+        # Variant B: Safety-First (Relaxed skeleton constraints - High Accuracy)
+        if num_variants >= 2:
+            try:
+                # Create a safety blueprint with relaxed constraints
+                safety_blueprint = blueprint.copy()
+                safety_metadata = safety_blueprint.get('style_metadata', {}).copy()
+                # Mark as safety mode to trigger relaxed generation
+                safety_metadata['safety_mode'] = True
+                safety_blueprint['style_metadata'] = safety_metadata
+
+                variant_b = self._generate_from_graph(
+                    safety_blueprint,
+                    input_node_map,
+                    author_name,
+                    verbose=False,
+                    previous_sentence=previous_sentence
+                )
+                if variant_b:
+                    candidates.append({
+                        'text': variant_b,
+                        'mode': 'SAFE',
+                        'blueprint': safety_blueprint
+                    })
+                    if verbose:
+                        print(f"       Variant B (Safety-First): {variant_b[:60]}...")
+            except Exception as e:
+                if verbose:
+                    print(f"       ⚠ Variant B generation failed: {e}")
+
+        # Fallback: If no variants generated, use direct generation
+        if not candidates:
+            if verbose:
+                print(f"     ⚠ No variants generated, using direct generation")
+            fallback_text = self._generate_from_graph(
+                blueprint,
+                input_node_map,
+                author_name,
+                verbose,
+                previous_sentence=previous_sentence
+            )
+            # Calculate score for fallback
+            fallback_score = 0.0
+            if fallback_text:
+                fallback_eval = self._evaluate_variant(fallback_text, chunk, verbose=False)
+                fallback_score = fallback_eval.get('score', 0.0)
+            return fallback_text, fallback_score
+
+        # Phase 2: Selection - Score all candidates and pick best
+        best_candidate = None
+        best_score = -1.0
+        best_critique = None
+
+        if verbose:
+            print(f"     📊 Scoring {len(candidates)} variants...")
+
+        for cand in candidates:
+            # Calculate semantic score
+            eval_result = self._evaluate_variant(cand['text'], chunk, verbose=False)
+            score = eval_result.get('score', 0.0)
+
+            if verbose:
+                print(f"       {cand['mode']}: score={score:.3f}")
+
+            if score > best_score:
+                best_score = score
+                best_candidate = cand
+                best_critique = eval_result
+
+        if not best_candidate:
+            # Fallback if scoring failed
+            fallback_text = candidates[0]['text']
+            fallback_eval = self._evaluate_variant(fallback_text, chunk, verbose=False)
+            fallback_score = fallback_eval.get('score', 0.0)
+            return fallback_text, fallback_score
+
+        current_text = best_candidate['text']
+        current_score = best_score
+        current_critique = best_critique
+
+        if verbose:
+            print(f"     ✓ Selected {best_candidate['mode']} variant (score={best_score:.3f})")
+
+        # Phase 3: Surgical Repair Loop
+        if current_score < 0.95 and max_repairs > 0:
+            if verbose:
+                print(f"     🔧 Entering repair loop (current score={current_score:.3f} < 0.95)")
+            print(f"  [DEBUG] Loop Score Check: {current_score:.3f} (Threshold: 0.95)")
+
+            for repair_iter in range(max_repairs):
+                if current_score >= 0.95:
+                    if verbose:
+                        print(f"     ✓ Score {current_score:.3f} >= 0.95, stopping repairs")
+                    print(f"  [DEBUG] Loop Score Check: {current_score:.3f} (Threshold: 0.95) - PASSED")
+                    break
+                print(f"  [DEBUG] Loop Score Check: {current_score:.3f} (Threshold: 0.95) - CONTINUING")
+
+                # Extract missing information from critique
+                missing_keywords = []
+                missing_propositions = []
+
+                # Check for missing propositions
+                recall_details = current_critique.get('recall_details', {})
+                if recall_details:
+                    missing_propositions = recall_details.get('missing', [])
+
+                # Check feedback for missing keywords
+                feedback = current_critique.get('feedback', '')
+                if 'Missing' in feedback or 'missing' in feedback:
+                    # Try to extract missing items from feedback
+                    import re
+                    missing_matches = re.findall(r'Missing[^:]*:\s*([^.|]+)', feedback, re.IGNORECASE)
+                    for match in missing_matches:
+                        # Split by comma or pipe, then strip quotes from each keyword
+                        raw_keywords = re.split(r'[,|]', match)
+                        clean_keywords = [kw.strip().strip('"\'') for kw in raw_keywords if kw.strip()]
+                        missing_keywords.extend(clean_keywords)
+
+                # Combine missing information
+                all_missing = missing_propositions + missing_keywords
+
+                if not all_missing:
+                    if verbose:
+                        print(f"     ✓ No missing information detected, stopping repairs")
+                    break
+
+                if verbose:
+                    print(f"     🔧 Repair iteration {repair_iter + 1}/{max_repairs}")
+                    print(f"       Missing: {', '.join(all_missing[:3])}{'...' if len(all_missing) > 3 else ''}")
+
+                # Surgical Repair Prompt
+                try:
+                    repaired_text = self._surgical_repair(
+                        current_text,
+                        all_missing,
+                        chunk,
+                        author_name,
+                        previous_sentence,
+                        verbose
+                    )
+
+                    if repaired_text and repaired_text != current_text:
+                        # Verify repair
+                        new_eval = self._evaluate_variant(repaired_text, chunk, verbose=False)
+                        new_score = new_eval.get('score', 0.0)
+
+                        if verbose:
+                            print(f"       Repair score: {new_score:.3f} (was {current_score:.3f})")
+
+                        if new_score > current_score:
+                            current_text = repaired_text
+                            current_score = new_score
+                            current_critique = new_eval
+                            if verbose:
+                                print(f"       ✓ Repair improved score to {new_score:.3f}")
+                        else:
+                            if verbose:
+                                print(f"       ⚠ Repair did not improve score, keeping previous")
+                            # If repair didn't help, try different strategy or stop
+                            break
+                    else:
+                        if verbose:
+                            print(f"       ⚠ Repair returned unchanged text, stopping")
+                        break
+
+                except Exception as e:
+                    if verbose:
+                        print(f"       ⚠ Repair failed: {e}, stopping")
+                    break
+
+        if verbose:
+            print(f"     ✓ Final score: {current_score:.3f}")
+
+        # Return both text and score for proper propagation
+        return current_text, current_score
+
+    def _evaluate_variant(
+        self,
+        generated_text: str,
+        input_propositions: List[str],
+        verbose: bool = False
+    ) -> Dict[str, any]:
+        """Evaluate a variant and return detailed critique.
+
+        Args:
+            generated_text: Generated text to evaluate
+            input_propositions: List of input proposition strings
+            verbose: Enable verbose logging
+
+        Returns:
+            Dictionary with score, feedback, and detailed critique
+        """
+        if not generated_text or not input_propositions:
+            return {
+                'score': 0.0,
+                'feedback': 'Empty text or propositions',
+                'recall_details': {}
+            }
+
+        try:
+            # Create SemanticBlueprint from input propositions
+            from src.ingestion.blueprint import BlueprintExtractor
+            extractor = BlueprintExtractor()
+            input_text = " ".join(input_propositions)
+            input_blueprint = extractor.extract(input_text)
+
+            # Evaluate with paragraph mode to get detailed feedback
+            result = self.semantic_critic.evaluate(
+                generated_text,
+                input_blueprint,
+                propositions=input_propositions,
+                is_paragraph=True,
+                verbose=verbose
+            )
+
+            # Extract score (use proposition_recall if available, otherwise recall_score)
+            score = result.get('proposition_recall', result.get('recall_score', 0.0))
+
+            # Combine with overall score if available (weighted: 60% semantics, 40% style)
+            overall_score = result.get('score', 0.0)
+            if overall_score > 0:
+                score = 0.6 * score + 0.4 * overall_score
+
+            result['score'] = score
+            return result
+
+        except Exception as e:
+            if verbose:
+                print(f"     ⚠ Variant evaluation failed: {e}")
+            return {
+                'score': 0.0,
+                'feedback': f'Evaluation error: {str(e)}',
+                'recall_details': {}
+            }
+
+    def _surgical_repair(
+        self,
+        current_text: str,
+        missing_info: List[str],
+        input_propositions: List[str],
+        author_name: str,
+        previous_sentence: Optional[str],
+        verbose: bool = False
+    ) -> str:
+        """Perform surgical repair: Insert missing information without rewriting style.
+
+        Args:
+            current_text: Current draft text
+            missing_info: List of missing keywords/propositions
+            input_propositions: Full list of input propositions
+            author_name: Target author name
+            previous_sentence: Previous sentence for context
+            verbose: Enable verbose logging
+
+        Returns:
+            Repaired text with missing information inserted
+        """
+        if not missing_info:
+            return current_text
+
+        # Load style profile
+        style_profile = self._load_style_profile(author_name)
+        style_description = ""
+        if style_profile:
+            style_description = style_profile.get('description') or style_profile.get('style_description', '')
+
+        # Build missing information text (strip quotes for clarity)
+        missing_text = "\n".join([f"- {item.strip('\"\'')}" for item in missing_info[:5]])  # Limit to 5 items
+
+        if verbose:
+            print(f"       [REPAIR DEBUG] Missing info: {missing_info}")
+            print(f"       [REPAIR DEBUG] Missing text (sanitized): {missing_text[:100]}...")
+
+        system_prompt = f"""You are a Surgical Editor. Your task is to fix the text by inserting missing information WITHOUT changing the style or tone.
+
+**Target Author:** {author_name}
+**Style:** {style_description}
+
+**CRITICAL RULES:**
+1. Do NOT rewrite the entire text. Only insert the missing information.
+2. Preserve ALL existing words, phrases, and structure.
+3. Insert missing information seamlessly into the text.
+4. Maintain the exact same tone and style.
+5. Do NOT add quotes, citations, or attribution unless they were already present.
+6. Do NOT invent new facts - only use the missing information provided."""
+
+        user_prompt = f"""**Current Text:**
+{current_text}
+
+**Missing Information (must be inserted):**
+{missing_text}
+
+**Full Input Propositions (for context):**
+{chr(10).join([f"- {prop}" for prop in input_propositions[:10]])}
+
+**Task:**
+Insert the missing information into the current text. You may:
+- Add a clause or phrase that contains the missing information
+- Expand an existing sentence to include the missing information
+- Add a new sentence if necessary (but preserve the existing ones)
+
+**CRITICAL:** Do NOT rewrite the text. Only insert the missing information while preserving everything else exactly as it is.
+
+**Output:** Return ONLY the repaired text, no explanation."""
+
+        try:
+            if verbose:
+                print(f"       [REPAIR DEBUG] Calling LLM for repair...")
+
+            response = self.llm_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                model_type="editor",
+                require_json=False,
+                temperature=0.2,  # Low temperature for surgical precision
+                max_tokens=500
+            )
+
+            if verbose:
+                print(f"       [REPAIR DEBUG] LLM response length: {len(response) if response else 0}")
+                if response:
+                    preview = response[:100].replace('\n', ' ')
+                    print(f"       [REPAIR DEBUG] LLM output preview: {preview}...")
+
+            # Clean up response
+            repaired = response.strip() if response else ""
+            # Remove any markdown code blocks
+            repaired = re.sub(r'```[^`]*```', '', repaired, flags=re.DOTALL)
+            repaired = repaired.strip()
+
+            # Check if repair actually changed the text
+            if not repaired:
+                if verbose:
+                    print(f"       [REPAIR DEBUG] Repair failed: LLM returned empty response")
+                return current_text
+
+            # Normalize both texts for comparison (strip whitespace, lowercase)
+            current_normalized = current_text.strip().lower()
+            repaired_normalized = repaired.strip().lower()
+
+            if repaired_normalized == current_normalized:
+                if verbose:
+                    print(f"       [REPAIR DEBUG] Repair failed: Text unchanged (normalized comparison)")
+                return current_text
+
+            if verbose:
+                print(f"       [REPAIR DEBUG] Repair success: Text changed (old: {len(current_text)}, new: {len(repaired)})")
+
+            return repaired
+
+        except Exception as e:
+            if verbose:
+                print(f"       ⚠ Surgical repair LLM call failed: {e}")
+            return current_text
+
     def translate_paragraph_propositions(
         self,
         paragraph: str,
         author_name: str,
         document_context: Optional[Dict] = None,
+        paragraph_index: Optional[int] = None,
+        total_paragraphs: Optional[int] = None,
+        prev_paragraph_text: Optional[str] = None,
         verbose: bool = False
     ) -> tuple[str, int, float]:
         """Generate text from propositions using the graph-based pipeline.
@@ -4691,6 +5474,9 @@ Generate text matching the author's voice:"""
             paragraph: Input paragraph text.
             author_name: Target author name.
             document_context: Optional dict with 'current_index' and 'total_paragraphs'.
+            paragraph_index: Paragraph index in document (0-based) for role filtering.
+            total_paragraphs: Total number of paragraphs in document.
+            prev_paragraph_text: Previous paragraph text for context continuity.
             verbose: Enable verbose logging.
 
         Returns:
@@ -4699,6 +5485,92 @@ Generate text matching the author's voice:"""
         if not paragraph or not paragraph.strip():
             return ("", 0, 1.0)
 
+        # Retry loop with graceful degradation
+        max_retries = 3
+        best_result = None
+        best_score = 0.0
+        target_score = 0.85
+
+        for attempt in range(max_retries):
+            if verbose and attempt > 0:
+                print(f"  🔄 Retry attempt {attempt + 1}/{max_retries} (previous score: {best_score:.3f})")
+
+            try:
+                result = self._translate_paragraph_propositions_attempt(
+                    paragraph,
+                    author_name,
+                    document_context,
+                    paragraph_index,
+                    total_paragraphs,
+                    prev_paragraph_text,
+                    verbose,
+                    attempt=attempt
+                )
+
+                generated_text, arch_id, score = result
+
+                # Track best result
+                if score > best_score:
+                    best_result = result
+                    best_score = score
+
+                # If score is good enough, return immediately
+                if score >= target_score:
+                    if verbose:
+                        print(f"  ✓ Generation successful (score: {score:.3f} >= {target_score})")
+                    return result
+
+                if verbose:
+                    print(f"  ⚠ Attempt {attempt + 1} score {score:.3f} < {target_score}, will retry...")
+
+            except Exception as e:
+                if verbose:
+                    print(f"  ⚠ Attempt {attempt + 1} failed: {e}")
+                # Continue to next attempt
+                continue
+
+        # Return best result or fallback
+        if best_result:
+            if verbose:
+                print(f"  ⚠ All attempts completed. Best score: {best_score:.3f}")
+            return best_result
+        else:
+            # Ultimate fallback
+            if verbose:
+                print(f"  ⚠ All attempts failed, using ultimate fallback")
+            fallback_result = self._fallback_simple_generation(paragraph, author_name, verbose)
+            fallback_text = fallback_result[0] if isinstance(fallback_result, tuple) else fallback_result
+            fallback_score = self._calculate_semantic_score(fallback_text, [], verbose=verbose)
+            if isinstance(fallback_result, tuple):
+                return (fallback_result[0], fallback_result[1], fallback_score)
+            return (fallback_text, 0, fallback_score)
+
+    def _translate_paragraph_propositions_attempt(
+        self,
+        paragraph: str,
+        author_name: str,
+        document_context: Optional[Dict] = None,
+        paragraph_index: Optional[int] = None,
+        total_paragraphs: Optional[int] = None,
+        prev_paragraph_text: Optional[str] = None,
+        verbose: bool = False,
+        attempt: int = 0
+    ) -> tuple[str, int, float]:
+        """Single attempt at generating text from propositions.
+
+        Args:
+            paragraph: Input paragraph text.
+            author_name: Target author name.
+            document_context: Optional dict with 'current_index' and 'total_paragraphs'.
+            paragraph_index: Paragraph index in document (0-based).
+            total_paragraphs: Total number of paragraphs in document.
+            prev_paragraph_text: Previous paragraph text for context continuity.
+            verbose: Enable verbose logging.
+            attempt: Retry attempt number (0 = High Style, 1 = Generic Template, 2 = Literal).
+
+        Returns:
+            Tuple of (generated_text, arch_id, compliance_score).
+        """
         try:
             # Step 1: Extract propositions
             if verbose:
@@ -4744,6 +5616,8 @@ Generate text matching the author's voice:"""
 
             # Step 3: Process each chunk
             generated_sentences = []
+            last_generated_sentence = None  # Initialize before loop
+            chunk_scores = []  # Track scores from repair loops
             for chunk_idx, chunk in enumerate(chunks):
                 try:
                     if verbose:
@@ -4757,18 +5631,35 @@ Generate text matching the author's voice:"""
                         if len(chunk) > 3:
                             print(f"       ... and {len(chunk) - 3} more")
 
-                    # Get intent from input mapper (for intent classification)
-                    input_graph = self.input_mapper.map_propositions(chunk)
+                    # Get intent, signature, and role from input mapper
+                    # Pass previous paragraph summary for context-aware role detection
+                    prev_paragraph_summary = prev_paragraph_text[:200] + "..." if prev_paragraph_text and len(prev_paragraph_text) > 200 else prev_paragraph_text
+                    input_graph = self.input_mapper.map_propositions(chunk, prev_paragraph_summary=prev_paragraph_summary)
                     input_intent = 'ARGUMENT'  # Default
+                    input_signature = 'DEFINITION'  # Default
+                    input_role = None
                     if input_graph:
                         input_intent = input_graph.get('intent', 'ARGUMENT')
+                        input_signature = input_graph.get('signature', 'DEFINITION')
+                        input_role = input_graph.get('role')
+
+                    # Load style profile for style injection
+                    style_profile = self._load_style_profile(author_name)
 
                     # Synthesize blueprint using Architect pattern
+                    # Use paragraph_index and total_paragraphs from parameters (Phase 5)
+                    global_idx = paragraph_index if paragraph_index is not None else (document_context.get('current_index') if document_context else None)
                     try:
                         blueprint = self.graph_matcher.synthesize_match(
                             chunk,
                             input_intent,
                             document_context,
+                            style_profile=style_profile,
+                            input_signature=input_signature,
+                            global_index=global_idx,
+                            input_role=input_role,
+                            prev_paragraph_summary=prev_paragraph_summary,
+                            input_graph=input_graph,  # Pass input_graph with structural_summary
                             verbose=verbose
                         )
                     except Exception as e:
@@ -4787,6 +5678,37 @@ Generate text matching the author's voice:"""
                             generated_sentences.append(fallback_text)
                         continue
 
+                    # Phase 4: Validate blueprint signature
+                    # TRUST THE GRAPH: If skeleton is built from graph traversal, bypass validation
+                    # The Graph Builder is grounded in actual input logic, so it is authoritative
+                    source_method = blueprint.get('source_method', 'unknown')
+
+                    if source_method == 'graph_traversal':
+                        if verbose:
+                            print(f"     ✓ Graph-based skeleton accepted (skipping signature validation)")
+                    else:
+                        # Perform validation only for Statistical/Generic/LLM templates
+                        if not self._validate_blueprint(blueprint, input_signature, verbose=verbose):
+                            if verbose:
+                                print(f"  ⚠ Blueprint validation failed, attempting repair...")
+                            # Attempt repair (only once to avoid infinite loops)
+                            try:
+                                blueprint = self._repair_blueprint(
+                                    blueprint,
+                                    input_signature,
+                                    chunk,
+                                    input_intent,
+                                    document_context,
+                                    style_profile=style_profile,
+                                    global_index=global_idx,
+                                    input_role=input_role,
+                                    prev_paragraph_summary=prev_paragraph_summary,
+                                    verbose=verbose
+                                )
+                            except Exception as e:
+                                if verbose:
+                                    print(f"  ⚠ Repair failed: {e}, continuing with original blueprint")
+
                     if verbose:
                         style_meta = blueprint.get('style_metadata', {})
                         print(f"     ✓ Synthesized blueprint:")
@@ -4798,8 +5720,9 @@ Generate text matching the author's voice:"""
                     # Create input_node_map from propositions (P0->proposition text)
                     input_node_map = {f'P{i}': prop for i, prop in enumerate(chunk)}
 
-                    # Render from graph
-                    sentence = self._generate_from_graph(
+                    # Render from graph using repair loop
+                    sentence, sentence_score = self._generate_with_repair_loop(
+                        chunk,
                         blueprint,
                         input_node_map,
                         author_name,
@@ -4807,9 +5730,11 @@ Generate text matching the author's voice:"""
                         previous_sentence=last_generated_sentence
                     )
 
+                    # Track score for this chunk
+                    chunk_scores.append(sentence_score)
+
                     if sentence:
                         generated_sentences.append(sentence)
-                        last_generated_sentence = sentence
                         last_generated_sentence = sentence
                         if verbose:
                             print(f"  ✓ Generated sentence from graph: {sentence[:80]}...")
@@ -4832,6 +5757,8 @@ Generate text matching the author's voice:"""
                         fallback_text = self._fallback_simple_generation_chunk(chunk, author_name, verbose)
                         if fallback_text:
                             generated_sentences.append(fallback_text)
+                            # Track fallback score (use a conservative score for fallbacks)
+                            chunk_scores.append(0.5)  # Conservative score for fallback
 
                 except Exception as e:
                     if verbose:
@@ -4840,26 +5767,53 @@ Generate text matching the author's voice:"""
                     fallback_text = self._fallback_simple_generation_chunk(chunk, author_name, verbose)
                     if fallback_text:
                         generated_sentences.append(fallback_text)
+                        # Track fallback score (use a conservative score for fallbacks)
+                        chunk_scores.append(0.5)  # Conservative score for fallback
 
-            # Step 4: Assembly
+            # Step 4: Assembly and Validation
             if generated_sentences:
                 result = " ".join(generated_sentences)
                 if verbose:
                     print(f"  ✓ Generated paragraph with {len(generated_sentences)} sentences")
+
+                # Use the best score from repair loops (average of chunk scores)
+                # This ensures we use the REPAIRED scores, not initial failures
+                if 'chunk_scores' in locals() and chunk_scores:
+                    compliance_score = sum(chunk_scores) / len(chunk_scores)
+                    if verbose:
+                        print(f"  ✓ Paragraph Semantic Score: {compliance_score:.3f} (from {len(chunk_scores)} repaired chunks)")
+                else:
+                    # Fallback: calculate if chunk scores not available
+                    compliance_score = self._calculate_semantic_score(result, propositions, verbose=verbose)
+                    if verbose:
+                        print(f"  ✓ Semantic compliance score (calculated): {compliance_score:.3f}")
+
                 # Return tuple: (text, arch_id, compliance_score)
-                # arch_id and compliance_score are not applicable for graph-based generation
-                return (result, 0, 1.0)
+                return (result, 0, compliance_score)
             else:
                 if verbose:
                     print(f"  ⚠ No sentences generated, using fallback")
-                fallback_text = self._fallback_simple_generation(paragraph, author_name, verbose)
-                return (fallback_text, 0, 1.0)
+                fallback_result = self._fallback_simple_generation(paragraph, author_name, verbose)
+                # _fallback_simple_generation returns a tuple (text, arch_id, score)
+                fallback_text = fallback_result[0] if isinstance(fallback_result, tuple) else fallback_result
+                # Calculate score for fallback
+                fallback_score = self._calculate_semantic_score(fallback_text, propositions, verbose=verbose)
+                if isinstance(fallback_result, tuple):
+                    return (fallback_result[0], fallback_result[1], fallback_score)
+                return (fallback_text, 0, fallback_score)
 
         except Exception as e:
             if verbose:
                 print(f"  ⚠ Graph pipeline failed: {e}, using fallback")
-            fallback_text = self._fallback_simple_generation(paragraph, author_name, verbose)
-            return (fallback_text, 0, 1.0)
+            fallback_result = self._fallback_simple_generation(paragraph, author_name, verbose)
+            # _fallback_simple_generation returns a tuple (text, arch_id, score)
+            fallback_text = fallback_result[0] if isinstance(fallback_result, tuple) else fallback_result
+            # Calculate score for fallback
+            input_props = propositions if 'propositions' in locals() else []
+            fallback_score = self._calculate_semantic_score(fallback_text, input_props, verbose=verbose)
+            if isinstance(fallback_result, tuple):
+                return (fallback_result[0], fallback_result[1], fallback_score)
+            return (fallback_text, 0, fallback_score)
 
     def _fallback_simple_generation_chunk(
         self,

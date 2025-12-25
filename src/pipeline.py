@@ -377,6 +377,9 @@ def process_text(
     previous_paragraph_id = -1
     previous_generated_text = ""
 
+    # Track previous paragraph text for context continuity (Phase 5)
+    prev_paragraph_text = None
+
     for para_idx, paragraph in enumerate(paragraphs):
         if verbose:
             print(f"\n{'='*60}")
@@ -499,6 +502,9 @@ def process_text(
                     paragraph,
                     author_name,
                     document_context=document_context,
+                    paragraph_index=para_idx,
+                    total_paragraphs=total_paragraphs,
+                    prev_paragraph_text=prev_paragraph_text,
                     verbose=verbose
                 )
 
@@ -636,6 +642,9 @@ def process_text(
             print(f"  ✓ Generated paragraph accepted")
 
         generated_paragraphs.append(generated_paragraph)
+
+        # Update previous paragraph text for next iteration (Phase 5)
+        prev_paragraph_text = generated_paragraph
 
         # Write paragraph if callback provided
         if write_callback:

@@ -331,14 +331,16 @@ class StyleGraphIndexer:
 
         return ''.join(result)
 
-    def _extract_topology(self, text: str) -> Optional[dict]:
+    def _extract_topology(self, text: str, paragraph_index: int = 0, total_paragraphs: int = 1) -> Optional[dict]:
         """Extract abstract logical topology from text using LLM.
 
         Args:
             text: Input sentence/utterance to analyze.
+            paragraph_index: Index of the paragraph in the document (0-based).
+            total_paragraphs: Total number of paragraphs in the document.
 
         Returns:
-            Dictionary with 'mermaid', 'description', 'node_count', 'edge_types', 'skeleton',
+            Dictionary with 'mermaid', 'description', 'node_count', 'edge_types', 'skeleton', 'role',
             or None if extraction fails.
         """
         system_prompt = (
@@ -354,8 +356,21 @@ Task:
 1. Analyze the logical structure.
 2. Generate a Mermaid.js graph string.
 3. Write a natural language description of this structure (for search).
-4. Classify the **Rhetorical Intent**: `DEFINITION` (explaining what X is), `ARGUMENT` (persuading/contrasting), `NARRATIVE` (telling a sequence), `INTERROGATIVE` (asking), `IMPERATIVE` (giving commands/directives).
-5. Create a 'Syntactic Skeleton':
+4. **Generate Structural Summary (CRITICAL):** Describe the **Rhetorical Structure** of this text. Ignore specific names, topics, or entities. Use abstract terms like 'Contrast', 'Definition', 'Attribution', 'Conditional', 'Causality', 'Sequence', 'List'. Keep it under 15 words. Focus on the LOGICAL FORM, not the CONTENT.
+   - Example: "A definition of a concept followed by its historical origin."
+   - Example: "A set of misconceptions followed by a clarification."
+   - Example: "Historical attribution of a creation action to a named agent."
+   - Example: "A contrast between a false view and a true statement."
+5. Classify the **Rhetorical Intent**: `DEFINITION` (explaining what X is), `ARGUMENT` (persuading/contrasting), `NARRATIVE` (telling a sequence), `INTERROGATIVE` (asking), `IMPERATIVE` (giving commands/directives).
+6. Classify the **Logical Signature** (Choose ONE based on the logical relationship between nodes):
+   - CONTRAST (Conflict/Negation/Correction: "Not X, but Y"; "Many think X, however Y")
+   - CAUSALITY (Reasoning/Result: "Because X, Y"; "X leads to Y")
+   - DEFINITION (Description/Identity: "X is Y"; "X constitutes Y")
+   - SEQUENCE (Time/Order: "First X, then Y"; "When X, Y")
+   - CONDITIONAL (Hypothetical: "If X, then Y")
+   - LIST (Grouping: "X, Y, and Z")
+   - If classification is ambiguous, default to DEFINITION.
+7. Create a 'Syntactic Skeleton':
    - Keep all original prepositions, conjunctions, negative markers ('no', 'not'), and punctuation.
    - Replace specific content words with the abstract NODE IDs from your Mermaid graph (e.g., [ROOT], [CLAIM]).
    - **CRITICAL: The placeholders in the skeleton MUST match the Node IDs used in your Mermaid graph exactly (e.g., if graph has A-->B, skeleton must use [A] and [B], not [Concept A] or [Node B]).**
@@ -364,9 +379,11 @@ Output JSON:
 {{
   "mermaid": "graph LR; ROOT --negates--> CONCEPT_A; ROOT --defines--> CONCEPT_B",
   "description": "A definition that starts by negating an opposing view.",
+  "structural_summary": "A definition that negates an opposing view then establishes a concept.",
   "node_count": 3,
   "edge_types": ["negates", "defines"],
   "intent": "DEFINITION",
+  "signature": "CONTRAST",
   "skeleton": "[ROOT] is not [CONCEPT_A], but [CONCEPT_B]."
 }}
 
@@ -409,8 +426,32 @@ Example: If input text is "Politics is war without bloodshed." and your Mermaid 
                 print(f"Warning: Missing required fields in LLM response for: {text[:50]}...")
                 return None
 
+            # Generate structural_summary if not provided (fallback)
+            if 'structural_summary' not in result or not result.get('structural_summary'):
+                # Fallback: create from description, but make it more abstract
+                result['structural_summary'] = result.get('description', 'A logical structure.')
+
             # Validate intent is one of the allowed values
             valid_intents = ['DEFINITION', 'ARGUMENT', 'NARRATIVE', 'INTERROGATIVE', 'IMPERATIVE']
+
+            # Validate signature if present, or set default
+            valid_signatures = ['CONTRAST', 'CAUSALITY', 'DEFINITION', 'SEQUENCE', 'CONDITIONAL', 'LIST']
+            if 'signature' not in result:
+                # Default to DEFINITION if not provided
+                result['signature'] = 'DEFINITION'
+            elif result.get('signature') not in valid_signatures:
+                print(f"Warning: Invalid signature '{result.get('signature')}', defaulting to 'DEFINITION' for: {text[:50]}...")
+                result['signature'] = 'DEFINITION'
+
+            # Determine narrative role based on paragraph position
+            if paragraph_index == 0:
+                role = 'INTRO'
+            elif paragraph_index == total_paragraphs - 1:
+                role = 'CONCLUSION'
+            else:
+                role = 'BODY'
+            result['role'] = role
+
             if result.get('intent') not in valid_intents:
                 print(f"Warning: Invalid intent '{result.get('intent')}' for: {text[:50]}..., defaulting to 'ARGUMENT'")
                 result['intent'] = 'ARGUMENT'  # Default fallback
@@ -464,6 +505,12 @@ Example: If input text is "Politics is war without bloodshed." and your Mermaid 
 
                 # Validate required fields
                 required_fields = ['mermaid', 'description', 'node_count', 'edge_types', 'intent', 'skeleton']
+                # Ensure signature is present
+                valid_signatures = ['CONTRAST', 'CAUSALITY', 'DEFINITION', 'SEQUENCE', 'CONDITIONAL', 'LIST']
+                if 'signature' not in result:
+                    result['signature'] = 'DEFINITION'
+                elif result.get('signature') not in valid_signatures:
+                    result['signature'] = 'DEFINITION'
                 if all(field in result for field in required_fields):
                     # Additional validation
                     if (isinstance(result.get('mermaid'), str) and
@@ -658,7 +705,12 @@ Example: If input text is "Politics is war without bloodshed." and your Mermaid 
 
             try:
                 # Extract topology with timeout handling
-                topology = self._extract_topology(sentence)
+                # Pass paragraph index and total paragraphs for role determination
+                topology = self._extract_topology(
+                    sentence,
+                    paragraph_index=task['para_idx'],
+                    total_paragraphs=total_paragraphs
+                )
 
                 if topology is None:
                     return {'type': 'skipped', 'sentence_id': sentence_id}
@@ -680,6 +732,9 @@ Example: If input text is "Politics is war without bloodshed." and your Mermaid 
                     'edge_types': ','.join(topology['edge_types']),
                     'skeleton': topology.get('skeleton', ''),
                     'intent': topology.get('intent', 'ARGUMENT'),
+                    'signature': topology.get('signature', 'DEFINITION'),  # Store signature
+                    'role': topology.get('role', 'BODY'),  # Store narrative role (INTRO, BODY, CONCLUSION)
+                    'structural_summary': topology.get('structural_summary', topology.get('description', '')),  # Store structural summary
                     'original_text': sentence,
                     'paragraph_role': task['paragraph_role'],
                     'paragraph_index': task['para_idx'],
@@ -695,7 +750,7 @@ Example: If input text is "Politics is war without bloodshed." and your Mermaid 
                     'type': 'success',
                     'sentence_id': sentence_id,
                     'graph_id': graph_id,
-                    'document': topology['description'],
+                    'document': topology.get('structural_summary', topology['description']),  # Use structural_summary for embedding
                     'metadata': metadata
                 }
             except Exception as e:

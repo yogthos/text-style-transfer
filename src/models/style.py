@@ -1,7 +1,7 @@
 """Style-related data models."""
 
 from dataclasses import dataclass, field
-from typing import List, Optional, Dict
+from typing import List, Optional, Dict, Tuple, Any
 
 
 @dataclass
@@ -15,6 +15,13 @@ class AuthorProfile:
     punctuation_freq: Dict[str, float] = field(default_factory=dict)
     perspective: str = "third_person"  # first_person_singular, first_person_plural, third_person
 
+    # Enhanced style features (Phase 1)
+    transitions: Dict[str, List[Tuple[str, int]]] = field(default_factory=dict)
+    voice_ratio: float = 0.5  # 0.0 = all passive, 1.0 = all active
+    sentence_openers: Dict[str, List[Tuple[str, int]]] = field(default_factory=dict)
+    signature_phrases: List[Tuple[str, int]] = field(default_factory=list)
+    punctuation_patterns: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
         return {
@@ -24,12 +31,37 @@ class AuthorProfile:
             "avg_sentence_length": self.avg_sentence_length,
             "burstiness": self.burstiness,
             "punctuation_freq": self.punctuation_freq,
-            "perspective": self.perspective
+            "perspective": self.perspective,
+            # Enhanced features
+            "transitions": {
+                cat: [(w, f) for w, f in words]
+                for cat, words in self.transitions.items()
+            },
+            "voice_ratio": self.voice_ratio,
+            "sentence_openers": {
+                cat: [(w, f) for w, f in words]
+                for cat, words in self.sentence_openers.items()
+            },
+            "signature_phrases": [(p, f) for p, f in self.signature_phrases],
+            "punctuation_patterns": self.punctuation_patterns
         }
 
     @classmethod
     def from_dict(cls, data: Dict) -> "AuthorProfile":
         """Create from dictionary."""
+        # Convert transitions back to proper format
+        transitions = {}
+        for cat, words in data.get("transitions", {}).items():
+            transitions[cat] = [(w, f) for w, f in words]
+
+        # Convert openers back
+        openers = {}
+        for cat, words in data.get("sentence_openers", {}).items():
+            openers[cat] = [(w, f) for w, f in words]
+
+        # Convert signature phrases
+        phrases = [(p, f) for p, f in data.get("signature_phrases", [])]
+
         return cls(
             name=data["name"],
             style_dna=data.get("style_dna", ""),
@@ -37,8 +69,39 @@ class AuthorProfile:
             avg_sentence_length=data.get("avg_sentence_length", 15.0),
             burstiness=data.get("burstiness", 0.3),
             punctuation_freq=data.get("punctuation_freq", {}),
-            perspective=data.get("perspective", "third_person")
+            perspective=data.get("perspective", "third_person"),
+            transitions=transitions,
+            voice_ratio=data.get("voice_ratio", 0.5),
+            sentence_openers=openers,
+            signature_phrases=phrases,
+            punctuation_patterns=data.get("punctuation_patterns", {})
         )
+
+    def get_transition_words(self, category: str, limit: int = 5) -> List[str]:
+        """Get top transition words for a category.
+
+        Args:
+            category: Transition category (causal, adversative, additive, etc.)
+            limit: Maximum number of words to return.
+
+        Returns:
+            List of transition words.
+        """
+        words = self.transitions.get(category, [])
+        return [w for w, _ in words[:limit]]
+
+    def get_preferred_openers(self, position: str = "openers", limit: int = 10) -> List[str]:
+        """Get preferred sentence openers.
+
+        Args:
+            position: Position type (openers, first_sentence, middle_sentence, last_sentence)
+            limit: Maximum openers to return.
+
+        Returns:
+            List of opener words/phrases.
+        """
+        openers = self.sentence_openers.get(position, [])
+        return [o for o, _ in openers[:limit]]
 
 
 @dataclass

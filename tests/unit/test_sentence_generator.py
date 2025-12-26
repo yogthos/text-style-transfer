@@ -131,6 +131,7 @@ class TestSentenceGenerator:
     def mock_llm(self):
         """Create mock LLM provider."""
         llm = MagicMock()
+        llm.call.return_value = "This is a generated test sentence."
         llm.generate.return_value = "This is a generated test sentence."
         return llm
 
@@ -200,8 +201,8 @@ class TestSentenceGenerator:
         """Test that generator calls LLM."""
         generator.generate_sentence(sentence_node, sentence_plan)
 
-        mock_llm.generate.assert_called_once()
-        call_args = mock_llm.generate.call_args
+        mock_llm.call.assert_called_once()
+        call_args = mock_llm.call.call_args
         assert "temperature" in call_args.kwargs
 
     def test_generate_paragraph(self, generator, sentence_plan, paragraph_context):
@@ -294,6 +295,9 @@ class TestMultiPassGenerator:
         """Create mock LLM provider."""
         llm = MagicMock()
         # Return numbered alternatives
+        llm.call.return_value = """1. First alternative sentence.
+2. Second alternative sentence.
+3. Third alternative sentence."""
         llm.generate.return_value = """1. First alternative sentence.
 2. Second alternative sentence.
 3. Third alternative sentence."""

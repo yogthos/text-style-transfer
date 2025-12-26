@@ -40,6 +40,7 @@ class PropositionClusterer:
     - Target sentence lengths from rhythm plan
     - Semantic boundaries (related propositions stay together)
     - Information density balance
+    - Graph structure (root propositions first, dependents follow)
     """
 
     def __init__(self, words_per_proposition: float = 8.0):
@@ -64,7 +65,8 @@ class PropositionClusterer:
             rhythm: Target rhythm pattern.
 
         Returns:
-            List of proposition clusters (one per sentence).
+            List of proposition clusters (one per sentence), with
+            propositions ordered by graph structure within each cluster.
         """
         if not propositions:
             return []
@@ -87,7 +89,78 @@ class PropositionClusterer:
             adjacency
         )
 
-        return clusters
+        # Order propositions within each cluster by graph structure
+        ordered_clusters = [
+            self._order_by_graph_structure(cluster, edges)
+            for cluster in clusters
+        ]
+
+        return ordered_clusters
+
+    def _order_by_graph_structure(
+        self,
+        cluster: List[PropositionNode],
+        edges: List[RelationshipEdge]
+    ) -> List[PropositionNode]:
+        """Order propositions within a cluster based on graph relationships.
+
+        Ordering rules:
+        1. Root propositions (sources with no incoming edges) come first
+        2. Dependent propositions follow their sources
+        3. Contrasting propositions are positioned after what they contrast
+
+        Args:
+            cluster: Propositions in this cluster.
+            edges: All edges in the graph.
+
+        Returns:
+            Ordered list of propositions.
+        """
+        if len(cluster) <= 1:
+            return cluster
+
+        cluster_ids = {p.id for p in cluster}
+        id_to_prop = {p.id: p for p in cluster}
+
+        # Find incoming and outgoing edges within this cluster
+        incoming: Dict[str, List[str]] = {p.id: [] for p in cluster}
+        outgoing: Dict[str, List[str]] = {p.id: [] for p in cluster}
+
+        for edge in edges:
+            if edge.source_id in cluster_ids and edge.target_id in cluster_ids:
+                incoming[edge.target_id].append(edge.source_id)
+                outgoing[edge.source_id].append(edge.target_id)
+
+        # Find roots (no incoming edges within cluster)
+        roots = [p.id for p in cluster if not incoming[p.id]]
+
+        # If no clear roots, use original order
+        if not roots:
+            return cluster
+
+        # Topological sort within cluster (BFS from roots)
+        ordered = []
+        visited = set()
+        queue = list(roots)
+
+        while queue:
+            node_id = queue.pop(0)
+            if node_id in visited:
+                continue
+            visited.add(node_id)
+            ordered.append(id_to_prop[node_id])
+
+            # Add children (targets of outgoing edges)
+            for child_id in outgoing.get(node_id, []):
+                if child_id not in visited and child_id in cluster_ids:
+                    queue.append(child_id)
+
+        # Add any remaining unvisited nodes (disconnected)
+        for p in cluster:
+            if p.id not in visited:
+                ordered.append(p)
+
+        return ordered
 
     def _build_adjacency(
         self,
@@ -253,12 +326,17 @@ class SentencePlanner:
                     matched_graph.skeleton, i, len(clusters)
                 )
 
+            # Ensure target length is viable for the proposition content
+            # Minimum = 60% of proposition word count (allowing for compression)
+            min_viable_length = self._calculate_min_viable_length(cluster)
+            adjusted_target = max(target_length, min_viable_length)
+
             node = SentenceNode(
                 id=f"s_{i}_{uuid.uuid4().hex[:8]}",
                 propositions=cluster,
                 role=role,
                 transition=transition,
-                target_length=target_length,
+                target_length=adjusted_target,
                 target_skeleton=skeleton,
                 keywords=self._extract_keywords(cluster)
             )
@@ -344,6 +422,37 @@ class SentencePlanner:
                     return transition
 
         return TransitionType.NONE
+
+    def _calculate_min_viable_length(
+        self,
+        cluster: List[PropositionNode]
+    ) -> int:
+        """Calculate minimum viable sentence length for a proposition cluster.
+
+        The LLM cannot compress content infinitely. This ensures the target
+        length is at least 60% of the total proposition word count, allowing
+        for reasonable compression while preventing content loss.
+
+        Args:
+            cluster: List of propositions to express.
+
+        Returns:
+            Minimum viable word count.
+        """
+        if not cluster:
+            return 10  # Default minimum
+
+        # Count total words in all propositions
+        total_words = sum(
+            len(p.text.split()) for p in cluster
+        )
+
+        # Allow 40% compression (60% retention)
+        # This is generous - most content needs near 1:1
+        min_viable = int(total_words * 0.6)
+
+        # Absolute minimum of 10 words
+        return max(10, min_viable)
 
     def _detect_signature(self, edges: List[RelationshipEdge]) -> str:
         """Detect the dominant signature from edges.

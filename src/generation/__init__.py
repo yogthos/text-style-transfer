@@ -4,7 +4,8 @@ from .prompt_builder import (
     PromptBuilder,
     MultiSentencePromptBuilder,
     GenerationPrompt,
-    TRANSITION_WORDS,
+    DEFAULT_TRANSITION_WORDS,
+    TRANSITION_TYPE_TO_CATEGORY,
 )
 from .sentence_generator import (
     SentenceGenerator,
@@ -24,6 +25,16 @@ from .critics import (
     FluencyCritic,
     SemanticCritic,
     StyleCritic,
+    VoiceCritic,
+    PunctuationCritic,
+)
+from .style_metrics import (
+    StyleScorer,
+    StyleScore,
+    VocabularyScorer,
+    VoiceScorer,
+    SentenceLengthScorer,
+    PunctuationScorer,
 )
 
 __all__ = [
@@ -31,7 +42,8 @@ __all__ = [
     "PromptBuilder",
     "MultiSentencePromptBuilder",
     "GenerationPrompt",
-    "TRANSITION_WORDS",
+    "DEFAULT_TRANSITION_WORDS",
+    "TRANSITION_TYPE_TO_CATEGORY",
     # Sentence generation
     "SentenceGenerator",
     "MultiPassGenerator",
@@ -49,4 +61,13 @@ __all__ = [
     "FluencyCritic",
     "SemanticCritic",
     "StyleCritic",
+    "VoiceCritic",
+    "PunctuationCritic",
+    # Style metrics
+    "StyleScorer",
+    "StyleScore",
+    "VocabularyScorer",
+    "VoiceScorer",
+    "SentenceLengthScorer",
+    "PunctuationScorer",
 ]

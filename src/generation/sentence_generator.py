@@ -4,12 +4,18 @@ import re
 from dataclasses import dataclass, field
 from typing import List, Optional, Tuple
 
+from typing import TYPE_CHECKING
+
 from ..llm.provider import LLMProvider
 from ..llm.session import LLMSession
 from ..models.plan import SentencePlan, SentenceNode
+from ..models.style import StyleProfile
 from ..ingestion.context_analyzer import GlobalContext, ParagraphContext
 from .prompt_builder import PromptBuilder, MultiSentencePromptBuilder
 from ..utils.logging import get_logger
+
+if TYPE_CHECKING:
+    from ..corpus.indexer import CorpusIndexer
 
 logger = get_logger(__name__)
 
@@ -72,7 +78,9 @@ class SentenceGenerator:
         self,
         llm_provider: LLMProvider,
         global_context: GlobalContext,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        style_profile: Optional[StyleProfile] = None,
+        indexer: Optional["CorpusIndexer"] = None
     ):
         """Initialize sentence generator.
 
@@ -80,11 +88,15 @@ class SentenceGenerator:
             llm_provider: LLM provider instance.
             global_context: Document-level context.
             temperature: Generation temperature.
+            style_profile: Target author's style profile (for author-specific transitions).
+            indexer: Optional corpus indexer for RAG-based style examples.
         """
         self.llm_provider = llm_provider
         self.global_context = global_context
         self.temperature = temperature
-        self.prompt_builder = PromptBuilder(global_context)
+        self.style_profile = style_profile
+        self.indexer = indexer
+        self.prompt_builder = PromptBuilder(global_context, style_profile, indexer)
 
     def generate_paragraph(
         self,
@@ -105,6 +117,9 @@ class SentenceGenerator:
             f"{len(plan.nodes)} sentences planned"
         )
 
+        # Reset entity tracking for new paragraph
+        self.prompt_builder.reset_entity_tracking()
+
         sentences = []
         previous_sentence = None
 
@@ -112,6 +127,12 @@ class SentenceGenerator:
             generated = self.generate_sentence(node, plan, previous_sentence)
             sentences.append(generated)
             previous_sentence = generated.text
+
+            # Register entities from this sentence's propositions for future reference
+            entities = []
+            for prop in node.propositions:
+                entities.extend(prop.entities)
+            self.prompt_builder.register_introduced_entities(entities)
 
         paragraph = GeneratedParagraph(
             sentences=sentences,
@@ -340,7 +361,9 @@ class MultiPassGenerator(SentenceGenerator):
         llm_provider: LLMProvider,
         global_context: GlobalContext,
         temperature: float = 0.8,
-        num_alternatives: int = 3
+        num_alternatives: int = 3,
+        style_profile: Optional[StyleProfile] = None,
+        indexer: Optional["CorpusIndexer"] = None
     ):
         """Initialize multi-pass generator.
 
@@ -349,10 +372,12 @@ class MultiPassGenerator(SentenceGenerator):
             global_context: Global context.
             temperature: Base temperature.
             num_alternatives: Number of alternatives per sentence.
+            style_profile: Target author's style profile.
+            indexer: Optional corpus indexer for RAG.
         """
-        super().__init__(llm_provider, global_context, temperature)
+        super().__init__(llm_provider, global_context, temperature, style_profile, indexer)
         self.num_alternatives = num_alternatives
-        self.multi_prompt_builder = MultiSentencePromptBuilder(global_context)
+        self.multi_prompt_builder = MultiSentencePromptBuilder(global_context, style_profile, indexer)
 
     def generate_sentence(
         self,
@@ -472,7 +497,9 @@ class SessionBasedGenerator(SentenceGenerator):
         self,
         llm_provider: LLMProvider,
         global_context: GlobalContext,
-        temperature: float = 0.7
+        temperature: float = 0.7,
+        style_profile: Optional[StyleProfile] = None,
+        indexer: Optional["CorpusIndexer"] = None
     ):
         """Initialize session-based generator.
 
@@ -480,8 +507,10 @@ class SessionBasedGenerator(SentenceGenerator):
             llm_provider: LLM provider.
             global_context: Global context.
             temperature: Generation temperature.
+            style_profile: Target author's style profile.
+            indexer: Optional corpus indexer for RAG.
         """
-        super().__init__(llm_provider, global_context, temperature)
+        super().__init__(llm_provider, global_context, temperature, style_profile, indexer)
         self._session = None
 
     def start_document_session(self) -> None:

@@ -256,18 +256,30 @@ class PropositionExtractor:
         """
         # Get subtree but limit scope
         clause_tokens = []
+        prev_token = None
+
         for token in verb_token.subtree:
             # Stop at coordinating conjunctions that start truly new clauses
-            # but NOT at "rather than", "as well as", etc.
+            # but NOT at comparative constructs like "rather than", "as well as"
             if token.dep_ == "cc" and token.i > verb_token.i:
-                # Check if this is a major clause break (followed by new subject/verb)
-                # vs a continuation like "rather than"
-                if token.text.lower() not in ("rather", "as", "well"):
-                    next_tokens = [t for t in token.rights]
-                    has_new_clause = any(t.dep_ in ("nsubj", "nsubjpass") for t in next_tokens)
+                # Check if preceded by "rather" or part of comparative construct
+                is_comparative = (
+                    prev_token and prev_token.text.lower() in ("rather", "as", "well", "other")
+                ) or token.text.lower() in ("than", "as")
+
+                if not is_comparative:
+                    # Check if this truly starts a new independent clause
+                    # by looking for a new subject/verb after it
+                    remaining_tokens = [t for t in verb_token.subtree if t.i > token.i]
+                    has_new_clause = any(
+                        t.dep_ in ("nsubj", "nsubjpass") and t.head.i > token.i
+                        for t in remaining_tokens
+                    )
                     if has_new_clause:
                         break
+
             clause_tokens.append(token)
+            prev_token = token
 
         # Sort by position
         clause_tokens.sort(key=lambda t: t.i)

@@ -7,7 +7,7 @@ from src.generation.prompt_builder import (
     PromptBuilder,
     MultiSentencePromptBuilder,
     GenerationPrompt,
-    TRANSITION_WORDS,
+    DEFAULT_TRANSITION_WORDS,
 )
 from src.models.plan import (
     SentencePlan,
@@ -266,29 +266,29 @@ class TestTransitionWords:
 
     def test_causal_transitions(self):
         """Test causal transition words exist."""
-        words = TRANSITION_WORDS[TransitionType.CAUSAL]
+        words = DEFAULT_TRANSITION_WORDS[TransitionType.CAUSAL]
         assert "therefore" in words
         assert "thus" in words
 
     def test_adversative_transitions(self):
         """Test adversative transition words exist."""
-        words = TRANSITION_WORDS[TransitionType.ADVERSATIVE]
+        words = DEFAULT_TRANSITION_WORDS[TransitionType.ADVERSATIVE]
         assert "however" in words
         assert "but" in words
 
     def test_additive_transitions(self):
         """Test additive transition words exist."""
-        words = TRANSITION_WORDS[TransitionType.ADDITIVE]
+        words = DEFAULT_TRANSITION_WORDS[TransitionType.ADDITIVE]
         assert "moreover" in words
         assert "furthermore" in words
 
     def test_temporal_transitions(self):
         """Test temporal transition words exist."""
-        words = TRANSITION_WORDS[TransitionType.TEMPORAL]
+        words = DEFAULT_TRANSITION_WORDS[TransitionType.TEMPORAL]
         assert "then" in words
         assert "next" in words
 
     def test_none_transition_empty(self):
         """Test NONE transition has no words."""
-        words = TRANSITION_WORDS[TransitionType.NONE]
+        words = DEFAULT_TRANSITION_WORDS[TransitionType.NONE]
         assert words == []

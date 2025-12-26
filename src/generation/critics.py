@@ -11,6 +11,7 @@ from ..models.style import StyleProfile
 from ..ingestion.context_analyzer import GlobalContext
 from ..utils.nlp import NLPManager
 from ..utils.logging import get_logger
+from .style_metrics import StyleScorer
 
 logger = get_logger(__name__)
 
@@ -22,6 +23,8 @@ class CriticType(Enum):
     LENGTH = "length"
     FLUENCY = "fluency"
     KEYWORD = "keyword"
+    VOICE = "voice"
+    PUNCTUATION = "punctuation"
 
 
 @dataclass
@@ -475,7 +478,7 @@ class SemanticCritic(Critic):
 
 
 class StyleCritic(Critic):
-    """Critic that evaluates style adherence."""
+    """Critic that evaluates style adherence using comprehensive style metrics."""
 
     def __init__(
         self,
@@ -488,11 +491,11 @@ class StyleCritic(Critic):
         Args:
             style_profile: Target style profile.
             threshold: Pass/fail threshold.
-            nlp_manager: NLP manager for analysis.
+            nlp_manager: NLP manager for analysis (unused, kept for API compat).
         """
         super().__init__(threshold)
         self.style_profile = style_profile
-        self.nlp = nlp_manager or NLPManager()
+        self.style_scorer = StyleScorer(style_profile)
 
     @property
     def critic_type(self) -> CriticType:
@@ -504,7 +507,7 @@ class StyleCritic(Critic):
         node: SentenceNode,
         context: Optional[Dict] = None
     ) -> CriticFeedback:
-        """Evaluate style adherence.
+        """Evaluate style adherence using StyleScorer.
 
         Args:
             generated_text: Generated sentence.
@@ -514,29 +517,98 @@ class StyleCritic(Critic):
         Returns:
             CriticFeedback with style analysis.
         """
+        # Use the comprehensive StyleScorer
+        style_score = self.style_scorer.score(generated_text)
+
         issues = []
-        scores = []
 
-        # Check vocabulary alignment
-        vocab_score = self._check_vocabulary(generated_text)
-        scores.append(vocab_score)
-        if vocab_score < 0.5:
+        # Report specific issues
+        if style_score.vocabulary_overlap < 0.3:
             issues.append("Low vocabulary alignment with target style")
+        if style_score.voice_match < 0.5:
+            target_ratio = self.style_profile.primary_author.voice_ratio
+            voice_type = "active" if target_ratio > 0.5 else "passive"
+            issues.append(f"Voice doesn't match target (should be more {voice_type})")
+        if style_score.sentence_length_match < 0.5:
+            issues.append("Sentence length doesn't match target style")
+        if style_score.punctuation_match < 0.4:
+            issues.append("Punctuation patterns don't match target style")
 
-        # Check sentence complexity
-        complexity_score = self._check_complexity(generated_text, node.target_length)
-        scores.append(complexity_score)
-        if complexity_score < 0.5:
-            issues.append("Sentence complexity doesn't match target style")
-
-        # Overall score
-        score = sum(scores) / len(scores) if scores else 0.5
-        passed = score >= self.threshold
+        passed = style_score.overall >= self.threshold
 
         suggestions = []
         if not passed:
-            vocab = self.style_profile.get_effective_vocab()[:10]
-            suggestions.append(f"Consider using vocabulary like: {', '.join(vocab[:5])}")
+            # Get specific feedback from StyleScorer
+            feedback = self.style_scorer.get_feedback(generated_text)
+            if feedback and feedback != "Style looks good":
+                suggestions.append(feedback)
+
+        return CriticFeedback(
+            critic_type=self.critic_type,
+            score=style_score.overall,
+            passed=passed,
+            issues=issues,
+            suggestions=suggestions
+        )
+
+
+class VoiceCritic(Critic):
+    """Critic that specifically evaluates active/passive voice matching."""
+
+    def __init__(
+        self,
+        style_profile: StyleProfile,
+        threshold: float = 0.6
+    ):
+        """Initialize voice critic.
+
+        Args:
+            style_profile: Target style profile.
+            threshold: Pass/fail threshold.
+        """
+        super().__init__(threshold)
+        self.style_profile = style_profile
+        self.style_scorer = StyleScorer(style_profile)
+
+    @property
+    def critic_type(self) -> CriticType:
+        return CriticType.VOICE
+
+    def evaluate(
+        self,
+        generated_text: str,
+        node: SentenceNode,
+        context: Optional[Dict] = None
+    ) -> CriticFeedback:
+        """Evaluate voice matching.
+
+        Args:
+            generated_text: Generated sentence.
+            node: Sentence specification.
+            context: Optional additional context.
+
+        Returns:
+            CriticFeedback with voice analysis.
+        """
+        voice_scorer = self.style_scorer.voice_scorer
+        score = voice_scorer.score(generated_text)
+        analysis = voice_scorer.analyze_voice(generated_text)
+
+        target_ratio = voice_scorer.target_voice_ratio
+        actual_ratio = analysis["active_ratio"]
+
+        issues = []
+        suggestions = []
+
+        passed = score >= self.threshold
+
+        if not passed:
+            if target_ratio > 0.6 and actual_ratio < 0.5:
+                issues.append(f"Text is {actual_ratio*100:.0f}% active voice, target is {target_ratio*100:.0f}%")
+                suggestions.append("Rewrite passive constructions to active voice")
+            elif target_ratio < 0.4 and actual_ratio > 0.5:
+                issues.append(f"Text is {actual_ratio*100:.0f}% active voice, target is {target_ratio*100:.0f}%")
+                suggestions.append("Use more passive constructions")
 
         return CriticFeedback(
             critic_type=self.critic_type,
@@ -546,56 +618,72 @@ class StyleCritic(Critic):
             suggestions=suggestions
         )
 
-    def _check_vocabulary(self, text: str) -> float:
-        """Check vocabulary alignment with style.
+
+class PunctuationCritic(Critic):
+    """Critic that evaluates punctuation pattern matching."""
+
+    def __init__(
+        self,
+        style_profile: StyleProfile,
+        threshold: float = 0.5
+    ):
+        """Initialize punctuation critic.
 
         Args:
-            text: Text to check.
-
-        Returns:
-            Score 0.0 to 1.0.
+            style_profile: Target style profile.
+            threshold: Pass/fail threshold.
         """
-        target_vocab = set(
-            w.lower() for w in self.style_profile.get_effective_vocab()[:100]
-        )
-        if not target_vocab:
-            return 1.0
+        super().__init__(threshold)
+        self.style_profile = style_profile
+        self.style_scorer = StyleScorer(style_profile)
 
-        doc = self.nlp.process(text)
-        text_words = set(
-            token.text.lower() for token in doc
-            if not token.is_stop and not token.is_punct
-        )
+    @property
+    def critic_type(self) -> CriticType:
+        return CriticType.PUNCTUATION
 
-        if not text_words:
-            return 0.5
-
-        overlap = len(text_words & target_vocab)
-        return min(1.0, overlap / (len(text_words) * 0.5))  # Don't require all words
-
-    def _check_complexity(self, text: str, target_length: int) -> float:
-        """Check sentence complexity alignment.
+    def evaluate(
+        self,
+        generated_text: str,
+        node: SentenceNode,
+        context: Optional[Dict] = None
+    ) -> CriticFeedback:
+        """Evaluate punctuation pattern matching.
 
         Args:
-            text: Text to check.
-            target_length: Target word count.
+            generated_text: Generated sentence.
+            node: Sentence specification.
+            context: Optional additional context.
 
         Returns:
-            Score 0.0 to 1.0.
+            CriticFeedback with punctuation analysis.
         """
-        doc = self.nlp.process(text)
+        punc_scorer = self.style_scorer.punctuation_scorer
+        score = punc_scorer.score(generated_text)
+        analysis = punc_scorer.analyze_punctuation(generated_text)
+        target_patterns = punc_scorer.target_patterns
 
-        # Calculate complexity metrics
-        word_count = len([t for t in doc if not t.is_punct])
-        avg_word_length = sum(len(t.text) for t in doc if not t.is_punct) / max(word_count, 1)
+        issues = []
+        suggestions = []
 
-        target_avg = self.style_profile.get_effective_avg_sentence_length()
+        passed = score >= self.threshold
 
-        # Score based on length similarity
-        length_diff = abs(word_count - target_length) / max(target_length, 1)
-        length_score = max(0.0, 1.0 - length_diff)
+        if not passed and target_patterns:
+            # Find significant mismatches
+            for punc_type, target_data in target_patterns.items():
+                target_freq = target_data.get("per_sentence", 0)
+                actual_freq = analysis.get(punc_type, 0)
 
-        return length_score
+                if target_freq > 0.2 and actual_freq < 0.1:
+                    issues.append(f"Missing {punc_type} (author uses {target_freq:.1f} per sentence)")
+                    suggestions.append(f"Consider using {punc_type}")
+
+        return CriticFeedback(
+            critic_type=self.critic_type,
+            score=score,
+            passed=passed,
+            issues=issues,
+            suggestions=suggestions
+        )
 
 
 class CriticPanel:
@@ -605,7 +693,9 @@ class CriticPanel:
         self,
         style_profile: StyleProfile,
         global_context: GlobalContext,
-        llm_provider: Optional[LLMProvider] = None
+        llm_provider: Optional[LLMProvider] = None,
+        include_voice: bool = True,
+        include_punctuation: bool = True
     ):
         """Initialize critic panel.
 
@@ -613,16 +703,25 @@ class CriticPanel:
             style_profile: Target style profile.
             global_context: Global document context.
             llm_provider: Optional LLM for advanced critics.
+            include_voice: Whether to include voice critic.
+            include_punctuation: Whether to include punctuation critic.
         """
         self.nlp = NLPManager()
+        self.style_profile = style_profile
 
         self.critics = [
             LengthCritic(threshold=0.7, tolerance=5),
             KeywordCritic(threshold=0.8),
             FluencyCritic(threshold=0.7, nlp_manager=self.nlp),
             SemanticCritic(threshold=0.7, llm_provider=llm_provider, nlp_manager=self.nlp),
-            StyleCritic(style_profile, threshold=0.6, nlp_manager=self.nlp),
+            StyleCritic(style_profile, threshold=0.6),
         ]
+
+        # Add optional critics for detailed style matching
+        if include_voice:
+            self.critics.append(VoiceCritic(style_profile, threshold=0.6))
+        if include_punctuation:
+            self.critics.append(PunctuationCritic(style_profile, threshold=0.5))
 
     def validate(
         self,

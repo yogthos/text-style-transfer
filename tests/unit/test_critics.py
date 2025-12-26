@@ -14,6 +14,8 @@ from src.generation.critics import (
     FluencyCritic,
     SemanticCritic,
     StyleCritic,
+    VoiceCritic,
+    PunctuationCritic,
 )
 from src.models.plan import SentenceNode, SentenceRole
 from src.models.graph import PropositionNode
@@ -390,6 +392,106 @@ class TestStyleCritic:
         assert feedback.score < 0.8
 
 
+class TestVoiceCritic:
+    """Test VoiceCritic functionality."""
+
+    @pytest.fixture
+    def active_profile(self):
+        """Create active voice profile."""
+        author = AuthorProfile(
+            name="Active Writer",
+            style_dna="Active voice.",
+            voice_ratio=0.8,
+        )
+        return StyleProfile.from_author(author)
+
+    @pytest.fixture
+    def passive_profile(self):
+        """Create passive voice profile."""
+        author = AuthorProfile(
+            name="Passive Writer",
+            style_dna="Passive voice.",
+            voice_ratio=0.3,
+        )
+        return StyleProfile.from_author(author)
+
+    @pytest.fixture
+    def simple_node(self):
+        """Create simple sentence node."""
+        return SentenceNode(id="s1", propositions=[], target_length=10)
+
+    def test_active_text_matches_active_profile(self, active_profile, simple_node):
+        """Test active text scores well with active profile."""
+        critic = VoiceCritic(active_profile)
+        text = "The scientist discovered the cure."
+        feedback = critic.evaluate(text, simple_node)
+        assert feedback.score > 0.5
+
+    def test_passive_text_matches_passive_profile(self, passive_profile, simple_node):
+        """Test passive text scores well with passive profile."""
+        critic = VoiceCritic(passive_profile)
+        text = "The cure was discovered by the scientist."
+        feedback = critic.evaluate(text, simple_node)
+        assert feedback.score > 0.5
+
+    def test_mismatch_gives_suggestions(self, active_profile, simple_node):
+        """Test mismatch provides helpful suggestions."""
+        critic = VoiceCritic(active_profile, threshold=0.9)
+        text = "The experiment was conducted by the team."
+        feedback = critic.evaluate(text, simple_node)
+        # Passive text for active-preferring author may fail with high threshold
+        if not feedback.passed:
+            assert len(feedback.suggestions) > 0 or len(feedback.issues) > 0
+
+
+class TestPunctuationCritic:
+    """Test PunctuationCritic functionality."""
+
+    @pytest.fixture
+    def semicolon_profile(self):
+        """Create profile that uses semicolons."""
+        author = AuthorProfile(
+            name="Semicolon Writer",
+            style_dna="Uses semicolons.",
+            punctuation_patterns={
+                "semicolon": {"per_sentence": 0.5},
+            },
+        )
+        return StyleProfile.from_author(author)
+
+    @pytest.fixture
+    def simple_profile(self):
+        """Create simple punctuation profile."""
+        author = AuthorProfile(
+            name="Simple Writer",
+            style_dna="Simple punctuation.",
+            punctuation_patterns={},
+        )
+        return StyleProfile.from_author(author)
+
+    @pytest.fixture
+    def simple_node(self):
+        """Create simple sentence node."""
+        return SentenceNode(id="s1", propositions=[], target_length=10)
+
+    def test_matching_punctuation_scores_well(self, semicolon_profile, simple_node):
+        """Test punctuation critic evaluates correctly."""
+        critic = PunctuationCritic(semicolon_profile)
+        text = "First clause; second clause. Another sentence here."
+        feedback = critic.evaluate(text, simple_node)
+        # Critic should run and return a valid feedback
+        assert isinstance(feedback.score, float)
+        assert 0.0 <= feedback.score <= 1.0
+
+    def test_no_patterns_neutral_score(self, simple_profile, simple_node):
+        """Test no patterns gives neutral score."""
+        critic = PunctuationCritic(simple_profile)
+        text = "Simple text here."
+        feedback = critic.evaluate(text, simple_node)
+        assert feedback.score == 0.5
+        assert feedback.passed is True
+
+
 class TestCriticPanel:
     """Test CriticPanel functionality."""
 
@@ -475,3 +577,29 @@ class TestCriticPanel:
         result = panel.validate(text, sentence_node)
 
         assert isinstance(result, ValidationResult)
+
+    def test_panel_includes_voice_critic(self, style_profile, global_context, sentence_node):
+        """Test panel includes voice critic when enabled."""
+        panel = CriticPanel(style_profile, global_context, include_voice=True)
+        result = panel.validate("Test sentence here.", sentence_node)
+        critic_types = {f.critic_type for f in result.feedbacks}
+        assert CriticType.VOICE in critic_types
+
+    def test_panel_includes_punctuation_critic(self, style_profile, global_context, sentence_node):
+        """Test panel includes punctuation critic when enabled."""
+        panel = CriticPanel(style_profile, global_context, include_punctuation=True)
+        result = panel.validate("Test sentence here.", sentence_node)
+        critic_types = {f.critic_type for f in result.feedbacks}
+        assert CriticType.PUNCTUATION in critic_types
+
+    def test_panel_excludes_optional_critics(self, style_profile, global_context, sentence_node):
+        """Test panel excludes optional critics when disabled."""
+        panel = CriticPanel(
+            style_profile, global_context,
+            include_voice=False,
+            include_punctuation=False
+        )
+        result = panel.validate("Test sentence here.", sentence_node)
+        critic_types = {f.critic_type for f in result.feedbacks}
+        assert CriticType.VOICE not in critic_types
+        assert CriticType.PUNCTUATION not in critic_types

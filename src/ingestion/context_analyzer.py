@@ -31,10 +31,50 @@ class GlobalContext:
     target_sentence_length: float
     top_vocabulary: List[str]
 
+    # Author style features (from corpus analysis)
+    author_transitions: Dict[str, List[str]] = field(default_factory=dict)
+    author_openers: List[str] = field(default_factory=list)
+    author_voice_ratio: float = 0.5  # 0=passive, 1=active
+    author_signature_phrases: List[str] = field(default_factory=list)
+
     # Processing state
     total_paragraphs: int = 0
     processed_paragraphs: int = 0
     generated_summary: str = ""  # Summary of previously generated text
+
+    def _get_author_transition_guidance(self) -> str:
+        """Generate transition guidance from author's actual usage."""
+        if not self.author_transitions:
+            return ""
+
+        # Get the author's preferred transitions (top 2-3 from each category)
+        preferred = []
+        for category, words in self.author_transitions.items():
+            if words:
+                preferred.extend(words[:2])
+
+        if not preferred:
+            return ""
+
+        return f"- Uses connectors like: {', '.join(preferred[:6])}"
+
+    def _get_author_opener_guidance(self) -> str:
+        """Generate opener guidance from author's actual sentence starts."""
+        if not self.author_openers:
+            return ""
+
+        # Show variety of openers the author uses
+        openers = self.author_openers[:8]
+        return f"- Varies sentence openings (examples: {', '.join(openers)})"
+
+    def _get_voice_guidance(self) -> str:
+        """Generate voice guidance from author's active/passive ratio."""
+        if self.author_voice_ratio > 0.7:
+            return "- Primarily uses active voice"
+        elif self.author_voice_ratio < 0.3:
+            return "- Often uses passive voice"
+        else:
+            return "- Mixes active and passive voice naturally"
 
     def to_system_prompt(self) -> str:
         """Convert context to LLM system prompt.
@@ -42,28 +82,51 @@ class GlobalContext:
         Returns:
             System prompt string with document context.
         """
-        return f"""You are a skilled writer adapting text to match a specific author's style.
+        # Build dynamic author style guidance from corpus analysis
+        style_hints = []
 
-TARGET STYLE: {self.author_name}
+        transition_hint = self._get_author_transition_guidance()
+        if transition_hint:
+            style_hints.append(transition_hint)
+
+        opener_hint = self._get_author_opener_guidance()
+        if opener_hint:
+            style_hints.append(opener_hint)
+
+        voice_hint = self._get_voice_guidance()
+        if voice_hint:
+            style_hints.append(voice_hint)
+
+        if self.author_signature_phrases:
+            phrases = self.author_signature_phrases[:4]
+            style_hints.append(f"- Characteristic phrases: {', '.join(phrases)}")
+
+        style_guidance = "\n".join(style_hints) if style_hints else "- Write naturally in the author's voice"
+
+        return f"""You are adapting text to match {self.author_name}'s writing style.
+
+STYLE DESCRIPTION:
 {self.style_dna}
 
-DOCUMENT CONTEXT:
-- Thesis: {self.thesis}
+DOCUMENT:
+- Main idea: {self.thesis}
 - Intent: {self.intent}
-- Keywords to incorporate: {', '.join(self.keywords[:10])}
 - Perspective: {self.perspective}
 
-STATISTICAL TARGETS:
-- Average sentence length: ~{self.target_sentence_length:.0f} words
-- Rhythm variation (burstiness): {self.target_burstiness:.2f}
-- Vocabulary preferences: {', '.join(self.top_vocabulary[:15])}
+AUTHOR'S PATTERNS (from corpus analysis):
+{style_guidance}
 
-RULES:
-1. Preserve ALL semantic meaning from the source
-2. Match the target style's sentence rhythm and vocabulary
-3. Maintain the {self.perspective} perspective throughout
-4. Use transition words and phrases characteristic of the target style
-5. Do not add new information not present in the source"""
+GUIDELINES:
+1. Preserve ALL semantic meaning - every fact and idea must appear in output
+2. Write naturally in the target style - don't mechanically apply rules
+3. Vary your sentence openings - avoid starting multiple sentences the same way
+4. Let transitions flow naturally from the author's patterns above
+5. Maintain {self.perspective} perspective
+
+AVOID:
+- Mechanical insertion of vocabulary words
+- Formulaic sentence structures
+- Over-explaining or padding"""
 
     def to_dict(self) -> Dict:
         """Convert to dictionary for serialization."""
@@ -154,6 +217,18 @@ class GlobalContextAnalyzer:
         # Get style profile effective values
         author = style_profile.primary_author
 
+        # Extract author's preferred transitions (just the words, not frequencies)
+        author_transitions = {}
+        for category, word_freqs in author.transitions.items():
+            author_transitions[category] = [word for word, _ in word_freqs[:5]]
+
+        # Extract author's preferred sentence openers
+        all_openers = author.sentence_openers.get("openers", [])
+        author_openers = [opener for opener, _ in all_openers[:10]]
+
+        # Extract signature phrases (just the phrases)
+        author_phrases = [phrase for phrase, _ in author.signature_phrases[:6]]
+
         context = GlobalContext(
             thesis=thesis,
             intent=document_graph.intent,
@@ -164,6 +239,12 @@ class GlobalContextAnalyzer:
             target_burstiness=style_profile.get_effective_burstiness(),
             target_sentence_length=style_profile.get_effective_avg_sentence_length(),
             top_vocabulary=style_profile.get_effective_vocab(),
+            # Author style features from corpus
+            author_transitions=author_transitions,
+            author_openers=author_openers,
+            author_voice_ratio=author.voice_ratio,
+            author_signature_phrases=author_phrases,
+            # Processing state
             total_paragraphs=len(document_graph.paragraphs),
             processed_paragraphs=0
         )

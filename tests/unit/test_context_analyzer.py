@@ -40,7 +40,8 @@ class TestGlobalContext:
         assert "clarity and precision" in prompt
         assert "persuade" in prompt
         assert "first_person_singular" in prompt
-        assert "~15 words" in prompt
+        # Note: sentence length stats removed from system prompt to reduce mechanical output
+        assert "AVOID" in prompt  # Anti-pattern guidance
 
     def test_to_dict(self, sample_context):
         """Test dictionary conversion."""

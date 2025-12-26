@@ -128,6 +128,9 @@ class SentenceGenerator:
             sentences.append(generated)
             previous_sentence = generated.text
 
+            # Register generated sentence for transition tracking
+            self.prompt_builder.register_generated_sentence(generated.text)
+
             # Register entities from this sentence's propositions for future reference
             entities = []
             for prop in node.propositions:

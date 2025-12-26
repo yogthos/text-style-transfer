@@ -8,6 +8,7 @@ from ..llm.session import LLMSession
 from ..utils.logging import get_logger
 from .loader import Corpus, CorpusDocument
 from .analyzer import StatisticalAnalyzer, FeatureVector
+from .style_extractor import StyleFeatures
 
 logger = get_logger(__name__)
 
@@ -91,13 +92,16 @@ class StyleProfiler:
         all_text = self._collect_text(corpus)
         features = self.analyzer.analyze_text(all_text)
 
-        # Step 2: Select representative samples for LLM
+        # Step 2: Extract enhanced style features (transitions, openers, etc.)
+        style_features = StyleFeatures.extract_from_text(all_text)
+
+        # Step 3: Select representative samples for LLM
         samples = self._select_samples(corpus)
 
-        # Step 3: Generate style DNA using LLM
+        # Step 4: Generate style DNA using LLM
         style_dna = self._generate_style_dna(author_name, samples, features)
 
-        # Step 4: Build author profile
+        # Step 5: Build author profile with all features
         profile = AuthorProfile(
             name=author_name,
             style_dna=style_dna,
@@ -105,13 +109,20 @@ class StyleProfiler:
             avg_sentence_length=features.avg_sentence_length,
             burstiness=features.burstiness,
             punctuation_freq=features.punctuation_freq,
-            perspective=features.perspective
+            perspective=features.perspective,
+            # Enhanced style features from corpus analysis
+            transitions=style_features.transitions,
+            voice_ratio=style_features.voice_ratio,
+            sentence_openers=style_features.openers,
+            signature_phrases=style_features.phrases.get("signature_phrases", []),
+            punctuation_patterns=style_features.punctuation
         )
 
         logger.info(
             f"Generated profile for {author_name}: "
             f"avg_len={features.avg_sentence_length:.1f}, "
-            f"burstiness={features.burstiness:.2f}"
+            f"burstiness={features.burstiness:.2f}, "
+            f"voice_ratio={style_features.voice_ratio:.2f}"
         )
 
         return profile

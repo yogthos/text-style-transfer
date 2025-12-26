@@ -1,7 +1,9 @@
 """Prompt building for sentence generation."""
 
+import re
+from collections import Counter
 from dataclasses import dataclass
-from typing import List, Optional, Dict, TYPE_CHECKING
+from typing import List, Optional, Dict, TYPE_CHECKING, Tuple
 
 from ..models.plan import SentencePlan, SentenceNode, TransitionType
 from ..models.graph import SemanticGraph
@@ -89,6 +91,53 @@ class PromptBuilder:
         self.style_profile = style_profile
         self.indexer = indexer
         self._introduced_entities: set = set()  # Entities already introduced in output
+        self._used_transitions: Counter = Counter()  # Track transition word usage
+        self._used_openers: Counter = Counter()  # Track sentence opener usage
+        self._sentence_lengths: List[int] = []  # Track sentence lengths for burstiness
+        self._total_sentences: int = 0  # Track sentence count for frequency calculations
+        self._author_transition_dist = self._build_author_transition_distribution()
+
+    def _build_author_transition_distribution(self) -> Dict[str, Dict[str, float]]:
+        """Build normalized transition distribution from author's profile.
+
+        Returns:
+            Dict mapping category to dict of word -> target proportion.
+        """
+        if not self.style_profile or not self.style_profile.primary_author:
+            return {}
+
+        author = self.style_profile.primary_author
+        distribution = {}
+
+        for category, word_freqs in author.transitions.items():
+            if not word_freqs:
+                continue
+
+            # Calculate total for this category
+            total = sum(freq for _, freq in word_freqs)
+            if total == 0:
+                continue
+
+            # Normalize to proportions (case-insensitive)
+            cat_dist = {}
+            for word, freq in word_freqs:
+                word_lower = word.lower()
+                if word_lower in cat_dist:
+                    cat_dist[word_lower] += freq / total
+                else:
+                    cat_dist[word_lower] = freq / total
+
+            distribution[category] = cat_dist
+
+        return distribution
+
+    def reset_tracking(self) -> None:
+        """Reset all tracking for a new document."""
+        self._introduced_entities = set()
+        self._used_transitions = Counter()
+        self._used_openers = Counter()
+        self._sentence_lengths = []
+        self._total_sentences = 0
 
     def reset_entity_tracking(self) -> None:
         """Reset entity tracking for a new paragraph."""
@@ -134,31 +183,148 @@ class PromptBuilder:
             f"Use pronouns (it, they, this, etc.) or shortened references instead of repeating full names."
         )
 
+    def register_generated_sentence(self, sentence: str) -> None:
+        """Register a generated sentence to track transitions, openers, and lengths.
+
+        Args:
+            sentence: The generated sentence text.
+        """
+        self._total_sentences += 1
+
+        # Track sentence length
+        word_count = len(sentence.split())
+        self._sentence_lengths.append(word_count)
+
+        # Track sentence opener (first word)
+        words = sentence.strip().split()
+        if words:
+            opener = words[0].strip('"\'"(')
+            self._used_openers[opener] += 1
+
+        # Check for transition words in all categories
+        sentence_lower = sentence.lower()
+
+        for category, word_dist in self._author_transition_dist.items():
+            for word in word_dist.keys():
+                # Use word boundary matching
+                pattern = r'\b' + re.escape(word) + r'\b'
+                matches = re.findall(pattern, sentence_lower)
+                if matches:
+                    self._used_transitions[word] += len(matches)
+
+    def get_transition_balance_guidance(self, transition_type: TransitionType) -> str:
+        """Get guidance on which transitions to prefer based on current usage balance.
+
+        Args:
+            transition_type: The type of transition needed.
+
+        Returns:
+            Guidance string suggesting under-used transitions.
+        """
+        if transition_type == TransitionType.NONE:
+            return ""
+
+        # Map transition type to category
+        type_to_category = {
+            TransitionType.CAUSAL: "causal",
+            TransitionType.ADVERSATIVE: "adversative",
+            TransitionType.ADDITIVE: "additive",
+            TransitionType.TEMPORAL: "temporal",
+        }
+
+        category = type_to_category.get(transition_type)
+        if not category or category not in self._author_transition_dist:
+            return ""
+
+        target_dist = self._author_transition_dist[category]
+        if not target_dist:
+            return ""
+
+        # Calculate current usage proportions
+        total_used = sum(self._used_transitions.get(w, 0) for w in target_dist.keys())
+
+        if total_used == 0:
+            # No transitions used yet - suggest the author's most common one
+            top_word = max(target_dist.items(), key=lambda x: x[1])[0]
+            return f"(author prefers '{top_word}' for this connection type)"
+
+        # Find under-used transitions (current usage < target proportion)
+        under_used = []
+        over_used = []
+
+        for word, target_prop in target_dist.items():
+            current_count = self._used_transitions.get(word, 0)
+            current_prop = current_count / total_used if total_used > 0 else 0
+
+            # Significant deviation from target
+            if target_prop > 0.1 and current_prop < target_prop * 0.5:
+                under_used.append((word, target_prop))
+            elif current_prop > target_prop * 2 and current_count > 2:
+                over_used.append(word)
+
+        if not under_used and not over_used:
+            return ""
+
+        guidance_parts = []
+
+        if under_used:
+            # Sort by target proportion (suggest most characteristic first)
+            under_used.sort(key=lambda x: -x[1])
+            suggestions = [w for w, _ in under_used[:2]]
+            guidance_parts.append(f"consider '{suggestions[0]}'" if len(suggestions) == 1
+                                  else f"consider '{suggestions[0]}' or '{suggestions[1]}'")
+
+        if over_used:
+            guidance_parts.append(f"vary from '{over_used[0]}'")
+
+        return f"({'; '.join(guidance_parts)})" if guidance_parts else ""
+
+    def get_opener_diversity_guidance(self) -> str:
+        """Get guidance to avoid repetitive sentence openers.
+
+        Returns:
+            Guidance string if an opener is overused, empty otherwise.
+        """
+        if not self._used_openers or self._total_sentences < 3:
+            return ""
+
+        # Find the most used opener
+        most_common = self._used_openers.most_common(1)
+        if not most_common:
+            return ""
+
+        top_opener, count = most_common[0]
+
+        # If an opener is used more than 30% of sentences, suggest variety
+        usage_ratio = count / self._total_sentences
+        if usage_ratio > 0.3 and count >= 2:
+            # Get author's openers as alternatives
+            author_openers = self.global_context.author_openers[:5]
+            alternatives = [o for o in author_openers if o.lower() != top_opener.lower()][:3]
+
+            if alternatives:
+                return f"(Vary your opener - avoid starting with '{top_opener}' again; try: {', '.join(alternatives)})"
+            else:
+                return f"(Vary your opener - avoid starting with '{top_opener}' again)"
+
+        return ""
+
     def get_vocabulary_guidance(self, n_words: int = 10) -> str:
         """Get vocabulary guidance from author's profile.
+
+        NOTE: We deliberately provide minimal vocabulary guidance here to avoid
+        the LLM mechanically stuffing words. Style should come from examples.
 
         Args:
             n_words: Number of vocabulary words to include.
 
         Returns:
-            Formatted vocabulary guidance string.
+            Formatted vocabulary guidance string (minimal or empty).
         """
-        if not self.style_profile:
-            return ""
-
-        vocab = self.style_profile.get_effective_vocab()
-        if not vocab:
-            return ""
-
-        # Take top N words, filter out very short words
-        top_words = [w for w in vocab if len(w) > 2][:n_words]
-        if not top_words:
-            return ""
-
-        return (
-            f"\nVOCABULARY PREFERENCE: When appropriate, prefer using words like: "
-            f"{', '.join(top_words)}. These are characteristic of the target style."
-        )
+        # Deliberately return empty - vocabulary should come from style examples
+        # and the style DNA in the system prompt, not from explicit word lists
+        # that cause mechanical stuffing
+        return ""
 
     def get_style_examples(
         self,
@@ -419,12 +585,22 @@ OUTPUT FORMAT: Write only the paragraph text, one sentence per line."""
         else:
             context = "This is the first sentence of the paragraph."
 
-        # Transition guidance (using author's preferred vocabulary)
-        transition_words = self.get_transition_words(sentence_node.transition)
-        if transition_words:
-            transition_hint = f"Consider using: {', '.join(transition_words[:3])}"
+        # Transition guidance - subtle, not prescriptive
+        transition_type = sentence_node.transition
+
+        # Get balance guidance based on what's been used vs author's distribution
+        balance_hint = self.get_transition_balance_guidance(transition_type)
+
+        if transition_type.value == "CAUSAL":
+            transition_hint = f"Show logical consequence {balance_hint}".strip()
+        elif transition_type.value == "ADVERSATIVE":
+            transition_hint = f"Show contrast or qualification {balance_hint}".strip()
+        elif transition_type.value == "ADDITIVE":
+            transition_hint = f"Build on the previous idea {balance_hint}".strip()
+        elif transition_type.value == "TEMPORAL":
+            transition_hint = f"Show sequence or temporal relationship {balance_hint}".strip()
         else:
-            transition_hint = "No transition word needed."
+            transition_hint = "Flow naturally from previous sentence"
 
         # Build individual propositions list for clarity
         props_list = self._format_propositions_list(sentence_node.propositions)
@@ -432,39 +608,47 @@ OUTPUT FORMAT: Write only the paragraph text, one sentence per line."""
         # Get entity reference guidance (for avoiding repetition)
         reference_guidance = self.get_reference_guidance(sentence_node.propositions)
 
-        # Get style examples from corpus (RAG)
+        # Get opener diversity guidance (avoid repetitive sentence starts)
+        opener_guidance = self.get_opener_diversity_guidance()
+
+        # Get style examples from corpus (RAG) - these are PRIMARY guidance
         query_text = sentence_node.get_proposition_text() if hasattr(sentence_node, 'get_proposition_text') else ""
         style_examples = self.get_style_examples(
             query_text=query_text,
             role=plan.paragraph_role if plan else None,
             target_length=sentence_node.target_length,
-            n_examples=2
+            n_examples=3  # More examples for better few-shot learning
         )
 
-        # Get vocabulary guidance
-        vocabulary_guidance = self.get_vocabulary_guidance(n_words=8)
+        # Combine guidance strings
+        guidance = ""
+        if transition_hint and transition_hint != "Flow naturally from previous sentence":
+            guidance += f"\n{transition_hint}"
+        if reference_guidance:
+            guidance += reference_guidance
+        if opener_guidance:
+            guidance += f"\n{opener_guidance}"
 
-        # Build the prompt
-        prompt = f"""Generate a single sentence for a {plan.paragraph_role} paragraph.
+        # Build the prompt - EXAMPLE-DRIVEN, not prescriptive
+        skeleton_hint = self._get_skeleton_hint(sentence_node)
 
-CONTEXT:
-{context}
+        if style_examples:
+            # Few-shot style: examples first, then the task
+            prompt = f"""Here are examples of the author's writing style:
+{style_examples}
 
-PROPOSITIONS TO EXPRESS (ALL must be included):
-{props_list}
+Now write a similar sentence that expresses: {sentence_node.get_proposition_text()}
 
-REQUIREMENTS:
-- Role: {sentence_node.role.value}
-- Target length: approximately {sentence_node.target_length} words
-- Transition: {sentence_node.transition.value}
-  {transition_hint}
-- CRITICAL: Every proposition above MUST be expressed in the output sentence. Do not omit any information.
-{reference_guidance}{vocabulary_guidance}{style_examples}
-{self._get_skeleton_hint(sentence_node)}
+{context}{guidance}
+{skeleton_hint}"""
+        else:
+            # Fallback when no examples available
+            prompt = f"""{context}
 
-OUTPUT: Write ONLY the sentence, nothing else."""
+Express this idea: {sentence_node.get_proposition_text()}{guidance}
+{skeleton_hint}"""
 
-        return prompt
+        return prompt.strip()
 
     def _format_sentence_spec(self, node: SentenceNode, index: int) -> str:
         """Format a sentence specification.

@@ -129,8 +129,9 @@ class TestPromptBuilder:
         prompt = builder.build_sentence_prompt(sentence_node, sentence_plan)
 
         assert isinstance(prompt, GenerationPrompt)
-        assert "THESIS" in prompt.user_prompt
-        assert "15 words" in prompt.user_prompt
+        # New example-driven prompt format - check for key elements
+        assert "evolves" in prompt.user_prompt.lower()  # proposition content
+        # Note: Removed explicit word count targets to reduce mechanical output
 
     def test_build_sentence_prompt_with_previous(self, builder, sentence_node, sentence_plan):
         """Test sentence prompt with previous sentence."""
@@ -159,7 +160,7 @@ class TestPromptBuilder:
 
         assert "Test Author" in prompt
         assert "Clear, direct writing style" in prompt
-        assert "15 words" in prompt  # sentence length
+        # Note: sentence length stats removed from system prompt to reduce mechanical output
 
     def test_format_sentence_spec(self, builder, sentence_node):
         """Test sentence specification formatting."""
@@ -170,7 +171,7 @@ class TestPromptBuilder:
         assert "15 words" in spec
 
     def test_transition_hint_causal(self, builder):
-        """Test transition word hints for causal."""
+        """Test transition hints for causal relationship."""
         prop = PropositionNode(id="p1", text="Test.", subject="S", verb="is")
         node = SentenceNode(
             id="s1",
@@ -182,8 +183,8 @@ class TestPromptBuilder:
         plan = SentencePlan(nodes=[node], paragraph_role="BODY")
         prompt = builder.build_sentence_prompt(node, plan)
 
-        # Should suggest causal transition words
-        assert any(word in prompt.user_prompt for word in ["therefore", "thus", "consequently"])
+        # Should have descriptive hint about logical consequence (not explicit words)
+        assert "logical consequence" in prompt.user_prompt.lower() or "consequence" in prompt.user_prompt.lower()
 
 
 class TestMultiSentencePromptBuilder:

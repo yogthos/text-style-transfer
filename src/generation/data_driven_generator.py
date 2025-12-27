@@ -14,6 +14,7 @@ from .evolutionary_generator import EvolutionaryParagraphGenerator
 from ..utils.nlp import split_into_sentences
 from ..utils.logging import get_logger
 from ..ingestion.proposition_extractor import PropositionExtractor
+from ..validation.entailment import EntailmentVerifier, EntailmentResult
 
 logger = get_logger(__name__)
 
@@ -28,6 +29,7 @@ class TransferResult:
     verification: VerificationResult
     sentence_count: int
     word_count: int
+    entailment: Optional[EntailmentResult] = None  # NLI content preservation check
 
 
 @dataclass
@@ -96,6 +98,7 @@ class DataDrivenStyleTransfer:
         # Initialize components
         self.verifier = StyleVerifier(self.profile)
         self.proposition_extractor = PropositionExtractor()
+        self.entailment_verifier = EntailmentVerifier(entailment_threshold=0.4)
 
         # Use evolutionary generator for better convergence
         self.generator = EvolutionaryParagraphGenerator(
@@ -126,23 +129,49 @@ class DataDrivenStyleTransfer:
         Returns:
             TransferResult with transferred text and verification.
         """
-        # Extract propositions from source
+        # Extract propositions from source with RST roles
         propositions = self.proposition_extractor.extract_from_text(paragraph)
 
         if not propositions:
             # Fallback: use sentences as propositions
             sentences = split_into_sentences(paragraph)
             proposition_texts = sentences if sentences else [paragraph]
+            rst_info = None
         else:
             proposition_texts = [p.text for p in propositions]
+            # Build RST info for generator
+            rst_info = [
+                {
+                    "role": p.rst_role,
+                    "relation": p.rst_relation,
+                    "parent_idx": p.parent_nucleus_idx,
+                    "entities": p.entities,
+                }
+                for p in propositions
+            ]
 
         logger.debug(f"Extracted {len(proposition_texts)} propositions")
 
-        # Generate paragraph using evolutionary approach
-        transferred = self.generator.generate_paragraph(proposition_texts)
+        # Generate paragraph using evolutionary approach with RST awareness
+        transferred = self.generator.generate_paragraph(
+            proposition_texts,
+            rst_info=rst_info
+        )
 
         # Verify against profile
         verification = self.verifier.verify_paragraph(transferred)
+
+        # Verify content preservation using NLI entailment
+        entailment = self.entailment_verifier.verify(proposition_texts, transferred)
+
+        # Log content preservation issues
+        if not entailment.is_acceptable:
+            logger.warning(
+                f"Content preservation issue: {entailment.coverage_ratio:.0%} propositions entailed"
+            )
+            if entailment.lost_propositions:
+                for lost in entailment.lost_propositions[:3]:
+                    logger.warning(f"  Lost: {lost[:60]}...")
 
         # Calculate stats
         sentences = split_into_sentences(transferred)
@@ -155,6 +184,7 @@ class DataDrivenStyleTransfer:
             verification=verification,
             sentence_count=len(sentences),
             word_count=word_count,
+            entailment=entailment,
         )
 
     def transfer_document(

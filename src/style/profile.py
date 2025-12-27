@@ -5,7 +5,7 @@ Based on stylometry research (Burrows' Delta, Markov chains).
 """
 
 from dataclasses import dataclass, field
-from typing import Dict, List, Optional
+from typing import Dict, List, Optional, Tuple
 import json
 
 
@@ -158,6 +158,53 @@ class RegisterProfile:
 
 
 @dataclass
+class DiscourseRelationProfile:
+    """Discourse relation patterns extracted from corpus using spaCy.
+
+    Tracks PDTB-style discourse relations:
+    - CONTRAST: Opposition/concession (but, however, although)
+    - CAUSE: Causal relations (because, so, therefore)
+    - ELABORATION: Expansion/detail (for example, specifically)
+    - TEMPORAL: Time sequences (then, after, before)
+    - CONTINUATION: Simple continuation (and, also)
+    """
+
+    # Relation distribution
+    relation_distribution: Dict[str, float] = field(default_factory=dict)
+
+    # Discourse relation transition Markov model
+    # P(next_relation | current_relation)
+    relation_transitions: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    # Sample sentence pairs for each relation type (for few-shot prompting)
+    relation_samples: Dict[str, List[Tuple[str, str]]] = field(default_factory=dict)
+
+    # Connectives used for each relation type (extracted from corpus)
+    relation_connectives: Dict[str, Dict[str, float]] = field(default_factory=dict)
+
+    def to_dict(self) -> Dict:
+        return {
+            "relation_distribution": self.relation_distribution,
+            "relation_transitions": self.relation_transitions,
+            "relation_samples": {k: list(v) for k, v in self.relation_samples.items()},
+            "relation_connectives": self.relation_connectives,
+        }
+
+    @classmethod
+    def from_dict(cls, data: Dict) -> "DiscourseRelationProfile":
+        samples = data.get("relation_samples", {})
+        # Convert lists back to tuples
+        samples = {k: [tuple(v) if isinstance(v, list) else v for v in vals]
+                   for k, vals in samples.items()}
+        return cls(
+            relation_distribution=data.get("relation_distribution", {}),
+            relation_transitions=data.get("relation_transitions", {}),
+            relation_samples=samples,
+            relation_connectives=data.get("relation_connectives", {}),
+        )
+
+
+@dataclass
 class SentenceStructureProfile:
     """Sentence structure patterns extracted from corpus using spaCy.
 
@@ -278,6 +325,7 @@ class AuthorStyleProfile:
     register_profile: RegisterProfile = field(default_factory=RegisterProfile)
     delta_profile: DeltaProfile = field(default_factory=DeltaProfile)
     structure_profile: SentenceStructureProfile = field(default_factory=SentenceStructureProfile)
+    discourse_profile: DiscourseRelationProfile = field(default_factory=DiscourseRelationProfile)
 
     # Style DNA (generated description)
     style_dna: str = ""
@@ -293,6 +341,7 @@ class AuthorStyleProfile:
             "register_profile": self.register_profile.to_dict(),
             "delta_profile": self.delta_profile.to_dict(),
             "structure_profile": self.structure_profile.to_dict(),
+            "discourse_profile": self.discourse_profile.to_dict(),
             "style_dna": self.style_dna,
         }
 
@@ -308,6 +357,7 @@ class AuthorStyleProfile:
             register_profile=RegisterProfile.from_dict(data["register_profile"]),
             delta_profile=DeltaProfile.from_dict(data["delta_profile"]),
             structure_profile=SentenceStructureProfile.from_dict(data.get("structure_profile", {})),
+            discourse_profile=DiscourseRelationProfile.from_dict(data.get("discourse_profile", {})),
             style_dna=data.get("style_dna", ""),
         )
 

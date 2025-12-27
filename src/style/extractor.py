@@ -16,6 +16,7 @@ from .profile import (
     RegisterProfile,
     DeltaProfile,
     SentenceStructureProfile,
+    DiscourseRelationProfile,
     AuthorStyleProfile,
 )
 
@@ -67,6 +68,7 @@ class StyleProfileExtractor:
         register_profile = self._extract_register_profile(all_sentences, paragraphs)
         delta_profile = self._extract_delta_profile(all_sentences)
         structure_profile = self._extract_structure_profile(all_sentences)
+        discourse_profile = self._extract_discourse_profile(paragraphs)
 
         # Calculate totals
         word_count = sum(len(s.split()) for s in all_sentences)
@@ -85,6 +87,7 @@ class StyleProfileExtractor:
             register_profile=register_profile,
             delta_profile=delta_profile,
             structure_profile=structure_profile,
+            discourse_profile=discourse_profile,
         )
 
     def _extract_length_profile(self, sentences: List[str]) -> SentenceLengthProfile:
@@ -585,6 +588,174 @@ class StyleProfileExtractor:
                 capacity[struct] = default
 
         return capacity
+
+
+    def _extract_discourse_profile(self, paragraphs: List[str]) -> DiscourseRelationProfile:
+        """Extract discourse relations between sentences using spaCy.
+
+        Identifies PDTB-style relations:
+        - CONTRAST: Opposition (but, however, although, yet)
+        - CAUSE: Causal (because, so, therefore, thus)
+        - ELABORATION: Expansion (for example, specifically, that is)
+        - TEMPORAL: Time (then, after, before, when)
+        - CONTINUATION: Simple continuation (and, also, moreover)
+        """
+        relation_counts = Counter()
+        relation_samples = defaultdict(list)
+        connective_counts = defaultdict(Counter)
+        relations = []
+
+        max_samples = 5  # Sample sentence pairs per relation
+
+        for para in paragraphs:
+            sentences = split_into_sentences(para)
+            if len(sentences) < 2:
+                continue
+
+            for i in range(len(sentences) - 1):
+                sent1 = sentences[i]
+                sent2 = sentences[i + 1]
+
+                # Classify the relation between sent1 and sent2
+                relation, connective = self._classify_discourse_relation(sent2)
+                relations.append(relation)
+                relation_counts[relation] += 1
+
+                if connective:
+                    connective_counts[relation][connective] += 1
+
+                # Store sample pairs
+                if len(relation_samples[relation]) < max_samples:
+                    sanitized1 = self._sanitize_sample(self.nlp(sent1))
+                    sanitized2 = self._sanitize_sample(self.nlp(sent2))
+                    if sanitized1 and sanitized2:
+                        relation_samples[relation].append((sanitized1, sanitized2))
+
+        # Calculate distribution
+        total = len(relations)
+        relation_distribution = {
+            r: count / total for r, count in relation_counts.items()
+        } if total > 0 else {}
+
+        # Build relation transition Markov model
+        relation_transitions = self._build_relation_markov(relations)
+
+        # Normalize connective frequencies
+        relation_connectives = {}
+        for relation, counts in connective_counts.items():
+            total_conn = sum(counts.values())
+            relation_connectives[relation] = {
+                conn: count / total_conn for conn, count in counts.most_common(5)
+            }
+
+        return DiscourseRelationProfile(
+            relation_distribution=relation_distribution,
+            relation_transitions=relation_transitions,
+            relation_samples=dict(relation_samples),
+            relation_connectives=relation_connectives,
+        )
+
+    def _classify_discourse_relation(self, sentence: str) -> Tuple[str, Optional[str]]:
+        """Classify the discourse relation signaled by a sentence's opening.
+
+        Uses spaCy's POS and dependency parsing to identify discourse markers.
+        Returns (relation_type, connective_used).
+        """
+        doc = self.nlp(sentence)
+        if len(doc) < 2:
+            return ("continuation", None)
+
+        first_token = doc[0]
+        first_word = first_token.text.lower()
+        first_pos = first_token.pos_
+        first_dep = first_token.dep_
+
+        # Check for subordinating conjunctions (SCONJ)
+        if first_pos == 'SCONJ':
+            # Classify by the conjunction's typical meaning
+            # Check if it's adversative or causal based on dependency structure
+            head = first_token.head
+            if head.pos_ == 'VERB':
+                # Look for negation or contrast patterns
+                children_deps = {c.dep_ for c in head.children}
+                if 'neg' in children_deps:
+                    return ("contrast", first_word)
+
+            # Default SCONJ to causal (because, since, if, when)
+            # Check for temporal semantics
+            if any(child.ent_type_ in ('TIME', 'DATE') for child in doc):
+                return ("temporal", first_word)
+            return ("cause", first_word)
+
+        # Check for coordinating conjunctions (CCONJ)
+        if first_pos == 'CCONJ':
+            # Check morphological features and context
+            if first_token.lemma_.lower() in ('but', 'yet'):
+                return ("contrast", first_word)
+            return ("continuation", first_word)
+
+        # Check for adverbs (ADV) that signal discourse relations
+        if first_pos == 'ADV':
+            # Sentence-initial adverbs often signal logical relations
+            # Check the semantic context
+            head = first_token.head
+
+            # Check for contrast patterns
+            if first_dep == 'advmod' and head.pos_ == 'VERB':
+                # Look for negation or contrast indicators
+                children = list(head.children)
+                has_neg = any(c.dep_ == 'neg' for c in children)
+                if has_neg:
+                    return ("contrast", first_word)
+
+            return ("elaboration", first_word)
+
+        # Check for prepositional phrases that signal relations
+        if first_pos == 'ADP' and len(doc) >= 2:
+            prep = first_word
+            next_word = doc[1].text.lower() if len(doc) > 1 else ""
+            phrase = f"{prep} {next_word}"
+
+            # Classify by preposition
+            if prep in ('despite', 'notwithstanding'):
+                return ("contrast", phrase)
+            elif prep in ('because', 'due'):
+                return ("cause", phrase)
+            elif prep in ('before', 'after', 'during'):
+                return ("temporal", phrase)
+            elif prep == 'in' and next_word in ('addition', 'fact', 'contrast'):
+                if next_word == 'contrast':
+                    return ("contrast", phrase)
+                return ("elaboration", phrase)
+
+        # Default: continuation (no explicit discourse marker)
+        return ("continuation", None)
+
+    def _build_relation_markov(self, relations: List[str]) -> Dict[str, Dict[str, float]]:
+        """Build Order-1 Markov chain for discourse relation transitions."""
+        transitions = defaultdict(Counter)
+
+        for i in range(len(relations) - 1):
+            current = relations[i]
+            next_rel = relations[i + 1]
+            transitions[current][next_rel] += 1
+
+        # Normalize to probabilities
+        markov = {}
+        for current, next_counts in transitions.items():
+            total = sum(next_counts.values())
+            markov[current] = {
+                rel: count / total for rel, count in next_counts.items()
+            }
+
+        # Ensure all relation types have entries
+        all_relations = {"contrast", "cause", "elaboration", "temporal", "continuation"}
+        default_dist = {r: 0.2 for r in all_relations}
+        for rel in all_relations:
+            if rel not in markov:
+                markov[rel] = default_dist.copy()
+
+        return markov
 
 
 def extract_author_profile(

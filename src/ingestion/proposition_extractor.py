@@ -36,6 +36,11 @@ class PropositionNode:
     is_quotation: bool = False
     attached_citations: List[str] = field(default_factory=list)
 
+    # RST-like rhetorical role
+    rst_role: str = "nucleus"  # "nucleus" (main claim) or "satellite" (supporting)
+    rst_relation: str = "none"  # relation to previous: "example", "evidence", "elaboration", "contrast", "cause", "none"
+    parent_nucleus_idx: Optional[int] = None  # index of the nucleus this satellite supports
+
 
 class PropositionExtractor:
     """Extracts atomic propositions from text using dependency parsing.
@@ -85,6 +90,9 @@ class PropositionExtractor:
                 sentence, sent_idx, citations
             )
             propositions.extend(sent_propositions)
+
+        # Classify RST roles (nucleus vs satellite)
+        propositions = self.classify_rst_roles(propositions)
 
         logger.debug(
             f"Extracted {len(propositions)} propositions from {len(sentences)} sentences"
@@ -363,3 +371,116 @@ class PropositionExtractor:
                 if lemma not in keywords and len(lemma) > 2:
                     keywords.append(lemma)
         return keywords[:10]  # Limit to top 10
+
+    def classify_rst_roles(self, propositions: List[PropositionNode]) -> List[PropositionNode]:
+        """Classify propositions into nucleus (main claims) vs satellite (supporting).
+
+        Uses spaCy to identify rhetorical roles based on:
+        - Sentence position (first sentences often nuclei)
+        - Discourse markers (e.g., "for example", "because")
+        - Specificity (examples are more concrete/specific)
+
+        Args:
+            propositions: List of extracted propositions.
+
+        Returns:
+            Propositions with rst_role, rst_relation, and parent_nucleus_idx set.
+        """
+        if not propositions:
+            return propositions
+
+        last_nucleus_idx = 0
+
+        for i, prop in enumerate(propositions):
+            doc = self.nlp(prop.text)
+
+            # Classify based on discourse markers and position
+            role, relation = self._classify_rst_role(doc, i == 0)
+
+            prop.rst_role = role
+            prop.rst_relation = relation
+
+            if role == "nucleus":
+                last_nucleus_idx = i
+                prop.parent_nucleus_idx = None
+            else:
+                prop.parent_nucleus_idx = last_nucleus_idx
+
+        return propositions
+
+    def _classify_rst_role(self, doc, is_first: bool) -> Tuple[str, str]:
+        """Classify a single sentence's RST role.
+
+        Args:
+            doc: spaCy Doc object.
+            is_first: Whether this is the first sentence.
+
+        Returns:
+            Tuple of (role, relation) where role is "nucleus" or "satellite"
+            and relation is the type of connection.
+        """
+        text_lower = doc.text.lower()
+        first_token = doc[0] if doc else None
+
+        # Check for example markers - these are SATELLITES
+        example_markers = [
+            "for example", "for instance", "such as", "like",
+            "consider", "take", "imagine", "suppose"
+        ]
+        if any(marker in text_lower for marker in example_markers):
+            return ("satellite", "example")
+
+        # Check for evidence/citation markers - SATELLITES
+        if "[^" in doc.text or "according to" in text_lower or "studies show" in text_lower:
+            return ("satellite", "evidence")
+
+        # Check for discourse connectors at start
+        if first_token:
+            first_pos = first_token.pos_
+            first_lemma = first_token.lemma_.lower()
+
+            # Contrast markers often indicate satellite elaboration
+            if first_pos == "CCONJ" and first_lemma in ("but", "yet", "however"):
+                return ("satellite", "contrast")
+
+            # Causal markers - satellite providing reason
+            if first_pos == "SCONJ" and first_lemma in ("because", "since", "as"):
+                return ("satellite", "cause")
+
+            # Conditional - satellite
+            if first_lemma == "if":
+                return ("satellite", "condition")
+
+            # "This/These/That" referring back often indicates elaboration
+            if first_lemma in ("this", "these", "that", "such") and first_pos == "DET":
+                return ("satellite", "elaboration")
+
+        # Check for specific/concrete entities (examples tend to be more concrete)
+        named_entities = [ent for ent in doc.ents]
+        concrete_nouns = [t for t in doc if t.pos_ == "NOUN" and not t.is_stop]
+
+        # If sentence has specific named entities and isn't first, likely an example
+        if named_entities and not is_first:
+            # Check if entities are specific (person names, places, etc.)
+            specific_ent_types = {"PERSON", "ORG", "GPE", "LOC", "PRODUCT"}
+            if any(ent.label_ in specific_ent_types for ent in named_entities):
+                return ("satellite", "example")
+
+        # Modal verbs indicating claims/assertions are often nuclei
+        has_modal_claim = any(
+            t.tag_ == "MD" and t.lemma_ in ("must", "should", "will", "would", "can")
+            for t in doc
+        )
+        if has_modal_claim:
+            return ("nucleus", "none")
+
+        # First sentence is typically nucleus
+        if is_first:
+            return ("nucleus", "none")
+
+        # Default: check sentence complexity
+        # Short, direct sentences after nuclei are often elaborations
+        if len(doc) < 8:
+            return ("satellite", "elaboration")
+
+        return ("nucleus", "none")

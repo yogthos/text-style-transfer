@@ -242,20 +242,31 @@ class StyleVerifier:
         return score, issues
 
     def _check_transitions(self, sentences: List[str]) -> Tuple[float, List[str]]:
-        """Check transition word usage."""
+        """Check transition word usage at sentence START only."""
         issues = []
 
-        # Count sentences with transitions
+        # Count sentences that START with transitions
         transition_words = self.profile.transition_profile.get_all_transitions()
         if not transition_words:
             return 0.5, []  # No transition profile
 
         sentences_with_trans = 0
         for sentence in sentences:
-            if any(trans in sentence.lower() for trans in transition_words):
+            # Check only the first 1-3 words for transition markers
+            words = sentence.lower().split()[:3]
+            first_word = words[0] if words else ""
+            first_two = " ".join(words[:2]) if len(words) >= 2 else ""
+            first_three = " ".join(words[:3]) if len(words) >= 3 else ""
+
+            # Check if sentence STARTS with a transition (multi-word first)
+            if any(trans == first_three for trans in transition_words if " " in trans and len(trans.split()) == 3):
+                sentences_with_trans += 1
+            elif any(trans == first_two for trans in transition_words if " " in trans and len(trans.split()) == 2):
+                sentences_with_trans += 1
+            elif any(trans == first_word for trans in transition_words if " " not in trans):
                 sentences_with_trans += 1
 
-        actual_trans_ratio = sentences_with_trans / len(sentences)
+        actual_trans_ratio = sentences_with_trans / len(sentences) if sentences else 0
         target_trans_ratio = 1.0 - self.profile.transition_profile.no_transition_ratio
 
         ratio_diff = abs(actual_trans_ratio - target_trans_ratio)

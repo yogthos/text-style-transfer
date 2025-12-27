@@ -63,6 +63,7 @@ class GenerationState:
     previous_sentences: List[str] = field(default_factory=list)
     previous_length_category: str = "medium"
     previous_structure_type: str = "simple"  # Track sentence structure
+    previous_discourse_relation: str = "continuation"  # Track discourse flow
     used_transitions: Counter = field(default_factory=Counter)
     paragraph_lengths: List[int] = field(default_factory=list)
     target_burstiness: float = 0.5
@@ -72,6 +73,9 @@ class GenerationState:
     used_openings: set = field(default_factory=set)  # Sentence opening patterns
     mentioned_concepts: List[str] = field(default_factory=list)  # For implicit refs
     key_nouns: List[str] = field(default_factory=list)  # Nouns that can be pronominalized
+
+    # Source discourse relation for current sentence (to preserve logic)
+    required_discourse_relation: Optional[str] = None
 
 
 class EvolutionarySentenceGenerator:
@@ -126,6 +130,11 @@ class EvolutionarySentenceGenerator:
         self.structure_samples = profile.structure_profile.structure_samples
         self.structure_transitions = profile.structure_profile.structure_transitions
         self.proposition_capacity = profile.structure_profile.proposition_capacity
+
+        # Store discourse relation data for logic preservation
+        self.discourse_samples = profile.discourse_profile.relation_samples
+        self.discourse_transitions = profile.discourse_profile.relation_transitions
+        self.discourse_connectives = profile.discourse_profile.relation_connectives
 
     @property
     def nlp(self):
@@ -224,6 +233,75 @@ class EvolutionarySentenceGenerator:
                     break
 
         return content_words
+
+    def _classify_source_discourse_relation(self, prev_prop: str, curr_prop: str) -> str:
+        """Classify the discourse relation between two source propositions.
+
+        Uses spaCy to identify logical relationships.
+        """
+        if not prev_prop:
+            return "continuation"
+
+        # Parse both propositions
+        doc_prev = self.nlp(prev_prop)
+        doc_curr = self.nlp(curr_prop)
+
+        # Check first token of current proposition for discourse markers
+        if len(doc_curr) > 0:
+            first_token = doc_curr[0]
+            first_pos = first_token.pos_
+
+            if first_pos == 'CCONJ':
+                if first_token.lemma_.lower() in ('but', 'yet'):
+                    return "contrast"
+                return "continuation"
+
+            if first_pos == 'SCONJ':
+                return "cause"
+
+            if first_pos == 'ADV':
+                return "elaboration"
+
+        # Check for semantic contrast (opposing concepts)
+        prev_verbs = [t.lemma_ for t in doc_prev if t.pos_ == 'VERB']
+        curr_verbs = [t.lemma_ for t in doc_curr if t.pos_ == 'VERB']
+
+        # Check for negation patterns suggesting contrast
+        prev_has_neg = any(t.dep_ == 'neg' for t in doc_prev)
+        curr_has_neg = any(t.dep_ == 'neg' for t in doc_curr)
+
+        if prev_has_neg != curr_has_neg:
+            return "contrast"
+
+        # Default to elaboration if there's semantic similarity
+        return "elaboration"
+
+    def _get_discourse_connective(self, relation: str) -> Optional[str]:
+        """Get an appropriate connective for a discourse relation from the corpus."""
+        if not self.discourse_connectives or relation not in self.discourse_connectives:
+            return None
+
+        connectives = self.discourse_connectives[relation]
+        if not connectives:
+            return None
+
+        # Sample based on corpus frequency
+        items = list(connectives.items())
+        words = [w for w, _ in items]
+        probs = [p for _, p in items]
+
+        return random.choices(words, weights=probs)[0]
+
+    def _get_few_shot_example(self, relation: str) -> Optional[Tuple[str, str]]:
+        """Get a few-shot example sentence pair for a discourse relation."""
+        if not self.discourse_samples or relation not in self.discourse_samples:
+            return None
+
+        samples = self.discourse_samples[relation]
+        if not samples:
+            return None
+
+        return random.choice(samples)
 
     def _get_current_structure_type(self, state: GenerationState) -> str:
         """Select next sentence structure type using Markov model."""
@@ -341,12 +419,14 @@ class EvolutionarySentenceGenerator:
         proposition: str,
         state: GenerationState,
         position: int,
+        style_hint: str = "",
     ) -> Tuple[str, GenerationState]:
         """Generate a sentence using evolutionary optimization.
 
         Args:
             proposition: What to express.
             state: Current generation state.
+            style_hint: Additional context for style guidance.
             position: Position in paragraph.
 
         Returns:
@@ -369,12 +449,12 @@ class EvolutionarySentenceGenerator:
 
         # Generate initial population
         population = self._generate_initial_population(
-            proposition, state, target_length, transition_word
+            proposition, state, target_length, transition_word, style_hint
         )
 
         # Evolve population
         best_candidate = self._evolve_population(
-            population, proposition, state, target_length, transition_word
+            population, proposition, state, target_length, transition_word, style_hint
         )
 
         # Update state
@@ -441,13 +521,14 @@ class EvolutionarySentenceGenerator:
         state: GenerationState,
         target_length: int,
         transition_word: Optional[str],
+        style_hint: str = "",
     ) -> List[Candidate]:
         """Generate initial population of diverse candidates."""
         population = []
 
         # Generate diverse prompts with different instructions
         prompt_variants = self._create_prompt_variants(
-            proposition, state, target_length, transition_word
+            proposition, state, target_length, transition_word, style_hint
         )
 
         for i, prompt in enumerate(prompt_variants[:self.population_size]):
@@ -471,18 +552,22 @@ class EvolutionarySentenceGenerator:
         state: GenerationState,
         target_length: int,
         transition_word: Optional[str],
+        style_hint: str = "",
     ) -> List[str]:
         """Create diverse prompt variants for population diversity."""
         variants = []
 
+        # Build context hint from RST/entity info
+        base_hint = style_hint if style_hint else "Write naturally, varying structure from previous sentences."
+
         # Variant 1: Standard prompt with full context
         variants.append(self._build_prompt(
             proposition, target_length, transition_word, state,
-            style_hint="Write naturally, varying structure from previous sentences."
+            style_hint=base_hint
         ))
 
-        # Variant 2: Emphasize length
-        length_hint = f"The sentence MUST be exactly {target_length} words."
+        # Variant 2: Emphasize length with context
+        length_hint = f"{base_hint} The sentence MUST be exactly {target_length} words."
         variants.append(self._build_prompt(
             proposition, target_length, transition_word, state,
             style_hint=length_hint
@@ -523,8 +608,20 @@ class EvolutionarySentenceGenerator:
         state: GenerationState,
         style_hint: str = "",
     ) -> str:
-        """Build a generation prompt with full context awareness."""
+        """Build a generation prompt with full context awareness and discourse preservation."""
         parts = []
+
+        # Get required discourse relation (preserving source logic)
+        discourse_relation = state.required_discourse_relation or "continuation"
+
+        # Add few-shot example from corpus for this discourse relation
+        if discourse_relation != "continuation":
+            example = self._get_few_shot_example(discourse_relation)
+            if example:
+                parts.append("EXAMPLE of the required logical flow:")
+                parts.append(f"  Previous: \"{example[0]}\"")
+                parts.append(f"  Current ({discourse_relation.upper()}): \"{example[1]}\"")
+                parts.append("")
 
         # Context from previous sentences
         context_constraints = self._build_context_constraints(state)
@@ -534,14 +631,27 @@ class EvolutionarySentenceGenerator:
         parts.append(f"Write ONE SINGLE sentence expressing: {proposition}")
         parts.append(f"REQUIRED: The sentence must be {target_length} words (minimum {max(10, target_length - 5)} words)")
 
-        if transition_word:
+        # Discourse relation guidance - balance source logic with target author's style
+        # Critical relations (contrast, cause) take priority; others respect transition decision
+        if discourse_relation == "contrast":
+            # CONTRAST is critical for logic - always signal it
+            connective = self._get_discourse_connective("contrast")
+            if connective:
+                parts.append(f"This sentence CONTRASTS with the previous. Start with: \"{connective.capitalize()}\"")
+            else:
+                parts.append("This sentence CONTRASTS with the previous (show opposition or concession)")
+        elif discourse_relation == "cause" and transition_word:
+            # CAUSE - only if we're allowed to use a transition
+            parts.append(f"This sentence shows CAUSE/RESULT. Start with: \"{transition_word.capitalize()}\"")
+        elif transition_word:
+            # We're allowed a transition - use the selected word
             parts.append(f"Start with: \"{transition_word.capitalize()}\"")
         else:
-            parts.append("Do NOT start with a transition word (but, however, so, etc.)")
+            # No transition allowed - flow naturally without explicit markers
+            parts.append("Do NOT start with a transition word (but, however, so, therefore, etc.)")
 
-        # Style guidance - use actual samples from corpus instead of hardcoded phrases
+        # Style guidance - use actual samples from corpus
         if hasattr(self, 'structure_samples') and self.structure_samples:
-            # Get a sample sentence of similar structure for style reference
             structure_type = self._get_current_structure_type(state)
             if structure_type in self.structure_samples and self.structure_samples[structure_type]:
                 sample = random.choice(self.structure_samples[structure_type])
@@ -561,12 +671,13 @@ class EvolutionarySentenceGenerator:
         state: GenerationState,
         target_length: int,
         transition_word: Optional[str],
+        style_hint: str = "",
     ) -> Candidate:
         """Evolve population through selection and mutation."""
         if not population:
             # Fallback: generate a single candidate
             prompt = self._build_prompt(
-                proposition, target_length, transition_word, state, ""
+                proposition, target_length, transition_word, state, style_hint
             )
             text = self._clean_sentence(self.llm_generate(prompt))
             return self._evaluate_candidate(text, target_length, transition_word, state)
@@ -867,14 +978,20 @@ class EvolutionaryParagraphGenerator:
     def generate_paragraph(
         self,
         propositions: List[str],
+        rst_info: Optional[List[dict]] = None,
     ) -> str:
-        """Generate a paragraph from propositions.
+        """Generate a paragraph from propositions with RST awareness.
 
-        Uses the structure Markov model to determine sentence types,
-        and batches propositions based on structure capacity.
+        Uses RST nucleus-satellite structure to maintain coherence.
+        Satellites (examples, evidence) reference their parent nuclei.
 
         Args:
             propositions: List of propositions to express.
+            rst_info: Optional RST info for each proposition with keys:
+                - role: "nucleus" or "satellite"
+                - relation: type of relation (example, evidence, contrast, etc.)
+                - parent_idx: index of parent nucleus for satellites
+                - entities: list of entities in the proposition
 
         Returns:
             Generated paragraph text.
@@ -886,35 +1003,74 @@ class EvolutionaryParagraphGenerator:
             target_burstiness=self.profile.length_profile.burstiness
         )
         sentences = []
-        prop_index = 0
         sentence_position = 0
 
-        while prop_index < len(propositions):
-            # Determine next sentence structure type
-            structure_type = self.generator._get_current_structure_type(state)
+        # Track generated sentences by proposition index for back-references
+        generated_by_prop_idx = {}
+        # Track entity mentions for coherent references
+        mentioned_entities = set()
 
-            # Get proposition capacity for this structure
-            capacity = self.generator.proposition_capacity.get(structure_type, 1)
-
-            # Take appropriate number of propositions
-            prop_batch = propositions[prop_index:prop_index + capacity]
-            prop_index += len(prop_batch)
-
-            # Combine propositions for this sentence
-            if len(prop_batch) == 1:
-                combined_prop = prop_batch[0]
+        for prop_idx, proposition in enumerate(propositions):
+            # Get RST info for this proposition
+            if rst_info and prop_idx < len(rst_info):
+                rst = rst_info[prop_idx]
+                role = rst.get("role", "nucleus")
+                relation = rst.get("relation", "none")
+                parent_idx = rst.get("parent_idx")
+                prop_entities = rst.get("entities", [])
             else:
-                # Join multiple propositions for complex/compound sentences
-                combined_prop = " AND ".join(prop_batch)
+                role = "nucleus"
+                relation = "none"
+                parent_idx = None
+                prop_entities = []
 
-            # Generate the sentence
+            # Set discourse relation from RST
+            if relation != "none" and sentence_position > 0:
+                # Map RST relations to discourse relations
+                relation_map = {
+                    "example": "elaboration",
+                    "evidence": "cause",
+                    "elaboration": "elaboration",
+                    "contrast": "contrast",
+                    "cause": "cause",
+                    "condition": "cause",
+                }
+                state.required_discourse_relation = relation_map.get(relation, "continuation")
+            else:
+                state.required_discourse_relation = None
+
+            # Build context hint for satellites that reference nuclei
+            context_hint = ""
+            if role == "satellite" and parent_idx is not None and parent_idx in generated_by_prop_idx:
+                parent_sentence = generated_by_prop_idx[parent_idx]
+                # Tell LLM to connect back to the parent claim
+                if relation == "example":
+                    context_hint = f"This is an EXAMPLE supporting: \"{parent_sentence[:60]}...\". Connect it clearly."
+                elif relation == "evidence":
+                    context_hint = f"This provides EVIDENCE for: \"{parent_sentence[:60]}...\". Reference the claim."
+                elif relation == "elaboration":
+                    context_hint = f"This ELABORATES on: \"{parent_sentence[:60]}...\". Expand naturally."
+
+            # Add entity context for coherent references
+            if mentioned_entities and prop_entities:
+                shared = mentioned_entities.intersection(set(prop_entities))
+                if shared:
+                    context_hint += f" Entities already mentioned: {', '.join(list(shared)[:3])}"
+
+            # Generate the sentence with context
             sentence, state = self.generator.generate_sentence(
-                proposition=combined_prop,
+                proposition=proposition,
                 state=state,
                 position=sentence_position,
+                style_hint=context_hint,
             )
+
             sentences.append(sentence)
+            generated_by_prop_idx[prop_idx] = sentence
             sentence_position += 1
+
+            # Update mentioned entities
+            mentioned_entities.update(prop_entities)
 
         paragraph = " ".join(sentences)
 

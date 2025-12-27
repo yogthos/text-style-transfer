@@ -335,6 +335,10 @@ class AuthorStyleProfile:
     structure_profile: SentenceStructureProfile = field(default_factory=SentenceStructureProfile)
     discourse_profile: DiscourseRelationProfile = field(default_factory=DiscourseRelationProfile)
 
+    # Human writing patterns (for humanization)
+    human_patterns: Dict = field(default_factory=dict)
+    # Contains: fragments, questions, asides, dash_patterns, short_sentences, etc.
+
     # Style DNA (generated description)
     style_dna: str = ""
 
@@ -350,6 +354,7 @@ class AuthorStyleProfile:
             "delta_profile": self.delta_profile.to_dict(),
             "structure_profile": self.structure_profile.to_dict(),
             "discourse_profile": self.discourse_profile.to_dict(),
+            "human_patterns": self.human_patterns,
             "style_dna": self.style_dna,
         }
 
@@ -366,6 +371,7 @@ class AuthorStyleProfile:
             delta_profile=DeltaProfile.from_dict(data["delta_profile"]),
             structure_profile=SentenceStructureProfile.from_dict(data.get("structure_profile", {})),
             discourse_profile=DiscourseRelationProfile.from_dict(data.get("discourse_profile", {})),
+            human_patterns=data.get("human_patterns", {}),
             style_dna=data.get("style_dna", ""),
         )
 

@@ -19,6 +19,8 @@ from ..style.profile import AuthorStyleProfile
 from ..style.verifier import StyleVerifier
 from ..utils.nlp import get_nlp, split_into_sentences
 from ..utils.logging import get_logger
+from ..humanization.pattern_injector import PatternInjector, HumanizationConfig
+from ..humanization.corpus_patterns import HumanPatterns
 
 logger = get_logger(__name__)
 
@@ -141,6 +143,41 @@ class EvolutionarySentenceGenerator:
         self.discourse_samples = profile.discourse_profile.relation_samples
         self.discourse_transitions = profile.discourse_profile.relation_transitions
         self.discourse_connectives = profile.discourse_profile.relation_connectives
+
+        # Initialize humanization pattern injector from profile
+        self.pattern_injector = self._create_pattern_injector(profile.human_patterns)
+
+    def _create_pattern_injector(self, human_patterns: Dict) -> PatternInjector:
+        """Create PatternInjector from profile's human_patterns dict."""
+        if not human_patterns:
+            logger.info("No human patterns in profile, using default humanization config")
+            return PatternInjector(patterns=None, config=HumanizationConfig())
+
+        # Reconstruct HumanPatterns from dict
+        patterns = HumanPatterns(
+            fragments=human_patterns.get("fragments", []),
+            questions=human_patterns.get("questions", []),
+            asides=human_patterns.get("asides", []),
+            dash_patterns=human_patterns.get("dash_patterns", []),
+            colloquialisms=human_patterns.get("colloquialisms", []),
+            short_sentences=human_patterns.get("short_sentences", []),
+            long_sentences=human_patterns.get("long_sentences", []),
+            unconventional_openers=human_patterns.get("unconventional_openers", []),
+            fragment_ratio=human_patterns.get("fragment_ratio", 0.0),
+            question_ratio=human_patterns.get("question_ratio", 0.0),
+            dash_ratio=human_patterns.get("dash_ratio", 0.0),
+            short_ratio=human_patterns.get("short_ratio", 0.0),
+            long_ratio=human_patterns.get("long_ratio", 0.0),
+        )
+
+        logger.info(
+            f"Initialized humanization from corpus: "
+            f"fragments={len(patterns.fragments)}, "
+            f"questions={len(patterns.questions)}, "
+            f"dashes={len(patterns.dash_patterns)}"
+        )
+
+        return PatternInjector(patterns=patterns)
 
     @property
     def nlp(self):
@@ -306,9 +343,14 @@ class EvolutionarySentenceGenerator:
 
         return random.choice(samples)
 
-    def _get_current_structure_type(self, state: GenerationState) -> str:
-        """Select next sentence structure type using Markov model."""
+    def _get_target_structure_type(self, state: GenerationState) -> str:
+        """Select next sentence structure type using Markov model.
+
+        Uses the structure transition probabilities to determine
+        what type of sentence to generate next.
+        """
         if not self.structure_transitions:
+            logger.debug("[STRUCTURE] No transitions available, defaulting to simple")
             return "simple"
 
         prev_type = state.previous_structure_type
@@ -322,7 +364,13 @@ class EvolutionarySentenceGenerator:
         # Sample from transition probabilities
         types = list(transitions.keys())
         probs = [transitions[t] for t in types]
-        return random.choices(types, weights=probs)[0]
+        selected = random.choices(types, weights=probs)[0]
+
+        logger.debug(
+            f"[STRUCTURE] Markov: {prev_type} -> {selected} "
+            f"(probs: {dict(zip(types, [f'{p:.2f}' for p in probs]))})"
+        )
+        return selected
 
     def _classify_generated_structure(self, text: str) -> str:
         """Classify the structure of a generated sentence."""
@@ -417,12 +465,22 @@ class EvolutionarySentenceGenerator:
         selected = random.choices(words, weights=adjusted_weights)[0]
         return True, selected
 
+    def _get_position_label(self, position: int, total_positions: int = 5) -> str:
+        """Convert numeric position to label for humanization."""
+        if position == 0:
+            return "start"
+        elif position >= total_positions - 1:
+            return "end"
+        else:
+            return "middle"
+
     def generate_sentence(
         self,
         proposition: str,
         state: GenerationState,
         position: int,
         style_hint: str = "",
+        total_sentences: int = 5,
     ) -> Tuple[str, GenerationState]:
         """Generate a sentence using evolutionary optimization.
 
@@ -431,6 +489,7 @@ class EvolutionarySentenceGenerator:
             state: Current generation state.
             style_hint: Additional context for style guidance.
             position: Position in paragraph.
+            total_sentences: Expected total sentences in paragraph.
 
         Returns:
             Tuple of (best_sentence, updated_state).
@@ -439,25 +498,39 @@ class EvolutionarySentenceGenerator:
         target_length, length_category = self.select_target_length(state)
         use_transition, transition_word = self.should_use_transition(position, state)
 
-        # Check if we need more burstiness
+        # Get humanization pattern request
+        position_label = self._get_position_label(position, total_sentences)
+        pattern_request = self.pattern_injector.get_pattern_request(position_label)
+
+        # Apply humanization burstiness modification
+        target_length = self.pattern_injector.modify_length_target(target_length, position_label)
+
+        # Check if we need more burstiness (on top of humanization)
         need_length_variation = self._check_burstiness_pressure(state, target_length)
         if need_length_variation:
             # Force a different length category to increase burstiness
             target_length = self._adjust_for_burstiness(state, target_length)
 
-        logger.debug(
-            f"Generating sentence: target_length={target_length}, "
-            f"transition={transition_word}, position={position}"
+        logger.info(
+            f"[GEN] Position {position}: target_length={target_length}, "
+            f"category={length_category}, transition={transition_word or 'none'}"
         )
+        logger.debug(f"[GEN] Proposition: {proposition[:80]}...")
+        if pattern_request:
+            logger.debug(f"[GEN] Humanization: {pattern_request}")
 
         # Generate initial population
         population = self._generate_initial_population(
-            proposition, state, target_length, transition_word, style_hint
+            proposition, state, target_length, transition_word, style_hint, pattern_request
         )
+
+        logger.debug(f"[GEN] Initial population: {len(population)} candidates")
+        for i, c in enumerate(population[:3]):
+            logger.debug(f"[GEN]   [{i}] len={c.word_count} fit={c.total_fitness:.2f}: {c.text[:50]}...")
 
         # Evolve population
         best_candidate = self._evolve_population(
-            population, proposition, state, target_length, transition_word, style_hint
+            population, proposition, state, target_length, transition_word, style_hint, pattern_request
         )
 
         # Update state
@@ -465,11 +538,14 @@ class EvolutionarySentenceGenerator:
             state, best_candidate.text, length_category, transition_word
         )
 
-        logger.debug(
-            f"Best candidate: fitness={best_candidate.total_fitness:.3f}, "
-            f"length={best_candidate.word_count}/{target_length}, "
-            f"generation={best_candidate.generation}"
+        # Detailed logging of result
+        length_diff = abs(best_candidate.word_count - target_length)
+        length_status = "OK" if length_diff <= 3 else f"MISS by {length_diff}"
+        logger.info(
+            f"[GEN] Result: len={best_candidate.word_count}/{target_length} ({length_status}), "
+            f"fitness={best_candidate.total_fitness:.2f}"
         )
+        logger.debug(f"[GEN] Output: {best_candidate.text}")
 
         return best_candidate.text, new_state
 
@@ -525,13 +601,14 @@ class EvolutionarySentenceGenerator:
         target_length: int,
         transition_word: Optional[str],
         style_hint: str = "",
+        pattern_request: Optional[str] = None,
     ) -> List[Candidate]:
         """Generate initial population of diverse candidates."""
         population = []
 
         # Generate diverse prompts with different instructions
         prompt_variants = self._create_prompt_variants(
-            proposition, state, target_length, transition_word, style_hint
+            proposition, state, target_length, transition_word, style_hint, pattern_request
         )
 
         for i, prompt in enumerate(prompt_variants[:self.population_size]):
@@ -556,51 +633,54 @@ class EvolutionarySentenceGenerator:
         target_length: int,
         transition_word: Optional[str],
         style_hint: str = "",
+        pattern_request: Optional[str] = None,
     ) -> List[str]:
         """Create diverse prompt variants for population diversity.
 
         Style comes ONLY from corpus samples - no hardcoded style descriptions.
         Variants differ only in target length (for burstiness) and structural constraints.
+        Humanization patterns (fragments, questions, dashes) are injected for variety.
         """
         variants = []
 
         # Pass through any RST/entity context hints (these are content, not style)
         context_hint = style_hint if style_hint else ""
 
-        # Variant 1: Standard prompt with base target length
+        # Variant 1: Standard prompt with base target length + humanization pattern
         variants.append(self._build_prompt(
             proposition, target_length, transition_word, state,
-            style_hint=context_hint
+            style_hint=context_hint, pattern_request=pattern_request
         ))
 
-        # Variant 2: Emphasize exact length (no style hint, just constraint)
+        # Variant 2: Emphasize exact length with pattern
+        length_hint = f"{context_hint} EXACTLY {target_length} words." if context_hint else f"EXACTLY {target_length} words."
         variants.append(self._build_prompt(
             proposition, target_length, transition_word, state,
-            style_hint=f"{context_hint} EXACTLY {target_length} words." if context_hint else f"EXACTLY {target_length} words."
+            style_hint=length_hint, pattern_request=pattern_request
         ))
 
-        # Variant 3: Shorter target (for burstiness variation)
+        # Variant 3: Shorter target (for burstiness variation) with pattern
         variants.append(self._build_prompt(
             proposition, max(8, target_length - 8), transition_word, state,
-            style_hint=context_hint
+            style_hint=context_hint, pattern_request=pattern_request
         ))
 
-        # Variant 4: Longer target (for burstiness variation)
+        # Variant 4: Longer target (for burstiness variation) with pattern
         variants.append(self._build_prompt(
             proposition, target_length + 10, transition_word, state,
-            style_hint=context_hint
+            style_hint=context_hint, pattern_request=pattern_request
         ))
 
-        # Variant 5: Much longer (for high burstiness authors)
+        # Variant 5: Much longer (for high burstiness authors) with pattern
         variants.append(self._build_prompt(
             proposition, min(50, target_length + 20), transition_word, state,
-            style_hint=context_hint
+            style_hint=context_hint, pattern_request=pattern_request
         ))
 
-        # Variant 6: Different structure sample selection (add a few more corpus samples)
+        # Variant 6: Without pattern request (for diversity)
         variants.append(self._build_prompt(
             proposition, target_length, transition_word, state,
-            style_hint=context_hint
+            style_hint=context_hint, pattern_request=None
         ))
 
         return variants
@@ -612,59 +692,96 @@ class EvolutionarySentenceGenerator:
         transition_word: Optional[str],
         state: GenerationState,
         style_hint: str = "",
+        pattern_request: Optional[str] = None,
     ) -> str:
-        """Build a generation prompt using corpus examples only - no hardcoded style."""
+        """Build a generation prompt using corpus examples only - no hardcoded style.
+
+        Humanization patterns (fragments, questions, dashes) are injected to
+        address AI detection signals like mechanical precision and predictable syntax.
+        """
         parts = []
 
-        # Show corpus examples as the ONLY style definition
-        parts.append("STYLE EXAMPLES (match this exactly):")
+        # Determine target structure type from Markov model
+        target_structure = self._get_target_structure_type(state)
+
+        # Show corpus examples for STRUCTURE/RHYTHM only
+        parts.append(f"STYLE REFERENCE (target: {target_structure} sentence):")
         parts.append("")
 
-        # Add MORE corpus samples - 6-8 instead of 4
+        # Select samples matching target structure type - focused selection
         samples_shown = 0
-        all_samples = []
-        if hasattr(self, 'structure_samples') and self.structure_samples:
-            for struct_type in ['simple', 'compound', 'complex', 'compound_complex']:
-                if struct_type in self.structure_samples and self.structure_samples[struct_type]:
-                    # Get 2 samples from each type
-                    samples = self.structure_samples[struct_type]
-                    for sample in random.sample(samples, min(2, len(samples))):
-                        all_samples.append(sample)
+        selected_samples = []
 
-        # Shuffle and show up to 8
-        random.shuffle(all_samples)
-        for sample in all_samples[:8]:
+        if hasattr(self, 'structure_samples') and self.structure_samples:
+            # First, try to get samples matching target structure
+            if target_structure in self.structure_samples and self.structure_samples[target_structure]:
+                available = self.structure_samples[target_structure]
+                selected_samples = random.sample(available, min(3, len(available)))
+                logger.debug(f"[SAMPLE] Selected {len(selected_samples)} {target_structure} samples")
+
+            # If not enough, fill from other types
+            if len(selected_samples) < 2:
+                for struct_type in ['simple', 'compound', 'complex']:
+                    if struct_type != target_structure and struct_type in self.structure_samples:
+                        available = self.structure_samples[struct_type]
+                        if available:
+                            selected_samples.append(random.choice(available))
+                            if len(selected_samples) >= 3:
+                                break
+
+        for sample in selected_samples[:3]:
             parts.append(f'"{sample}"')
             samples_shown += 1
+            logger.debug(f"[SAMPLE] Using: {sample[:60]}...")
 
         if samples_shown == 0:
             parts.append("(No style samples available)")
+            logger.warning("[SAMPLE] No style samples available!")
 
         parts.append("")
+        parts.append("(Match the sentence RHYTHM and STRUCTURE above, not the topics.)")
         parts.append("---")
 
         # Context from previous sentences
         if state.previous_sentences:
             parts.append(f"Previous: \"{state.previous_sentences[-1]}\"")
 
-        # The task
-        parts.append(f"Idea: {proposition}")
-        parts.append(f"Length: {target_length} words")
+        # The task - STRICT content preservation
+        parts.append("")
+        parts.append("CONTENT TO EXPRESS (do not add, remove, or change meaning):")
+        parts.append(f'"{proposition}"')
+        parts.append("")
+        parts.append(f"Length: ~{target_length} words")
 
         # Transition guidance from corpus data
+        # IMPORTANT: Only add transition if explicitly requested (76.7% should have NO transition)
         discourse_relation = state.required_discourse_relation or "continuation"
+        has_explicit_transition = False
+
         if discourse_relation == "contrast":
             connective = self._get_discourse_connective("contrast")
             if connective:
                 parts.append(f"Start with: \"{connective.capitalize()}\"")
+                has_explicit_transition = True
         elif transition_word:
             parts.append(f"Start with: \"{transition_word.capitalize()}\"")
+            has_explicit_transition = True
+
+        # If no transition requested, explicitly tell LLM not to add one
+        if not has_explicit_transition:
+            parts.append("Do NOT start with a transition word (no 'So', 'But', 'However', etc.)")
 
         if style_hint:
             parts.append(style_hint)
 
+        # HUMANIZATION: Add pattern request if available
+        # This addresses AI detection signals by requesting human writing patterns
+        if pattern_request:
+            parts.append(f"Structure: {pattern_request}")
+
         parts.append("")
-        parts.append("Write ONE sentence in the EXACT same style as the examples:")
+        parts.append("CRITICAL: Express ONLY the idea above. Do not add new concepts, examples, or embellishments.")
+        parts.append("Write ONE sentence matching the style examples:")
 
         return "\n".join(parts)
 
@@ -676,12 +793,14 @@ class EvolutionarySentenceGenerator:
         target_length: int,
         transition_word: Optional[str],
         style_hint: str = "",
+        pattern_request: Optional[str] = None,
     ) -> Candidate:
         """Evolve population through selection and mutation."""
         if not population:
             # Fallback: generate a single candidate
             prompt = self._build_prompt(
-                proposition, target_length, transition_word, state, style_hint
+                proposition, target_length, transition_word, state, style_hint,
+                pattern_request=pattern_request
             )
             text = self._clean_sentence(self.llm_generate(prompt))
             return self._evaluate_candidate(text, target_length, transition_word, state)
@@ -717,7 +836,8 @@ class EvolutionarySentenceGenerator:
             # Fill remaining slots with new random candidates if needed
             while len(population) < self.population_size:
                 prompt = random.choice(self._create_prompt_variants(
-                    proposition, state, target_length, transition_word
+                    proposition, state, target_length, transition_word,
+                    pattern_request=pattern_request
                 ))
                 try:
                     text = self._clean_sentence(self.llm_generate(prompt))
@@ -981,8 +1101,8 @@ class EvolutionaryParagraphGenerator:
     ) -> str:
         """Generate a paragraph from propositions with RST awareness.
 
-        Uses RST nucleus-satellite structure to maintain coherence.
-        Satellites (examples, evidence) reference their parent nuclei.
+        KEY: Groups propositions based on target sentence structure complexity.
+        A compound_complex sentence might combine 3-4 propositions.
 
         Args:
             propositions: List of propositions to express.
@@ -991,6 +1111,7 @@ class EvolutionaryParagraphGenerator:
                 - relation: type of relation (example, evidence, contrast, etc.)
                 - parent_idx: index of parent nucleus for satellites
                 - entities: list of entities in the proposition
+                - citations: list of citations attached to proposition
 
         Returns:
             Generated paragraph text.
@@ -998,99 +1119,168 @@ class EvolutionaryParagraphGenerator:
         if not propositions:
             return ""
 
+        logger.info(f"[PARA] Generating paragraph from {len(propositions)} propositions")
+
         state = GenerationState(
             target_burstiness=self.profile.length_profile.burstiness
         )
         sentences = []
         sentence_position = 0
 
-        # Track generated sentences by proposition index for back-references
-        generated_by_prop_idx = {}
-        # Track entity mentions for coherent references
+        # Track entity mentions for coherent references (implicit refs)
         mentioned_entities = set()
+        mentioned_nouns = []
 
-        for prop_idx, proposition in enumerate(propositions):
-            # Get RST info for this proposition
-            if rst_info and prop_idx < len(rst_info):
-                rst = rst_info[prop_idx]
-                role = rst.get("role", "nucleus")
-                relation = rst.get("relation", "none")
-                parent_idx = rst.get("parent_idx")
-                prop_entities = rst.get("entities", [])
+        # Group propositions based on target structure complexity
+        prop_groups = self._group_propositions(propositions, rst_info, state)
+
+        logger.info(f"[PARA] Grouped into {len(prop_groups)} sentence groups")
+
+        for group_idx, group in enumerate(prop_groups):
+            group_props = group["propositions"]
+            group_rst = group.get("rst_info", [])
+            target_structure = group["target_structure"]
+            citations = group.get("citations", [])
+
+            logger.debug(
+                f"[PARA] Group {group_idx}: {len(group_props)} props, "
+                f"structure={target_structure}, citations={citations}"
+            )
+
+            # Combine propositions into a single content block
+            if len(group_props) == 1:
+                combined_content = group_props[0]
             else:
-                role = "nucleus"
-                relation = "none"
-                parent_idx = None
-                prop_entities = []
+                # Join with semicolons or logical connectors for LLM to reformulate
+                combined_content = "; ".join(group_props)
 
-            # Set discourse relation from RST
-            if relation != "none" and sentence_position > 0:
-                # Map RST relations to discourse relations
-                relation_map = {
-                    "example": "elaboration",
-                    "evidence": "cause",
-                    "elaboration": "elaboration",
-                    "contrast": "contrast",
-                    "cause": "cause",
-                    "condition": "cause",
-                }
-                state.required_discourse_relation = relation_map.get(relation, "continuation")
+            # Build context hint for implicit references
+            context_hint = ""
+            if mentioned_nouns:
+                # Suggest using implicit references to previously mentioned concepts
+                recent_nouns = mentioned_nouns[-5:]
+                context_hint = f"[Can refer to: {', '.join(recent_nouns)}]"
+
+            # Add RST context if satellite
+            if group_rst:
+                primary_rst = group_rst[0]
+                relation = primary_rst.get("relation", "none")
+                if relation != "none" and sentence_position > 0:
+                    state.required_discourse_relation = relation
             else:
                 state.required_discourse_relation = None
 
-            # Build context hint for satellites that reference nuclei
-            # This is content structure, not style - tells LLM what this sentence relates to
-            context_hint = ""
-            if role == "satellite" and parent_idx is not None and parent_idx in generated_by_prop_idx:
-                parent_sentence = generated_by_prop_idx[parent_idx]
-                # Provide the logical relationship context (not style instructions)
-                if relation == "example":
-                    context_hint = f"[Example of: \"{parent_sentence[:60]}...\"]"
-                elif relation == "evidence":
-                    context_hint = f"[Evidence for: \"{parent_sentence[:60]}...\"]"
-                elif relation == "elaboration":
-                    context_hint = f"[Elaboration of: \"{parent_sentence[:60]}...\"]"
+            # Add citation to content if present
+            if citations:
+                combined_content += f" {' '.join(citations)}"
 
-            # Add entity context for coherent references
-            if mentioned_entities and prop_entities:
-                shared = mentioned_entities.intersection(set(prop_entities))
-                if shared:
-                    context_hint += f" Entities already mentioned: {', '.join(list(shared)[:3])}"
-
-            # Generate the sentence with context
+            # Generate the sentence
             sentence, state = self.generator.generate_sentence(
-                proposition=proposition,
+                proposition=combined_content,
                 state=state,
                 position=sentence_position,
                 style_hint=context_hint,
+                total_sentences=len(prop_groups),
             )
+
+            # Validate citation preservation
+            if citations:
+                missing_citations = [c for c in citations if c not in sentence]
+                if missing_citations:
+                    logger.warning(f"[PARA] Missing citations: {missing_citations}")
+                    # Append missing citations
+                    sentence = sentence.rstrip('.!?') + ' ' + ' '.join(missing_citations) + '.'
 
             # Prevent duplicate sentences
             if sentences and sentence.strip() == sentences[-1].strip():
-                logger.warning(f"Duplicate sentence detected, regenerating...")
-                # Try once more - the state already tracks used phrases to avoid repetition
+                logger.warning(f"[PARA] Duplicate sentence detected, regenerating...")
                 sentence, state = self.generator.generate_sentence(
-                    proposition=proposition,
+                    proposition=combined_content,
                     state=state,
                     position=sentence_position,
                     style_hint=context_hint,
+                    total_sentences=len(prop_groups),
                 )
 
             sentences.append(sentence)
-            generated_by_prop_idx[prop_idx] = sentence
             sentence_position += 1
 
-            # Update mentioned entities
-            mentioned_entities.update(prop_entities)
+            # Update mentioned entities for implicit references
+            for rst in group_rst:
+                mentioned_entities.update(rst.get("entities", []))
+
+            # Extract nouns from generated sentence for future implicit refs
+            new_nouns = self.generator._extract_key_nouns(sentence)
+            mentioned_nouns.extend(new_nouns)
 
         paragraph = " ".join(sentences)
 
         # Verify and log
         verification = self.verifier.verify_paragraph(paragraph)
-        if not verification.is_acceptable:
-            logger.warning(
-                f"Paragraph verification: score={verification.overall_score:.2f}, "
-                f"issues={verification.issues}"
-            )
+        logger.info(
+            f"[PARA] Result: {len(sentences)} sentences, "
+            f"score={verification.overall_score:.2f}, "
+            f"issues={verification.issues if verification.issues else 'none'}"
+        )
 
         return paragraph
+
+    def _group_propositions(
+        self,
+        propositions: List[str],
+        rst_info: Optional[List[dict]],
+        state: GenerationState,
+    ) -> List[dict]:
+        """Group propositions based on target sentence structure complexity.
+
+        Uses Markov model to determine structure type, then groups
+        propositions according to the capacity of that structure.
+        """
+        if not propositions:
+            return []
+
+        groups = []
+        prop_idx = 0
+        capacity_map = self.profile.structure_profile.proposition_capacity
+
+        while prop_idx < len(propositions):
+            # Determine target structure using Markov model
+            target_structure = self.generator._get_target_structure_type(state)
+            capacity = capacity_map.get(target_structure, 1)
+
+            # Don't exceed remaining propositions
+            actual_capacity = min(capacity, len(propositions) - prop_idx)
+
+            # Collect propositions for this group
+            group_props = propositions[prop_idx:prop_idx + actual_capacity]
+            group_rst = []
+            group_citations = []
+
+            if rst_info:
+                for i in range(prop_idx, min(prop_idx + actual_capacity, len(rst_info))):
+                    group_rst.append(rst_info[i])
+                    # Collect citations from RST info
+                    citations = rst_info[i].get("citations", [])
+                    group_citations.extend(citations)
+
+            groups.append({
+                "propositions": group_props,
+                "rst_info": group_rst,
+                "target_structure": target_structure,
+                "citations": group_citations,
+            })
+
+            logger.debug(
+                f"[GROUP] Created group: {actual_capacity} props for {target_structure} "
+                f"(capacity={capacity})"
+            )
+
+            # Update state for next Markov transition
+            state = GenerationState(
+                previous_structure_type=target_structure,
+                target_burstiness=state.target_burstiness,
+            )
+
+            prop_idx += actual_capacity
+
+        return groups

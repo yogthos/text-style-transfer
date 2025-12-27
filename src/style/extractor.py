@@ -70,6 +70,9 @@ class StyleProfileExtractor:
         structure_profile = self._extract_structure_profile(all_sentences)
         discourse_profile = self._extract_discourse_profile(paragraphs)
 
+        # Extract human writing patterns for humanization
+        human_patterns = self._extract_human_patterns(paragraphs)
+
         # Calculate totals
         word_count = sum(len(s.split()) for s in all_sentences)
 
@@ -77,6 +80,8 @@ class StyleProfileExtractor:
         logger.info(f"  Length: {length_profile.mean:.1f} +/- {length_profile.std:.1f}")
         logger.info(f"  Burstiness: {length_profile.burstiness:.3f}")
         logger.info(f"  No-transition ratio: {transition_profile.no_transition_ratio:.2f}")
+        logger.info(f"  Human patterns: {human_patterns.get('fragment_ratio', 0):.1%} fragments, "
+                   f"{human_patterns.get('question_ratio', 0):.1%} questions")
 
         return AuthorStyleProfile(
             author_name=author_name,
@@ -88,6 +93,7 @@ class StyleProfileExtractor:
             delta_profile=delta_profile,
             structure_profile=structure_profile,
             discourse_profile=discourse_profile,
+            human_patterns=human_patterns,
         )
 
     def _extract_length_profile(self, sentences: List[str]) -> SentenceLengthProfile:
@@ -761,6 +767,21 @@ class StyleProfileExtractor:
                 markov[rel] = default_dist.copy()
 
         return markov
+
+    def _extract_human_patterns(self, paragraphs: List[str]) -> Dict:
+        """Extract human writing patterns for humanization.
+
+        Identifies patterns that signal human authorship:
+        - Sentence fragments
+        - Rhetorical questions
+        - Parenthetical asides
+        - Extreme length variation
+        """
+        from ..humanization.corpus_patterns import CorpusPatternExtractor
+
+        extractor = CorpusPatternExtractor()
+        patterns = extractor.extract(paragraphs)
+        return patterns.to_dict()
 
 
 def extract_author_profile(

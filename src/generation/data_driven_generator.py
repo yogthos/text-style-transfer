@@ -139,16 +139,22 @@ class DataDrivenStyleTransfer:
             rst_info = None
         else:
             proposition_texts = [p.text for p in propositions]
-            # Build RST info for generator
+            # Build RST info for generator (including citations)
             rst_info = [
                 {
                     "role": p.rst_role,
                     "relation": p.rst_relation,
                     "parent_idx": p.parent_nucleus_idx,
                     "entities": p.entities,
+                    "citations": p.attached_citations,  # Pass citations through
                 }
                 for p in propositions
             ]
+
+            # Log citation preservation
+            all_citations = [c for p in propositions for c in p.attached_citations]
+            if all_citations:
+                logger.info(f"[TRANSFER] Found {len(all_citations)} citations to preserve: {all_citations}")
 
         logger.debug(f"Extracted {len(proposition_texts)} propositions")
 

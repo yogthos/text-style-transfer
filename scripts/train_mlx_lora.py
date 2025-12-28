@@ -43,6 +43,66 @@ def check_mlx_available():
         return False
 
 
+def create_ollama_generator(model: str = "qwen2.5:7b"):
+    """Create an Ollama generator function (fallback).
+
+    Args:
+        model: Ollama model name to use.
+
+    Returns:
+        Function that generates text from a prompt.
+    """
+    import requests
+
+    def generate(prompt: str) -> str:
+        """Generate text using Ollama."""
+        try:
+            response = requests.post(
+                "http://localhost:11434/api/generate",
+                json={
+                    "model": model,
+                    "prompt": prompt,
+                    "stream": False,
+                    "options": {"temperature": 0.3},
+                },
+                timeout=300,
+            )
+            if response.status_code == 200:
+                return response.json().get("response", "")
+            else:
+                print(f"Ollama error: {response.status_code}")
+                return ""
+        except Exception as e:
+            print(f"Ollama error: {e}")
+            return ""
+
+    return generate
+
+
+def create_mlx_generator(model: str = None):
+    """Create an MLX generator function (default, self-contained).
+
+    Args:
+        model: Model name (defaults to Qwen2.5-7B-Instruct-4bit).
+
+    Returns:
+        Function that generates text from a prompt.
+    """
+    from src.llm.mlx_provider import MLXGenerator
+
+    generator = MLXGenerator(model_name=model, temperature=0.3)
+
+    def generate(prompt: str) -> str:
+        """Generate text using MLX."""
+        try:
+            return generator.generate(prompt, max_tokens=512)
+        except Exception as e:
+            print(f"MLX error: {e}")
+            return ""
+
+    return generate
+
+
 def prepare_dataset(
     corpus_path: str,
     author: str,
@@ -55,7 +115,7 @@ def prepare_dataset(
         corpus_path: Path to corpus text file.
         author: Author name.
         output_path: Base path for output files.
-        llm_provider: LLM provider for description generation (optional).
+        llm_provider: LLM provider for generating neutral paraphrases.
 
     Returns:
         Dict with paths to train and validation files.
@@ -66,20 +126,38 @@ def prepare_dataset(
     with open(corpus_path, 'r') as f:
         corpus_text = f.read()
 
-    # Set up LLM if provider specified
+    # Set up LLM for generating neutral paraphrases
     llm_generate = None
     if llm_provider:
-        print(f"Using {llm_provider} for content descriptions...")
-        from src.generation.llm_provider import LLMProvider
-        provider = LLMProvider(llm_provider)
-        llm_generate = provider.generate
+        print(f"Using {llm_provider} for generating neutral paraphrases...")
+        if llm_provider == "mlx" or llm_provider.startswith("mlx:"):
+            # Use MLX (self-contained, no external services)
+            parts = llm_provider.split(":", 1)
+            model = parts[1] if len(parts) > 1 else None
+            print("Using MLX generator (self-contained)")
+            llm_generate = create_mlx_generator(model)
+        elif llm_provider.startswith("ollama"):
+            # Use Ollama (requires server)
+            parts = llm_provider.split(":", 1)
+            model = parts[1] if len(parts) > 1 else "qwen2.5:7b"
+            print(f"Using Ollama: {model}")
+            llm_generate = create_ollama_generator(model)
+        else:
+            # Default to MLX
+            print(f"Unknown provider: {llm_provider}, using MLX")
+            llm_generate = create_mlx_generator()
 
     print(f"Generating dataset for {author}...")
+    if llm_generate:
+        print("Note: Generating neutral paraphrases for each chunk (this will take a while)...")
+
     paths = generate_mlx_dataset(
         corpus_text=corpus_text,
         author=author,
         output_path=output_path,
         llm_generate=llm_generate,
+        min_chunk_words=50,
+        max_chunk_words=150,
     )
 
     print(f"Dataset saved:")
@@ -87,6 +165,72 @@ def prepare_dataset(
     print(f"  Validation: {paths['valid']}")
 
     return paths
+
+
+def prepare_from_neutralized(
+    neutralized_path: str,
+    author: str,
+    output_path: str,
+) -> dict:
+    """Prepare training dataset from pre-neutralized JSONL.
+
+    Args:
+        neutralized_path: Path to neutralized JSONL file (from neutralize_corpus.py).
+        author: Author name.
+        output_path: Base path for output files.
+
+    Returns:
+        Dict with paths to train and validation files.
+    """
+    import random
+    from pathlib import Path
+
+    print(f"Loading neutralized data from {neutralized_path}...")
+
+    examples = []
+    with open(neutralized_path, 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            # Training format: neutral input -> author's original output
+            example = {
+                "messages": [
+                    {"role": "system", "content": f"You write exactly like {author}. Transform the text into {author}'s distinctive voice and style."},
+                    {"role": "user", "content": data["neutral"]},
+                    {"role": "assistant", "content": data["original"]},
+                ]
+            }
+            examples.append(example)
+
+    print(f"Loaded {len(examples)} examples")
+
+    # Shuffle and split
+    random.seed(42)
+    random.shuffle(examples)
+
+    val_size = max(1, len(examples) // 10)
+    train_examples = examples[val_size:]
+    val_examples = examples[:val_size]
+
+    # Save
+    path = Path(output_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+
+    train_path = str(path.with_suffix('.train.jsonl'))
+    val_path = str(path.with_suffix('.valid.jsonl'))
+
+    with open(train_path, 'w') as f:
+        for ex in train_examples:
+            f.write(json.dumps(ex) + '\n')
+
+    with open(val_path, 'w') as f:
+        for ex in val_examples:
+            f.write(json.dumps(ex) + '\n')
+
+    print(f"Dataset saved:")
+    print(f"  Training: {train_path} ({len(train_examples)} examples)")
+    print(f"  Validation: {val_path} ({len(val_examples)} examples)")
+
+    return {'train': train_path, 'valid': val_path}
 
 
 def train_lora(
@@ -420,7 +564,12 @@ def main():
     # Optional
     parser.add_argument(
         "--llm-provider",
-        help="LLM provider for content descriptions (deepseek, ollama)",
+        default="mlx",
+        help="LLM provider for neutral paraphrases: 'mlx' (default, self-contained) or 'ollama:model'",
+    )
+    parser.add_argument(
+        "--from-neutralized",
+        help="Path to pre-neutralized JSONL file (from neutralize_corpus.py)",
     )
     parser.add_argument(
         "--test-prompt",
@@ -434,9 +583,20 @@ def main():
         parser.error("Must specify at least one action: --prepare, --train, or --test")
 
     dataset_path = args.dataset
+    validation_path = None
 
-    # Prepare dataset
-    if args.prepare:
+    # Prepare dataset from pre-neutralized file
+    if args.from_neutralized:
+        paths = prepare_from_neutralized(
+            neutralized_path=args.from_neutralized,
+            author=args.author,
+            output_path=args.output,
+        )
+        dataset_path = paths['train']
+        validation_path = paths['valid']
+
+    # Prepare dataset from corpus (with live neutralization)
+    elif args.prepare:
         if not args.corpus:
             parser.error("--corpus is required for --prepare")
 
@@ -448,8 +608,8 @@ def main():
         )
         dataset_path = paths['train']
         validation_path = paths['valid']
+
     else:
-        validation_path = None
         if dataset_path:
             # Try to find validation file
             val_path = Path(dataset_path).with_suffix('.valid.jsonl')

@@ -1,4 +1,10 @@
-"""Validation modules for semantic preservation."""
+"""Validation modules for semantic preservation.
+
+Core validation for the LoRA pipeline:
+- EntailmentVerifier: NLI-based content verification
+- SemanticVerifier: Semantic fidelity checking with repair hints
+- QualityCritic: Explicit fix instructions for quality issues
+"""
 
 from .entailment import EntailmentVerifier, EntailmentResult
 from .semantic_verifier import (
@@ -7,26 +13,20 @@ from .semantic_verifier import (
     VerificationIssue,
     verify_semantic_fidelity,
 )
-from .anachronistic_test import (
-    ANACHRONISTIC_PROMPTS,
-    AnachronisticTestResult,
-    AnachronisticTestSuite,
-    run_anachronistic_tests,
-    validate_style_generalization,
+from .quality_critic import (
+    QualityCritic,
+    QualityCritique,
+    QualityIssue,
 )
 
 __all__ = [
     "EntailmentVerifier",
     "EntailmentResult",
-    # New semantic verification
     "SemanticVerifier",
     "VerificationResult",
     "VerificationIssue",
     "verify_semantic_fidelity",
-    # Anachronistic testing
-    "ANACHRONISTIC_PROMPTS",
-    "AnachronisticTestResult",
-    "AnachronisticTestSuite",
-    "run_anachronistic_tests",
-    "validate_style_generalization",
+    "QualityCritic",
+    "QualityCritique",
+    "QualityIssue",
 ]

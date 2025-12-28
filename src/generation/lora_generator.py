@@ -34,7 +34,7 @@ class GenerationConfig:
     """Configuration for LoRA generation."""
 
     max_tokens: int = 512
-    temperature: float = 0.7
+    temperature: float = 0.5  # Lower for more faithful translation
     top_p: float = 0.9
     repetition_penalty: float = 1.1
     min_tokens: int = 50  # Prevent too-short outputs
@@ -147,6 +147,7 @@ class LoRAStyleGenerator:
         author: str,
         context: Optional[str] = None,
         system_override: Optional[str] = None,
+        max_tokens: Optional[int] = None,
     ) -> str:
         """Generate styled text from content description.
 
@@ -155,6 +156,7 @@ class LoRAStyleGenerator:
             author: Author name (used in system prompt).
             context: Optional previous paragraph for continuity.
             system_override: Optional custom system prompt.
+            max_tokens: Override for max tokens (defaults to config).
 
         Returns:
             Generated text in the author's style.
@@ -165,20 +167,18 @@ class LoRAStyleGenerator:
         if system_override:
             system = system_override
         else:
-            system = (
-                f"You write in the style of {author}. "
-                "Render the given content in this voice, maintaining "
-                "natural flow and the author's characteristic rhythm."
-            )
+            # Content-preserving prompt with explicit constraints
+            system = f"""You are {author}. Rewrite the following text in your distinctive voice.
 
-        # Build user message
-        if context:
-            user = (
-                f"Previous paragraph:\n{context}\n\n"
-                f"Content to express:\n{content}"
-            )
-        else:
-            user = f"Content to express:\n{content}"
+CRITICAL RULES:
+1. COMPLETE all sentences - never truncate or leave sentences unfinished
+2. PRESERVE all facts, names, and key information from the source
+3. DO NOT add new claims, examples, or ideas not in the original
+4. DO NOT substitute technical terms with synonyms
+5. VARY your word choice - avoid repeating the same adjectives and qualifiers"""
+
+        # Build user message - just the content
+        user = content
 
         messages = [
             {"role": "system", "content": system},
@@ -198,12 +198,15 @@ class LoRAStyleGenerator:
             top_p=self.config.top_p,
         )
 
+        # Use provided max_tokens or config default
+        tokens_limit = max_tokens or self.config.max_tokens
+
         # Generate
         response = generate(
             self._model,
             self._tokenizer,
             prompt=prompt,
-            max_tokens=self.config.max_tokens,
+            max_tokens=tokens_limit,
             sampler=sampler,
         )
 
@@ -229,17 +232,19 @@ class LoRAStyleGenerator:
         Returns:
             Styled paragraph expressing all propositions.
         """
-        # Format propositions as content description
-        if len(propositions) == 1:
-            content = propositions[0]
-        else:
-            content = "Express the following points in a cohesive paragraph:\n"
-            content += "\n".join(f"- {p}" for p in propositions)
+        # Join propositions as the content to translate
+        content = " ".join(propositions)
+
+        # Strict max tokens based on input length (1.3x to allow for style variation)
+        input_words = len(content.split())
+        estimated_tokens = int(input_words * 1.5)  # ~1.1 tokens per word + small margin
+        max_tokens = max(50, min(estimated_tokens, self.config.max_tokens))
 
         return self.generate(
             content=content,
             author=author,
             context=previous_paragraph,
+            max_tokens=max_tokens,
         )
 
     def generate_with_repair(

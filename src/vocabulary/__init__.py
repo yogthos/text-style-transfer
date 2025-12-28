@@ -1,25 +1,14 @@
-"""Vocabulary control for style transfer."""
+"""Vocabulary control for style transfer.
 
-from .controller import VocabularyController, VocabularyBiases
-from .analyzer import VocabularyAnalyzer, VocabularyAnalysis
-from .semantic_filter import SemanticFilter, WordCategory
-from .deepseek_controller import (
-    DeepSeekVocabularyController,
-    OllamaVocabularyController,
-    get_vocabulary_controller,
-)
-from .controlled_generator import ControlledGenerator, create_controlled_generator
+The LoRA pipeline uses RepetitionReducer for post-processing:
+- Tracks word usage across the document
+- Replaces overused words with synonyms
+- Replaces LLM-speak with simpler alternatives
+"""
+
+from .repetition_reducer import RepetitionReducer, ReductionStats
 
 __all__ = [
-    "VocabularyController",
-    "VocabularyBiases",
-    "VocabularyAnalyzer",
-    "VocabularyAnalysis",
-    "SemanticFilter",
-    "WordCategory",
-    "DeepSeekVocabularyController",
-    "OllamaVocabularyController",
-    "get_vocabulary_controller",
-    "ControlledGenerator",
-    "create_controlled_generator",
+    "RepetitionReducer",
+    "ReductionStats",
 ]

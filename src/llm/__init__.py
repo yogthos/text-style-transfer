@@ -11,6 +11,7 @@ from .provider import (
     register_provider,
 )
 from .session import LLMSession, SessionConfig
+from .mlx_provider import MLXGenerator, TextNeutralizer, create_mlx_generator
 
 # Import providers to register them
 from . import deepseek
@@ -29,4 +30,8 @@ __all__ = [
     # Session
     "LLMSession",
     "SessionConfig",
+    # MLX
+    "MLXGenerator",
+    "TextNeutralizer",
+    "create_mlx_generator",
 ]

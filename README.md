@@ -1,140 +1,169 @@
 # Text Style Transfer
 
-Transform text to match a target author's writing style while preserving semantic meaning. Uses graph-based semantic representation and LLM generation to produce stylistically accurate output.
+Transform text to match a target author's writing style while preserving semantic meaning. Uses LoRA-adapted language models for fast, consistent style transfer.
 
 ## Features
 
-- **Style Analysis**: Extract statistical fingerprints from author corpora (sentence length, burstiness, vocabulary patterns)
-- **Semantic Preservation**: Graph-based representation ensures meaning is preserved during transformation
-- **Rhythm Matching**: Reproduces the target author's sentence length variation patterns
-- **Validation Critics**: Multi-critic validation ensures output quality (semantic, style, fluency, length)
-- **RAG-Enhanced Generation**: ChromaDB index enables retrieval of similar style patterns
+- **LoRA-Based Generation**: Fine-tuned adapters capture author style in model weights
+- **Faithful Translation**: Training approach ensures output matches input length (no hallucination)
+- **Fast Transfer**: ~5-10 seconds per paragraph
+- **Semantic Preservation**: NLI-based entailment verification ensures meaning is preserved
+- **Post-Processing**: Reduces word repetition and removes LLM-speak
+
+## Requirements
+
+- Python 3.9+
+- Apple Silicon Mac (for MLX-based training/inference)
+- ~8GB RAM for inference, ~16GB for training
 
 ## Installation
 
-### 1. Clone and Setup Virtual Environment
-
 ```bash
+# Clone repository
 git clone <repository-url>
 cd text-style-transfer
 
 # Create virtual environment
 python3 -m venv venv
-
-# Activate virtual environment
-# On macOS/Linux:
-source venv/bin/activate # for bash
-source venv/bin/activate.fish # for fish
-# On Windows:
-# venv\Scripts\activate
+source venv/bin/activate
 
 # Install dependencies
 pip install -r requirements.txt
 
-# Download spaCy model (large model with word vectors)
-python -m spacy download en_core_web_lg
+# Download spaCy model
+python -m spacy download en_core_web_sm
 ```
 
-### 2. Configure LLM Provider
+## Quick Start
 
-Copy the sample configuration and edit with your API credentials:
+### 1. Configure Base Model
 
-```bash
-cp config.json.sample config.json
-```
-
-Edit `config.json` with your settings:
+Edit `config.json` to set your MLX base model:
 
 ```json
 {
   "llm": {
-    "provider": "deepseek",
     "providers": {
-      "deepseek": {
-        "api_key": "${DEEPSEEK_API_KEY}",
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
-        "max_tokens": 4096,
-        "temperature": 0.7
-      },
-      "ollama": {
-        "base_url": "http://localhost:11434",
-        "model": "llama3"
+      "mlx": {
+        "model": "mlx-community/Qwen3-8B-bf16",
+        "max_tokens": 512,
+        "temperature": 0.3,
+        "top_p": 0.9
       }
     }
-  },
-  "chromadb": {
-    "persist_path": "atlas_cache/"
   }
 }
 ```
 
-Set your API key as an environment variable:
+**Model options:**
+| Model | Size | Quality | Use Case |
+|-------|------|---------|----------|
+| `mlx-community/Qwen3-8B-bf16` | ~16GB | Best | Production training |
+| `mlx-community/Qwen3-8B-4bit` | ~4.3GB | Good | Limited memory |
+
+> **Important:** Use base models (not Instruct). Instruct-tuned models have response patterns that resist style overwriting. Base models are blank canvases for LoRA adaptation.
+
+### 2. Train a LoRA Adapter
+
+Training is a two-step process: neutralize the corpus, then train.
 
 ```bash
-export DEEPSEEK_API_KEY="your-api-key-here"
+# Step 1: Convert author's distinctive text to neutral paraphrases
+python scripts/neutralize_corpus.py \
+    --input data/corpus/author.txt \
+    --output data/neutralized/author.jsonl \
+    --author "Author Name"
+
+# Step 2: Train LoRA adapter on neutral → author pairs
+python scripts/train_mlx_lora.py \
+    --from-neutralized data/neutralized/author.jsonl \
+    --author "Author Name" \
+    --train \
+    --output lora_adapters/author
 ```
 
-## Usage
-
-### Quick Start
+### 3. Transfer Text
 
 ```bash
-# 1. Ingest an author's corpus
-python cli.py ingest styles/sample_sagan.txt --author "Carl Sagan"
-
-# 2. Transform text to that author's style
-python cli.py transfer input.txt --author "Carl Sagan" --output output.txt
+# Transform text to author's style
+python cli.py transfer input.txt --author "Author Name" --output output.txt
 ```
 
-### Commands
+## Commands
 
-#### `ingest` - Build Style Index
-
-Load an author's corpus and build a style profile:
-
-```bash
-python cli.py ingest <corpus_path> --author "<Author Name>"
-
-# Examples:
-python cli.py ingest styles/sample_hitchens.txt --author "Christopher Hitchens"
-python cli.py ingest styles/ --author "Mixed Authors"  # Directory of files
-```
-
-This creates:
-- Style profile with statistical metrics (sentence length, burstiness, vocabulary)
-- ChromaDB index of paragraph structures for RAG retrieval
-
-#### `transfer` - Transform Text
+### `transfer` - Style Transfer
 
 Transform input text to match an author's style:
 
 ```bash
-python cli.py transfer <input_file> --author "<Author Name>" [--output <output_file>]
+python cli.py transfer <input_file> --author "<Author Name>" [options]
 
 # Examples:
-python cli.py transfer essay.txt --author "Carl Sagan"
-python cli.py transfer essay.txt --author "Carl Sagan" --output transformed.txt
-python cli.py transfer essay.txt --author "Carl Sagan" --max-revisions 3
+python cli.py transfer essay.txt --author "Mao"
+python cli.py transfer essay.txt --author "Mao" --output styled.txt
+python cli.py transfer essay.txt --author "Mao" --temperature 0.5
 ```
 
 Options:
-- `--output, -o`: Output file (prints to stdout if not specified)
-- `--max-revisions, -r`: Maximum revision attempts per sentence (default: 2)
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--output, -o` | stdout | Output file path |
+| `--adapter` | `lora_adapters/<author>` | Custom adapter path |
+| `--temperature, -t` | 0.5 | Generation temperature |
+| `--threshold` | 0.7 | Entailment threshold for repair |
+| `--no-verify` | false | Skip entailment verification |
+| `--no-repair` | false | Skip repair attempts |
+| `--no-reduce-repetition` | false | Skip post-processing |
+| `--no-adapter` | false | Use base model without LoRA (for testing) |
 
-#### `analyze` - Analyze Text Style
+### `train` - Train LoRA Adapter
+
+Training uses the self-contained MLX pipeline (no external services needed).
+
+**Step 1: Neutralize corpus** - Convert author's distinctive text to plain English:
+
+```bash
+python scripts/neutralize_corpus.py \
+    --input data/corpus/author.txt \
+    --output data/neutralized/author.jsonl \
+    --author "Author Name"
+```
+
+Neutralization options:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--min-words` | 50 | Minimum words per chunk |
+| `--max-words` | 150 | Maximum words per chunk |
+| `--llm` | mlx | LLM provider (mlx or ollama:model) |
+
+**Step 2: Train LoRA adapter** on neutral → author pairs:
+
+```bash
+python scripts/train_mlx_lora.py \
+    --from-neutralized data/neutralized/author.jsonl \
+    --author "Author Name" \
+    --train \
+    --output lora_adapters/author \
+    --epochs 3
+```
+
+Training options:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--epochs` | 3 | Training epochs |
+| `--batch-size` | 2 | Batch size |
+| `--learning-rate` | 5e-5 | Learning rate |
+| `--rank` | 16 | LoRA rank |
+| `--lora-alpha` | 32 | LoRA alpha scaling |
+
+### `analyze` - Analyze Text
 
 Get style metrics for any text file:
 
 ```bash
 python cli.py analyze <file>
 
-# Example:
-python cli.py analyze essay.txt
-```
-
-Output:
-```
+# Example output:
 Analysis of: essay.txt
 
 Structure:
@@ -142,237 +171,281 @@ Structure:
   Sentences: 23
   Words: 412
 
-Style Metrics:
-  Average sentence length: 17.9 words
-  Sentence length range: 5 - 42 words
-  Burstiness: 0.342
-  Avg dependency depth: 4.52
-  Perspective: third_person
-
-POS Distribution:
-  NOUN: 15.4%
-  PUNCT: 12.1%
-  VERB: 10.4%
-  ADP: 10.0%
-  PRON: 9.6%
-
-Top Vocabulary:
-  concept, system, process, analysis, method, ...
+Sentence Length:
+  Mean: 17.9 words
+  Std: 8.2
+  Range: 5 - 42 words
+  Burstiness: 0.458
 ```
 
-#### `list-authors` - Show Indexed Authors
+### `list` - List Adapters
+
+Show available trained adapters:
 
 ```bash
-python cli.py list-authors
-```
+python cli.py list
 
-### Configuration Options
-
-Full `config.json` options:
-
-```json
-{
-  "llm": {
-    "provider": "deepseek",
-    "providers": {
-      "deepseek": {
-        "api_key": "${DEEPSEEK_API_KEY}",
-        "base_url": "https://api.deepseek.com",
-        "model": "deepseek-chat",
-        "max_tokens": 4096,
-        "temperature": 0.7,
-        "timeout": 120
-      }
-    },
-    "retry": {
-      "max_attempts": 5,
-      "base_delay": 2,
-      "max_delay": 60
-    }
-  },
-  "chromadb": {
-    "persist_path": "atlas_cache/",
-    "embedding_model": "all-mpnet-base-v2"
-  },
-  "generation": {
-    "max_repair_retries": 5,
-    "rag_examples_count": 5,
-    "length_tolerance": 0.2
-  },
-  "validation": {
-    "semantic": {
-      "min_proposition_coverage": 0.9,
-      "max_hallucinated_entities": 0
-    },
-    "statistical": {
-      "length_tolerance": 0.2,
-      "burstiness_tolerance": 0.3,
-      "min_vocab_match": 0.5
-    }
-  },
-  "log_level": "INFO"
-}
+# Output:
+Available LoRA adapters:
+  mao: rank=16
 ```
 
 ## Architecture
 
 ```
-┌─────────────────────────────────────────────────────────────────┐
-│                         Input Text                               │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Phase 1: Corpus Ingestion                                       │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ Preprocessor │→ │   Analyzer   │→ │   Indexer    │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Phase 2: Semantic Deconstruction                                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │  Proposition │→ │ Relationship │→ │    Graph     │          │
-│  │  Extractor   │  │  Detector    │  │   Builder    │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Phase 3: Planning                                               │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │ Graph Matcher│→ │    Rhythm    │→ │   Sentence   │          │
-│  │   (RAG)      │  │   Planner    │  │   Planner    │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│  Phase 4: Generation & Validation                                │
-│  ┌──────────────┐  ┌──────────────┐  ┌──────────────┐          │
-│  │   Prompt     │→ │  Sentence    │→ │   Critic     │          │
-│  │   Builder    │  │  Generator   │  │   Panel      │          │
-│  └──────────────┘  └──────────────┘  └──────────────┘          │
-└─────────────────────────────────────────────────────────────────┘
-                                │
-                                ▼
-┌─────────────────────────────────────────────────────────────────┐
-│                       Styled Output                              │
-└─────────────────────────────────────────────────────────────────┘
+Input Text (N words)
+    │
+    ▼
+┌─────────────────────────────┐
+│ 1. PARAGRAPH SPLITTING      │  Split into paragraphs
+│    - Filter headings        │  for processing
+│    - Track word counts      │
+└─────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────┐
+│ 2. LORA GENERATION          │  Single forward pass with
+│    - Style in adapter       │  author-specific LoRA weights
+│    - Word count constraint  │  Output ≈ input length
+│    - ~5-10s per paragraph   │
+└─────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────┐
+│ 3. CONTENT VERIFICATION     │  NLI entailment check
+│    - Score > 0.7 = pass     │  ensures meaning preserved
+│    - Repair if needed       │
+└─────────────────────────────┘
+    │
+    ▼
+┌─────────────────────────────┐
+│ 4. POST-PROCESSING          │  Replace overused words
+│    - Reduce repetition      │  with synonyms
+│    - Remove LLM-speak       │
+└─────────────────────────────┘
+    │
+    ▼
+Output Text (≈N words)
 ```
 
-## Included Sample Corpora
+## How Training Works
 
-The `styles/` directory contains sample corpora from various authors:
+The training approach uses **neutral → author pairs** to teach pure style transformation:
 
-| Author | File | Size |
-|--------|------|------|
-| Richard Dawkins | `sample_dawkins.txt` | ~800KB |
-| Carl Sagan | `sample_sagan.txt` | ~700KB |
-| Richard Feynman | `sample_feyman.txt` | ~470KB |
-| Christopher Hitchens | `sample_hitchens.txt` | ~180KB |
-| Douglas Hofstadter | `sample_hofstadter.txt` | ~900KB |
-| H.P. Lovecraft | `sample_lovecraft.txt` | ~2.6MB |
-| Michael Parenti | `sample_parenti.txt` | ~325KB |
+### Training Data Format
 
-## Development
-
-### Running Tests
-
-```bash
-# Run all tests
-python -m pytest tests/unit/ -v
-
-# Run specific test file
-python -m pytest tests/unit/test_critics.py -v
-
-# Run with coverage
-python -m pytest tests/unit/ --cov=src --cov-report=html
+```
+Input:  "The universe is very large. Each person is a small part of many stars."
+Output: "The cosmos is vast beyond imagining. We are, each of us, tiny specks in an ocean of stars."
 ```
 
-### Project Structure
+The model learns to transform plain English into the author's distinctive voice.
+
+### Why This Works
+
+1. **Base model as blank canvas**: No pre-existing instruction patterns to fight against
+2. **Neutral input**: Generic text has no style - the model must add all stylistic elements
+3. **Meaning preservation**: Input and output express the same ideas, just differently
+4. **Length awareness**: Training pairs have similar word counts
+
+### Training Process
+
+```
+Author Corpus (distinctive prose)
+         │
+         ▼
+    ┌─────────────┐
+    │ Neutralize  │  MLX base model converts to plain English
+    └─────────────┘
+         │
+         ▼
+  Neutral → Author Pairs
+         │
+         ▼
+    ┌─────────────┐
+    │ LoRA Train  │  Adapter learns style transformation
+    └─────────────┘
+         │
+         ▼
+   Trained Adapter
+```
+
+This differs from naive approaches that fine-tune on author text directly, which can lead to memorization rather than style learning.
+
+## Project Structure
 
 ```
 text-style-transfer/
-├── cli.py                 # Command-line interface
-├── config.json            # Configuration (create from sample)
-├── config.json.sample     # Sample configuration
-├── requirements.txt       # Python dependencies
+├── cli.py                    # Command-line interface
+├── requirements.txt          # Python dependencies
 ├── src/
-│   ├── config.py          # Configuration loading
-│   ├── corpus/            # Corpus processing
-│   │   ├── loader.py      # Load corpus files
-│   │   ├── preprocessor.py # Text preprocessing
-│   │   ├── analyzer.py    # Statistical analysis
-│   │   ├── profiler.py    # Style profile creation
-│   │   └── indexer.py     # ChromaDB indexing
-│   ├── ingestion/         # Semantic analysis
-│   │   ├── proposition_extractor.py  # SVO extraction
-│   │   ├── relationship_detector.py  # Edge detection
-│   │   ├── graph_builder.py          # Graph construction
-│   │   └── context_analyzer.py       # Global context
-│   ├── planning/          # Sentence planning
-│   │   ├── graph_matcher.py   # RAG matching
-│   │   ├── rhythm_planner.py  # Length patterns
-│   │   └── sentence_planner.py # Plan creation
-│   ├── generation/        # Text generation
-│   │   ├── prompt_builder.py     # Prompt construction
-│   │   ├── sentence_generator.py # LLM generation
-│   │   └── critics.py            # Validation
-│   ├── llm/               # LLM providers
-│   │   ├── provider.py    # Base class
-│   │   ├── deepseek.py    # DeepSeek API
-│   │   └── ollama.py      # Ollama local
-│   ├── models/            # Data models
-│   │   ├── graph.py       # Semantic graph
-│   │   ├── plan.py        # Sentence plan
-│   │   └── style.py       # Style profile
-│   └── utils/             # Utilities
-│       ├── nlp.py         # NLP utilities
-│       └── logging.py     # Structured logging
-├── styles/                # Sample author corpora
-└── tests/                 # Test suite
-    └── unit/              # Unit tests
+│   ├── generation/           # Core generation
+│   │   ├── lora_generator.py # MLX LoRA inference
+│   │   └── fast_transfer.py  # Pipeline orchestration
+│   ├── validation/           # Content verification
+│   │   ├── entailment.py     # NLI-based checking
+│   │   └── semantic_verifier.py
+│   ├── vocabulary/           # Post-processing
+│   │   └── repetition_reducer.py
+│   ├── sft/                  # Training data generation
+│   │   └── mlx_dataset.py    # Dataset for MLX LoRA
+│   ├── llm/                  # LLM providers
+│   │   ├── mlx_provider.py   # MLX local (self-contained)
+│   │   ├── deepseek.py       # DeepSeek API
+│   │   └── ollama.py         # Ollama local
+│   ├── corpus/               # Corpus loading
+│   └── utils/                # NLP utilities
+├── scripts/
+│   ├── neutralize_corpus.py  # Convert corpus to neutral pairs
+│   ├── train_mlx_lora.py     # LoRA training script
+│   └── fast_restyle.py       # Direct inference script
+├── lora_adapters/            # Trained adapters
+└── archive/                  # Deprecated modules
 ```
 
-## Key Concepts
+## Training Your Own Adapter
 
-### Burstiness
-A measure of sentence length variation (coefficient of variation). Low burstiness (~0.1) indicates uniform sentence lengths; high burstiness (~0.4+) indicates varied lengths like Hitchens' punchy style.
+### Step 1: Prepare Corpus
 
-### Semantic Graph
-Represents text as propositions (subject-verb-object triples) connected by relationships (CAUSES, CONTRASTS, ELABORATES, etc.). Ensures meaning preservation during transformation.
+Create a plain text file with the author's writing:
+- **Recommended size**: 50KB+ of text (more = better style capture)
+- **Format**: Clean paragraphs separated by blank lines
+- **Remove**: Headers, footnotes, citations, non-prose content
 
-### Style DNA
-A natural language description of an author's characteristic patterns, vocabulary preferences, and rhetorical strategies.
+Place the corpus in `data/corpus/author_name.txt`.
+
+### Step 2: Configure Base Model
+
+Edit `config.json` to select your base model:
+
+```json
+{
+  "llm": {
+    "providers": {
+      "mlx": {
+        "model": "mlx-community/Qwen3-8B-bf16",
+        "max_tokens": 512,
+        "temperature": 0.3
+      }
+    }
+  }
+}
+```
+
+**Why base models?** Instruct-tuned models have learned response patterns (helpfulness, safety guardrails) that resist style overwriting. Base models have no such patterns - they're blank canvases that fully absorb the author's voice during LoRA training.
+
+### Step 3: Neutralize Corpus (Once Per Author)
+
+Convert the author's distinctive prose to plain neutral English. This creates training pairs: neutral input → author-style output.
+
+```bash
+python scripts/neutralize_corpus.py \
+    --input data/corpus/my_author.txt \
+    --output data/neutralized/my_author.jsonl \
+    --author "Author Name"
+```
+
+This runs the base model to paraphrase each chunk into generic prose. Takes ~1-2 minutes per 10KB of corpus.
+
+> **Note:** The neutralized corpus is model-agnostic. You only need to run this once per author, then you can train adapters on different base models using the same `author.jsonl` file.
+
+### Step 4: Train LoRA Adapter
+
+Train the adapter on neutral → author pairs:
+
+```bash
+python scripts/train_mlx_lora.py \
+    --from-neutralized data/neutralized/my_author.jsonl \
+    --author "Author Name" \
+    --train \
+    --output lora_adapters/my_author \
+    --epochs 3
+```
+
+Training takes ~10-15 minutes for a typical corpus. The adapter learns to transform neutral text into the author's distinctive voice.
+
+### Step 5: Test Transfer
+
+```bash
+python cli.py transfer test_input.txt --author "Author Name"
+```
+
+### Tips for Best Results
+
+- **More data is better**: 100KB+ corpus gives richer style capture
+- **Use bf16 model**: Higher precision = better LoRA quality
+- **Clean corpus**: Remove non-prose elements that could confuse the model
+- **Adjust epochs**: 3-5 epochs typically works well; more can overfit
+- **Lower temperature**: Use 0.3-0.5 for more consistent output
+
+## Performance
+
+| Metric | Value |
+|--------|-------|
+| Time per paragraph | 5-10 seconds |
+| LLM calls per paragraph | 1 |
+| Memory (inference, 4-bit) | ~8GB |
+| Memory (inference, bf16) | ~18GB |
+| Memory (training, bf16) | ~20GB |
+| Neutralization time | ~1-2 min per 10KB |
+| Training time (3 epochs) | ~10-15 min |
 
 ## Troubleshooting
 
-### ChromaDB Issues
+### MLX Not Available
 
-If you encounter ChromaDB errors:
-```bash
-# Clear the index and rebuild
-rm -rf atlas_cache/
-python cli.py ingest <corpus> --author "<Author>"
+This project requires Apple Silicon. For other platforms, the architecture supports adding PyTorch backends.
+
+### Out of Memory During Training
+
+Use 4-bit model instead of bf16:
+```json
+{
+  "llm": {
+    "providers": {
+      "mlx": {
+        "model": "mlx-community/Qwen3-8B-4bit"
+      }
+    }
+  }
+}
 ```
+
+Or reduce batch size:
+```bash
+python scripts/train_mlx_lora.py --train ... --batch-size 1
+```
+
+### Neutralization Output Contains Thinking/Reasoning Text
+
+The base model may output reasoning before the actual response. The script automatically filters this, but if issues persist:
+- Check that you're using a base model (not Instruct)
+- The filtering in `neutralize_corpus.py` handles common patterns
+
+### Adapter Trained on Wrong Model
+
+LoRA adapters are model-specific. If you switch base models (e.g., from 4-bit to bf16), you must retrain the adapter. However, you can reuse the neutralized corpus - it's model-agnostic:
+
+```bash
+# No need to re-neutralize! Just retrain the adapter on the new model
+python scripts/train_mlx_lora.py \
+    --from-neutralized data/neutralized/author.jsonl \
+    --author "Author" \
+    --train \
+    --output lora_adapters/author_bf16
+```
+
+### Low Quality Output
+
+- **Use bf16 model**: Higher precision = better style capture
+- **More training data**: 50KB+ corpus recommended
+- **Lower temperature**: `--temperature 0.3` for more consistent output
+- **More epochs**: `--epochs 5` (but watch for overfitting)
 
 ### spaCy Model Missing
 
 ```bash
-python -m spacy download en_core_web_lg
-```
-
-### Rate Limits
-
-The system includes exponential backoff for API rate limits. Adjust in config:
-```json
-"retry": {
-  "max_attempts": 10,
-  "base_delay": 5,
-  "max_delay": 120
-}
+python -m spacy download en_core_web_sm
 ```
 
 ## License

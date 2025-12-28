@@ -21,7 +21,6 @@ from ..utils.nlp import (
     split_into_paragraphs,
     split_into_sentences,
     filter_headings,
-    extract_keywords,
 )
 from ..utils.logging import get_logger
 
@@ -41,9 +40,17 @@ class TransferConfig:
     verify_entailment: bool = True
     entailment_threshold: float = 0.7
 
+    # Quality critic settings
+    use_quality_critic: bool = True  # Enable quality checking with explicit fix instructions
+    word_cluster_threshold: int = 3  # Words used 3+ times trigger warning
+
     # Repair settings
-    max_repair_attempts: int = 1  # Just one retry
+    max_repair_attempts: int = 2  # Allow 2 repair attempts with critic feedback
     repair_temperature: float = 0.5  # Lower temp for repair
+
+    # Post-processing settings
+    reduce_repetition: bool = True
+    repetition_threshold: int = 3  # Words used 3+ times get replaced
 
     # Content extraction
     skip_headings: bool = True
@@ -56,6 +63,9 @@ class TransferStats:
 
     paragraphs_processed: int = 0
     paragraphs_repaired: int = 0
+    quality_issues_found: int = 0
+    quality_issues_fixed: int = 0
+    words_replaced: int = 0
     total_time_seconds: float = 0.0
     avg_time_per_paragraph: float = 0.0
     entailment_scores: List[float] = field(default_factory=list)
@@ -65,6 +75,7 @@ class TransferStats:
         return {
             "paragraphs_processed": self.paragraphs_processed,
             "paragraphs_repaired": self.paragraphs_repaired,
+            "words_replaced": self.words_replaced,
             "total_time_seconds": round(self.total_time_seconds, 2),
             "avg_time_per_paragraph": round(self.avg_time_per_paragraph, 2),
             "avg_entailment_score": round(
@@ -148,7 +159,7 @@ class FastStyleTransfer:
 
     def __init__(
         self,
-        adapter_path: str,
+        adapter_path: Optional[str],
         author_name: str,
         config: Optional[TransferConfig] = None,
         verify_fn: Optional[Callable[[str, str], float]] = None,
@@ -156,7 +167,7 @@ class FastStyleTransfer:
         """Initialize the fast transfer pipeline.
 
         Args:
-            adapter_path: Path to LoRA adapter directory.
+            adapter_path: Path to LoRA adapter directory, or None for base model.
             author_name: Author name for prompts.
             config: Transfer configuration.
             verify_fn: Optional verification function (original, output) -> score.
@@ -178,6 +189,22 @@ class FastStyleTransfer:
 
         # Initialize proposition extractor
         self.prop_extractor = PropositionExtractor()
+
+        # Initialize repetition reducer for post-processing
+        self.repetition_reducer = None
+        if self.config.reduce_repetition:
+            from ..vocabulary.repetition_reducer import RepetitionReducer
+            self.repetition_reducer = RepetitionReducer(
+                threshold=self.config.repetition_threshold
+            )
+
+        # Initialize quality critic for explicit fix instructions
+        self.quality_critic = None
+        if self.config.use_quality_critic:
+            from ..validation.quality_critic import QualityCritic
+            self.quality_critic = QualityCritic(
+                cluster_threshold=self.config.word_cluster_threshold
+            )
 
         # Set up entailment verifier if requested
         if self.config.verify_entailment and self.verify_fn is None:
@@ -240,12 +267,14 @@ class FastStyleTransfer:
         self,
         paragraph: str,
         previous: Optional[str] = None,
+        stats: Optional['TransferStats'] = None,
     ) -> Tuple[str, float]:
-        """Transfer a single paragraph.
+        """Transfer a single paragraph with quality checking and repair.
 
         Args:
             paragraph: Source paragraph.
             previous: Previous output paragraph for continuity.
+            stats: Optional stats object to update.
 
         Returns:
             Tuple of (styled_paragraph, entailment_score).
@@ -255,37 +284,65 @@ class FastStyleTransfer:
             logger.debug(f"Skipping short paragraph: {paragraph[:50]}...")
             return paragraph, 1.0
 
-        # Step 1: Extract propositions
-        propositions = self.prop_extractor.extract(paragraph)
+        word_count = len(paragraph.split())
+        logger.debug(f"Translating paragraph: {word_count} words")
 
-        if not propositions:
-            logger.warning("No propositions extracted, using original text")
-            propositions = [paragraph]
+        # Generate with token limit based on input (allow 1.5x for style variation)
+        max_tokens = max(100, int(word_count * 1.8))
 
-        logger.debug(f"Extracted {len(propositions)} propositions")
-
-        # Step 2: Generate styled text
-        output = self.generator.generate_paragraph(
-            propositions=propositions,
+        output = self.generator.generate(
+            content=paragraph,
             author=self.author,
-            previous_paragraph=previous,
+            context=previous,
+            max_tokens=max_tokens,
         )
 
-        # Step 3: Verify if configured
+        # Quality critique and repair loop
+        if self.quality_critic:
+            for attempt in range(self.config.max_repair_attempts):
+                critique = self.quality_critic.critique(paragraph, output)
+
+                if stats:
+                    stats.quality_issues_found += len(critique.issues)
+
+                if not critique.has_critical_issues:
+                    logger.debug(f"Quality check passed (attempt {attempt + 1})")
+                    break
+
+                # Log issues
+                for issue in critique.issues:
+                    if issue.severity == "critical":
+                        logger.warning(f"Quality issue: {issue.description}")
+
+                # Generate repair prompt with explicit fix instructions
+                repair_prompt = self.quality_critic.get_repair_system_prompt(
+                    self.author, critique
+                )
+
+                logger.info(f"Repair attempt {attempt + 1}: {len(critique.issues)} issues")
+
+                # Lower temperature for repair
+                old_temp = self.generator.config.temperature
+                self.generator.config.temperature = self.config.repair_temperature
+
+                try:
+                    output = self.generator.generate(
+                        content=paragraph,
+                        author=self.author,
+                        context=previous,
+                        system_override=repair_prompt,
+                        max_tokens=max_tokens,
+                    )
+                finally:
+                    self.generator.config.temperature = old_temp
+
+                if stats:
+                    stats.quality_issues_fixed += 1
+
+        # Verify if configured
         score = 1.0
         if self.verify_fn:
             score = self.verify_fn(paragraph, output)
-
-            if score < self.config.entailment_threshold:
-                logger.warning(
-                    f"Low entailment ({score:.2f} < {self.config.entailment_threshold})"
-                )
-
-                # Step 4: Repair if needed
-                if self.config.max_repair_attempts > 0:
-                    output, score = self._repair(
-                        paragraph, output, propositions, previous
-                    )
 
         return output, score
 
@@ -309,26 +366,31 @@ class FastStyleTransfer:
         """
         logger.info("Attempting repair...")
 
-        # Find what might be missing by checking keywords
-        original_keywords = set(extract_keywords(original, top_n=15))
-        output_keywords = set(extract_keywords(current, top_n=15))
-        missing_keywords = original_keywords - output_keywords
-
-        # Augment propositions with explicit requirements
-        augmented = propositions.copy()
-        if missing_keywords:
-            missing_str = ", ".join(list(missing_keywords)[:5])
-            augmented.append(f"MUST INCLUDE concepts: {missing_str}")
-
-        # Generate with lower temperature for consistency
+        # Generate with lower temperature and stricter prompt
         old_temp = self.generator.config.temperature
         self.generator.config.temperature = self.config.repair_temperature
 
+        # Use stricter system prompt for repair
+        repair_system = (
+            f"You are a translator who converts text into {self.author}'s writing style. "
+            "CRITICAL: Translate the text faithfully. Do NOT:\n"
+            "- Add new ideas, examples, or explanations\n"
+            "- Expand or elaborate beyond the original\n"
+            "- Change the meaning or add interpretations\n"
+            "Output ONLY the translated text, nothing else."
+        )
+
         try:
-            output = self.generator.generate_with_repair(
-                propositions=augmented,
+            # Estimate tokens based on input
+            input_words = len(original.split())
+            max_tokens = max(100, int(input_words * 2.0))
+
+            output = self.generator.generate(
+                content=original,
                 author=self.author,
-                previous_paragraph=previous,
+                context=previous,
+                system_override=repair_system,
+                max_tokens=max_tokens,
             )
         finally:
             self.generator.config.temperature = old_temp
@@ -356,6 +418,10 @@ class FastStyleTransfer:
         start_time = time.time()
         stats = TransferStats()
 
+        # Reset repetition reducer for new document
+        if self.repetition_reducer:
+            self.repetition_reducer.reset()
+
         # Split into paragraphs
         paragraphs = split_into_paragraphs(text)
 
@@ -378,7 +444,12 @@ class FastStyleTransfer:
 
             para_start = time.time()
 
-            output, score = self.transfer_paragraph(para, previous)
+            output, score = self.transfer_paragraph(para, previous, stats)
+
+            # Apply repetition reduction
+            if self.repetition_reducer:
+                output, reduction_stats = self.repetition_reducer.reduce(output)
+                stats.words_replaced += reduction_stats.replacements_made
 
             para_time = time.time() - para_start
             logger.debug(f"Paragraph {i+1}: {para_time:.1f}s, score={score:.2f}")
@@ -398,6 +469,15 @@ class FastStyleTransfer:
             stats.total_time_seconds / stats.paragraphs_processed
             if stats.paragraphs_processed > 0 else 0
         )
+
+        # Log repetition reduction summary
+        if self.repetition_reducer and stats.words_replaced > 0:
+            overused = self.repetition_reducer.get_overused_words(limit=5)
+            if overused:
+                logger.info(
+                    f"Repetition reduction: {stats.words_replaced} replacements, "
+                    f"top overused: {', '.join(w for w, _ in overused)}"
+                )
 
         logger.info(
             f"Transfer complete: {stats.paragraphs_processed} paragraphs in "

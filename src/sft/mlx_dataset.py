@@ -7,6 +7,7 @@ to learn style separately from content.
 """
 
 import json
+import re
 from dataclasses import dataclass
 from typing import List, Optional, Callable, Dict, Any
 from pathlib import Path
@@ -17,7 +18,18 @@ from ..utils.logging import get_logger
 logger = get_logger(__name__)
 
 
-# Style-neutral instruction prompt - focuses on WHAT, not HOW
+# Prompt to generate neutral paraphrase (same content, no distinctive style)
+NEUTRALIZE_PROMPT = """Convert distinctive prose to plain neutral English. Keep the SAME word count.
+
+EXAMPLE:
+Distinctive (32 words): "The cosmos is vast beyond imagining. We are, each of us, a tiny speck in an ocean of stars. And yet - in this vastness - our minds can grasp infinity itself."
+Neutral (32 words): "The universe is very large. Each person is a small part of a huge number of stars. Despite this large scale, human minds are able to understand the concept of infinity."
+
+NOW DO THIS:
+Distinctive ({word_count} words): "{chunk}"
+Neutral ({word_count} words):"""
+
+# Fallback: simple description for when LLM unavailable
 CONTENT_EXTRACTION_PROMPT = """Describe the content of this passage in neutral, factual terms.
 
 Focus ONLY on:
@@ -83,8 +95,8 @@ class MLXDatasetGenerator:
     def __init__(
         self,
         llm_generate: Optional[Callable[[str], str]] = None,
-        min_chunk_words: int = 150,
-        max_chunk_words: int = 400,
+        min_chunk_words: int = 50,
+        max_chunk_words: int = 200,
     ):
         """Initialize the MLX dataset generator.
 
@@ -93,6 +105,9 @@ class MLXDatasetGenerator:
                          Signature: (prompt: str) -> str
             min_chunk_words: Minimum words per training chunk.
             max_chunk_words: Maximum words per training chunk.
+
+        Note: Smaller chunks (50-200 words) match inference paragraph size,
+        teaching the model to work at the same granularity.
         """
         self.llm_generate = llm_generate
         self.min_chunk_words = min_chunk_words
@@ -148,38 +163,52 @@ class MLXDatasetGenerator:
         )
         return chunks
 
-    def generate_content_description(self, chunk: str) -> str:
-        """Generate style-neutral content description for a chunk.
+    def generate_neutral_paraphrase(self, chunk: str) -> str:
+        """Generate a neutral paraphrase of the chunk.
 
-        CRITICAL: Description must focus on WHAT is said, not HOW.
-        This forces the model to learn style as a separate dimension
-        from content.
+        Creates a plain English version with the same content but no
+        distinctive stylistic features. This becomes the training INPUT,
+        teaching the model to transform neutral text into styled text.
 
         Args:
-            chunk: Text chunk from corpus.
+            chunk: Text chunk from corpus (author's styled text).
 
         Returns:
-            Style-neutral description of chunk content.
+            Neutral paraphrase with same content, no distinctive style.
         """
-        if not self.llm_generate:
-            # Fallback: extract key propositions heuristically
-            return self._heuristic_description(chunk)
+        word_count = len(chunk.split())
 
-        prompt = CONTENT_EXTRACTION_PROMPT.format(chunk=chunk[:2000])
+        if not self.llm_generate:
+            # Fallback: return chunk as-is (less effective but works)
+            logger.warning("No LLM available for paraphrase generation")
+            return chunk
+
+        prompt = NEUTRALIZE_PROMPT.format(chunk=chunk[:2000], word_count=word_count)
 
         try:
             response = self.llm_generate(prompt)
-            description = response.strip()
+            paraphrase = response.strip()
 
-            # Clean up and limit length
-            if len(description) > 400:
-                description = description[:400].rsplit('.', 1)[0] + '.'
+            # Strip any prefix like 'Neutral (47 words): "...'
+            paraphrase = re.sub(r'^Neutral\s*\(\d+\s*words?\)\s*:\s*', '', paraphrase)
+            # Remove surrounding quotes if present
+            if paraphrase.startswith('"') and paraphrase.endswith('"'):
+                paraphrase = paraphrase[1:-1]
+            paraphrase = paraphrase.strip()
 
-            return description
+            # Ensure we got a reasonable paraphrase
+            para_words = len(paraphrase.split())
+            if para_words < word_count * 0.5 or para_words > word_count * 1.5:
+                logger.warning(f"Paraphrase length mismatch: {para_words} vs {word_count}")
+                # Try to use it anyway if it's reasonable
+                if para_words < 20:
+                    return chunk  # Fallback to original
+
+            return paraphrase
 
         except Exception as e:
-            logger.warning(f"Content description generation failed: {e}")
-            return self._heuristic_description(chunk)
+            logger.warning(f"Neutral paraphrase generation failed: {e}")
+            return chunk  # Fallback to original
 
     def _heuristic_description(self, chunk: str) -> str:
         """Generate heuristic content description without LLM.
@@ -209,41 +238,53 @@ class MLXDatasetGenerator:
     def create_training_example(
         self,
         chunk: str,
-        content_description: str,
+        neutral_input: str,
         author: str,
     ) -> MLXTrainingExample:
         """Create a single training example.
 
+        Training uses neutral text as input and styled text as output:
+        - Input: Plain, neutral paraphrase (no distinctive style)
+        - Output: Author's original text (with distinctive style)
+
+        This teaches the model to TRANSFORM neutral text into the author's
+        distinctive voice, rather than just copying.
+
         Args:
-            chunk: Original text chunk (becomes assistant response).
-            content_description: Style-neutral description of content.
+            chunk: Original text chunk in author's style (becomes output).
+            neutral_input: Neutral paraphrase of the chunk (becomes input).
             author: Author name.
 
         Returns:
             MLXTrainingExample ready for training.
         """
-        # Minimal system prompt - just sets identity
-        system = f"You write in the style of {author}. Render the given content in this voice."
+        # System prompt emphasizes style transformation
+        system = f"You write exactly like {author}. Transform the text into {author}'s distinctive voice and style."
 
+        # Input: neutral text, Output: author's styled text
+        # This teaches: plain text → distinctive author style
         return MLXTrainingExample(
             system=system,
-            user=content_description,
-            assistant=chunk,
+            user=neutral_input,  # Neutral/plain version
+            assistant=chunk,     # Author's original styled text
         )
 
     def generate_dataset(
         self,
         paragraphs: List[str],
         author: str,
-        generate_descriptions: bool = True,
+        generate_paraphrases: bool = True,
         progress_callback: Optional[Callable[[int, int], None]] = None,
     ) -> List[MLXTrainingExample]:
         """Generate complete MLX training dataset from corpus.
 
+        Each example pairs a neutral paraphrase (input) with the author's
+        original styled text (output), teaching style transformation.
+
         Args:
             paragraphs: List of paragraph texts from corpus.
             author: Author name.
-            generate_descriptions: Whether to generate LLM descriptions.
+            generate_paraphrases: Whether to generate LLM paraphrases.
             progress_callback: Optional callback (current, total).
 
         Returns:
@@ -257,20 +298,23 @@ class MLXDatasetGenerator:
             return []
 
         logger.info(f"Generating {len(chunks)} training examples for {author}")
+        if generate_paraphrases and self.llm_generate:
+            logger.info("Generating neutral paraphrases for each chunk (this may take a while)...")
 
         examples = []
 
         for i, chunk in enumerate(chunks):
-            # Generate content description
-            if generate_descriptions and self.llm_generate:
-                description = self.generate_content_description(chunk)
+            # Generate neutral paraphrase as training input
+            if generate_paraphrases and self.llm_generate:
+                neutral_input = self.generate_neutral_paraphrase(chunk)
             else:
-                description = self._heuristic_description(chunk)
+                # Fallback: use chunk as-is (less effective)
+                neutral_input = chunk
 
-            # Create training example
+            # Create training example: neutral → styled
             example = self.create_training_example(
-                chunk=chunk,
-                content_description=description,
+                chunk=chunk,           # Author's original (output)
+                neutral_input=neutral_input,  # Neutral version (input)
                 author=author,
             )
             examples.append(example)
@@ -379,7 +423,7 @@ def generate_mlx_dataset(
     examples = generator.generate_dataset(
         paragraphs=paragraphs,
         author=author,
-        generate_descriptions=(llm_generate is not None),
+        generate_paraphrases=(llm_generate is not None),
     )
 
     # Save dataset

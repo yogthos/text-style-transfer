@@ -89,6 +89,12 @@ Note: Author styles must be loaded into ChromaDB first using:
         help='Enable verbose output'
     )
 
+    parser.add_argument(
+        '--graph-mode',
+        action='store_true',
+        help='Enable graph-based generation mode (requires style graph index)'
+    )
+
     args = parser.parse_args()
 
     # Validate blend_ratio if provided
@@ -113,6 +119,37 @@ Note: Author styles must be loaded into ChromaDB first using:
     import json
     with open(args.config, 'r') as f:
         config = json.load(f)
+
+    # Check for graph mode and verify index exists
+    if args.graph_mode:
+        import chromadb
+
+        atlas_cache_path = args.atlas_cache or config.get("atlas", {}).get("persist_path", "atlas_cache")
+        chroma_path = Path(atlas_cache_path) / "chroma"
+
+        # Check if ChromaDB collection exists
+        if not chroma_path.exists():
+            print("⚠️  Style Graph Index missing.", file=sys.stderr)
+            print(f"   Expected location: {chroma_path}", file=sys.stderr)
+            print("   Please run 'python scripts/build_style_graph_index.py' first.", file=sys.stderr)
+            sys.exit(1)
+
+        # Try to connect and verify collection exists
+        try:
+            client = chromadb.PersistentClient(path=str(chroma_path))
+            collection = client.get_collection(name="style_graphs")
+            count = collection.count()
+            if count == 0:
+                print("⚠️  Style Graph Index is empty.", file=sys.stderr)
+                print("   Please run 'python scripts/build_style_graph_index.py' first.", file=sys.stderr)
+                sys.exit(1)
+            if args.verbose:
+                print(f"✓ Style Graph Index found ({count} graphs)")
+        except Exception as e:
+            print("⚠️  Style Graph Index missing or invalid.", file=sys.stderr)
+            print(f"   Error: {e}", file=sys.stderr)
+            print("   Please run 'python scripts/build_style_graph_index.py' first.", file=sys.stderr)
+            sys.exit(1)
 
     # Resolve atlas_cache_path: CLI override > config.json > None
     atlas_cache_path = args.atlas_cache or config.get("atlas", {}).get("persist_path")

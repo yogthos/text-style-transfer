@@ -5,10 +5,11 @@ This script runs all required setup steps:
 1. Load styles into ChromaDB
 2. Build paragraph atlas
 3. Build RAG index
+4. Build style graph index (for graph-based generation)
 
 Usage:
-    python scripts/init_author.py --author "Mao" --style-file styles/sample_mao.txt
-    python scripts/init_author.py --author "Sagan" --style-file styles/sample_sagan.txt --config config.json --verbose
+    python scripts/init_author.py --author "Mao" --style-file data/corpus/mao.txt
+    python scripts/init_author.py --author "Sagan" --style-file data/corpus/sagan.txt --config config.json --verbose
 """
 
 import argparse
@@ -67,8 +68,8 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --author "Mao" --style-file styles/sample_mao.txt
-  %(prog)s --author "Sagan" --style-file styles/sample_sagan.txt --config config.json --verbose
+  %(prog)s --author "Mao" --style-file data/corpus/mao.txt
+  %(prog)s --author "Sagan" --style-file data/corpus/sagan.txt --config config.json --verbose
   %(prog)s --author "Hemingway" --style-file styles/hemingway.txt --skip-rag
         """
     )
@@ -133,6 +134,12 @@ Examples:
         '--skip-rag',
         action='store_true',
         help='Skip building RAG index (if already built)'
+    )
+
+    parser.add_argument(
+        '--skip-graph-index',
+        action='store_true',
+        help='Skip building style graph index (if already built)'
     )
 
     parser.add_argument(
@@ -254,6 +261,23 @@ Examples:
     else:
         print("\n→ Skipping RAG index build (--skip-rag)")
 
+    # Step 4: Build Style Graph Index
+    if not args.skip_graph_index:
+        graph_index_cmd = [
+            sys.executable,
+            str(script_dir / "build_style_graph_index.py"),
+            "--corpus-file", args.style_file,
+            "--author", args.author,
+            "--config", args.config
+        ]
+
+        if not run_command(graph_index_cmd, "Building style graph index", args.verbose):
+            success = False
+            if not args.verbose:
+                print("  Continuing...")
+    else:
+        print("\n→ Skipping style graph index build (--skip-graph-index)")
+
     # Summary
     print(f"\n{'='*60}")
     if success:
@@ -261,6 +285,7 @@ Examples:
         print(f"\nYou can now use this author for style transfer:")
         print(f"  python3 restyle.py input.txt -o output.txt")
         print(f"\nMake sure '{args.author}' is listed in config.json under 'blend.authors'")
+        print(f"\nNote: Graph-based generation requires the style graph index (built in Step 4).")
     else:
         print(f"✗ Initialization completed with errors")
         print(f"  Review the output above for details")

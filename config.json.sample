@@ -1,219 +1,120 @@
 {
-  "provider": "deepseek",
-  "ollama": {
-    "url": "http://localhost:11434/api/chat",
-    "editor_model": "mistral-nemo:12b",
-    "critic_model": "qwen3:8b",
-    "keep_alive": "10m"
+  "fitness_weights": {
+    "content": 0.40,
+    "length": 0.20,
+    "transition": 0.15,
+    "vocabulary": 0.15,
+    "fluency": 0.10,
+    "style_blending": {
+      "enabled_weight": 0.15,
+      "content_with_blending": 0.35,
+      "length_with_blending": 0.18,
+      "transition_with_blending": 0.12,
+      "vocabulary_with_blending": 0.12,
+      "fluency_with_blending": 0.08
+    }
   },
-  "deepseek": {
-    "api_key": "<your key>",
-    "api_url": "https://api.deepseek.com/v1/chat/completions",
-    "editor_model": "deepseek-chat",
-    "critic_model": "deepseek-chat"
+  "thresholds": {
+    "overuse_word_count": 3,
+    "severe_overuse_count": 5,
+    "entailment_score": 0.5,
+    "delta_score": 1.5,
+    "content_preservation_min": 0.5,
+    "novelty_min": 0.95,
+    "anachronistic_pass_rate": 0.9
   },
-  "llm_provider": {
-    "max_retries": 5,
-    "retry_delay": 2,
-    "timeout": 120,
-    "batch_timeout": 180,
-    "context_window": 128000,
-    "max_output_tokens": 4000,
-    "models_list_timeout": 5
-  },
-  "atlas": {
-    "persist_path": "atlas_cache/",
-    "num_clusters": 5,
-    "min_structure_words": 4,
-    "max_length_ratio": 1.5,
-    "min_length_ratio": 0.5,
-    "early_exit_threshold": 0.1,
-    "length_tolerance": 0.2
-  },
-  "length_gate": {
-    "default_min_ratio": 0.6,
-    "default_max_ratio": 2.0,
-    "lenient_min_ratio": 0.1,
-    "lenient_max_ratio": 6.0,
-    "very_different_threshold_low": 0.5,
-    "very_different_threshold_high": 2.0,
-    "moderate_different_threshold_low": 0.67,
-    "moderate_different_threshold_high": 1.5,
-    "skip_gate_when_very_different": true,
-    "micro_sentence_threshold": 6,
-    "micro_sentence_absolute_tolerance": 2
-  },
-  "critic": {
-    "stat_tolerance": 0.2,
-    "min_score": 0.75,
-    "max_retries": 5,
-    "fallback_pass_threshold": 0.75,
-    "good_enough_threshold": 0.95,
-    "evaluation_temperature": 0.3,
-    "edit_temperature": 0.3,
-    "evaluation_max_tokens": 300,
-    "edit_max_tokens": 200,
-    "synonym_threshold": 0.6,
-    "coverage_threshold": 0.8,
-    "similarity_threshold": 0.7,
-    "semantic_similarity_threshold": 0.65,
-    "high_semantic_similarity_threshold": 0.8
-  },
-  "scorer": {
-    "meaning_threshold": 0.8,
-    "style_threshold": 0.7,
-    "hallucination_threshold": 0.1,
-    "llm_style_threshold": 0.75,
-    "evaluation_temperature": 0.2,
-    "evaluation_max_tokens": 300
-  },
-  "blend": {
-    "authors": [
-      "Langan",
-      "Mao"
-    ],
-    "ratio": 0.6
-  },
-  "translator": {
-    "temperature": 0.6,
-    "max_tokens": 3000,
-    "literal_temperature": 0.3,
-    "literal_max_tokens": 200,
-    "batch_temperature": 0.6,
-    "breeding_temperature": 0.7,
-    "repair_temperature": 0.2,
-    "classification_temperature": 0.3,
-    "smoothing_temperature": 0.2,
-    "fallback_temperature": 0.5,
-    "fallback_max_tokens": 200
-  },
-  "semantic_critic": {
-    "recall_threshold": 0.9,
-    "precision_threshold": 0.6,
-    "similarity_threshold": 0.5,
-    "fluency_threshold": 0.75,
-    "accuracy_weight": 0.50,
-    "fluency_weight": 0.10,
-    "weights": {
-      "accuracy": 0.50,
-      "fluency": 0.10,
-      "style": 0.10,
-      "thesis_alignment": 0.20,
-      "intent_compliance": 0.10,
-      "keyword_coverage": 0.0
+  "llm": {
+    "provider": "deepseek",
+    "providers": {
+      "deepseek": {
+        "api_key": "${DEEPSEEK_API_KEY}",
+        "base_url": "https://api.deepseek.com",
+        "model": "deepseek-chat",
+        "max_tokens": 4096,
+        "temperature": 0.7,
+        "timeout": 120
+      },
+      "ollama": {
+        "base_url": "http://localhost:11434",
+        "model": "llama3",
+        "max_tokens": 4096,
+        "temperature": 0.7
+      },
+      "openai": {
+        "api_key": "${OPENAI_API_KEY}",
+        "base_url": "https://api.openai.com/v1",
+        "model": "gpt-4",
+        "max_tokens": 4096,
+        "temperature": 0.7
+      },
+      "anthropic": {
+        "api_key": "${ANTHROPIC_API_KEY}",
+        "base_url": "https://api.anthropic.com",
+        "model": "claude-3-sonnet-20240229",
+        "max_tokens": 4096,
+        "temperature": 0.7
+      }
     },
-    "evaluation_temperature": 0.2,
-    "batch_evaluation_temperature": 0.1,
-    "evaluation_max_tokens": 200,
-    "entailment_max_tokens": 150,
-    "meaning_preservation_max_tokens": 300,
-    "evaluation_timeout": 30,
-    "entailment_timeout": 20,
-    "meaning_preservation_timeout": 20,
-    "paragraph_mode_similarity_threshold": 0.3,
-    "use_llm_verification": false
+    "retry": {
+      "max_attempts": 5,
+      "base_delay": 2,
+      "max_delay": 60
+    }
   },
-  "paragraph_atlas": {
-    "path": "atlas_cache/paragraph_atlas"
-  },
-  "semantic_translation": {
-    "temperature": 0.3,
-    "max_tokens": 1000
-  },
-  "generation": {
-    "temperature": 0.7,
-    "max_tokens": 1500,
-    "num_candidates": 6,
-    "max_retries": 10,
-    "compliance_threshold": 0.85,
-    "compliance_fuzziness": 0.05,
-    "sentence_variants_per_attempt": 5,
-    "default_perspective": "third_person",
-    "_perspective_options": "Valid options: 'first_person_singular', 'first_person_plural', 'third_person', 'author_voice_third_person' (writes AS author, not ABOUT author)",
-    "presence_penalty": 0.6,
-    "frequency_penalty": 0.3
-  },
-  "global_context": {
-    "enabled": true,
-    "max_summary_tokens": 600,
-    "analysis_temperature": 0.3
-  },
-  "refinement": {
-    "max_generations": 10,
-    "pass_threshold": 0.9,
-    "patience_threshold": 5,
-    "patience_min_score": 0.8,
-    "initial_temperature": 0.4,
-    "temperature_increment": 0.1,
-    "max_temperature": 0.95,
-    "refinement_temperature": 0.6,
-    "repair_plan_temperature": 0.3,
-    "repair_execution_temperature": 0.5,
-    "repair_plan_max_tokens": 1000,
-    "repair_execution_max_tokens": 500,
-    "repair_variants_per_attempt": 5,
-    "prefer_compression_on_repetition": true,
-    "repetition_trigger_threshold": 5
-  },
-  "evolutionary": {
-    "batch_size": 40,
-    "max_generations": 10,
-    "convergence_threshold": 0.95,
-    "top_k_parents": 10,
-    "breeding_children": 10,
-    "fresh_generation_ratio": 0.33,
-    "min_keyword_presence": 0.4,
-    "min_viable_recall": 0.85
-  },
-  "style_rag": {
-    "num_fragments": 5,
-    "window_size": 3,
-    "overlap": 1,
+  "chromadb": {
+    "persist_path": "atlas_cache/",
     "embedding_model": "all-mpnet-base-v2"
   },
-  "content_planner": {
-    "temperature": 0.3,
-    "max_tokens": 1000
+  "corpus": {
+    "min_sentences_per_paragraph": 2,
+    "style_audit_threshold": 4,
+    "opener_percentage": 0.15,
+    "closer_percentage": 0.15
   },
-  "structure_extractor": {
-    "temperature": 0.3,
-    "max_tokens": 500,
-    "timeout": 30
+  "generation": {
+    "max_repair_retries": 5,
+    "rag_examples_count": 5,
+    "length_tolerance": 0.2,
+    "short_paragraph_threshold": 2
   },
-  "style_extractor": {
-    "temperature": 0.3,
-    "max_tokens": 300
+  "style": {
+    "perspective": "preserve",
+    "perspective_options": {
+      "preserve": "Keep the original perspective from input text",
+      "first_person_singular": "Convert to I/me/my perspective",
+      "first_person_plural": "Convert to we/us/our perspective",
+      "third_person": "Convert to he/she/they perspective"
+    },
+    "voice_injection": {
+      "enabled": true,
+      "assertiveness_weight": 0.7,
+      "rhetorical_weight": 0.8
+    },
+    "blending": {
+      "enabled": false,
+      "embedding_model": "all-MiniLM-L6-v2",
+      "cache_dir": "centroid_cache/",
+      "authors": {}
+    }
   },
-  "prompt_builder": {
-    "temperature": 0.3,
-    "max_tokens": 100
+  "validation": {
+    "semantic": {
+      "min_proposition_coverage": 0.9,
+      "max_hallucinated_entities": 0,
+      "require_citation_preservation": true
+    },
+    "statistical": {
+      "length_tolerance": 0.2,
+      "burstiness_tolerance": 0.3,
+      "min_vocab_match": 0.5
+    }
   },
-  "rhetoric": {
-    "classification_max_tokens": 10
+  "context_budget": {
+    "system_prompt_max": 1500,
+    "user_prompt_max": 600,
+    "keep_last_n_sentences": 5,
+    "max_conversation_tokens": 8000
   },
-  "structure_tracker": {
-    "opener_penalty_threshold": 0.3
-  },
-  "vocabulary_budget": {
-    "enabled": true,
-    "restricted_words": [
-      "profound",
-      "profoundly",
-      "vast",
-      "vastly",
-      "monumental",
-      "staggering",
-      "colossal",
-      "inexorable",
-      "intricate",
-      "complexity",
-      "alienation"
-    ],
-    "max_per_chapter": 0,
-    "clustering_distance": 50,
-    "enforce_clustering": true,
-    "auto_regenerate_on_violation": true,
-    "force_programmatic_fix": true,
-    "max_retries_before_force": 1
-  }
+  "log_level": "INFO",
+  "log_json": false
 }

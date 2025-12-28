@@ -47,3 +47,7 @@ atlas_cache/
 
 # Cache files
 structure_cache.json
+
+# Logs
+logs/*.md
+!logs/.gitkeep

@@ -2,10 +2,14 @@
 """Load author styles into ChromaDB.
 
 This script loads style text files into ChromaDB with author tags for use
-in style blending and text restyling.
+in style blending and text restyling. This creates the style atlas used for
+statistical/archetype-based generation (fallback mode).
+
+For graph-based generation, you also need to run:
+    python scripts/build_style_graph_index.py --corpus-file <file> --author <author>
 
 Usage:
-    python scripts/load_style.py --style-file styles/sample_sagan.txt --author "Sagan"
+    python scripts/load_style.py --style-file data/corpus/sagan.txt --author "Sagan"
     python scripts/load_style.py --style-file file1.txt --author "Author1" --style-file file2.txt --author "Author2"
 """
 
@@ -18,7 +22,7 @@ from pathlib import Path
 project_root = Path(__file__).parent.parent
 sys.path.insert(0, str(project_root))
 
-from src.atlas.builder import build_style_atlas
+from src.atlas.builder import build_style_atlas, save_atlas
 
 
 def main():
@@ -28,9 +32,9 @@ def main():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s --style-file styles/sample_sagan.txt --author "Sagan"
-  %(prog)s --style-file styles/sample_hemingway.txt --author "Hemingway" \\
-           --style-file styles/sample_lovecraft.txt --author "Lovecraft"
+  %(prog)s --style-file data/corpus/sagan.txt --author "Sagan"
+  %(prog)s --style-file data/corpus/hemingway.txt --author "Hemingway" \\
+           --style-file data/corpus/lovecraft.txt --author "Lovecraft"
         """
     )
 
@@ -155,6 +159,13 @@ Examples:
             paragraph_count = len(atlas.cluster_ids)
             print(f"  ✓ Loaded style for author '{author_name}': {paragraph_count} paragraphs, {atlas.num_clusters} clusters")
 
+            # Save atlas.json file (needed by pipeline)
+            if atlas_cache_path:
+                atlas_file = Path(atlas_cache_path) / "atlas.json"
+                save_atlas(atlas, str(atlas_file))
+                if args.verbose:
+                    print(f"  Saved atlas metadata to: {atlas_file}")
+
             if args.verbose:
                 print(f"  Collection: {collection_name}")
                 print(f"  Persist directory: {atlas_cache_path}")
@@ -172,6 +183,10 @@ Examples:
     print(f"  Persist directory: {atlas_cache_path or '(in-memory)'}")
     if not atlas_cache_path:
         print(f"\n⚠ Note: Data is in-memory. Use --atlas-cache or set 'atlas.persist_path' in config.json to persist.")
+
+    print(f"\nNote: This script loads styles for statistical/archetype-based generation.")
+    print(f"      For graph-based generation, also run:")
+    print(f"        python scripts/build_style_graph_index.py --corpus-file <file> --author <author>")
     print(f"\nYou can now use restyle.py to transform text using these styles.")
 
 

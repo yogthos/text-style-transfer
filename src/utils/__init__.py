@@ -1,25 +1,47 @@
-# Utils package
-# Re-export functions from utils.py for backward compatibility
-import sys
-import importlib.util
-from pathlib import Path
+"""Utility modules for the style transfer pipeline."""
 
-# Import from the parent utils.py file
-_parent_dir = Path(__file__).parent.parent
-_utils_file = _parent_dir / "utils.py"
+from .logging import (
+    get_logger,
+    setup_logging,
+    set_request_id,
+    get_request_id,
+    log_llm_call,
+)
+from .nlp import (
+    get_nlp,
+    split_into_sentences,
+    split_into_paragraphs,
+    extract_citations,
+    remove_citations,
+    extract_entities,
+    extract_keywords,
+    count_words,
+    calculate_burstiness,
+    get_pos_distribution,
+    get_dependency_depth,
+    detect_perspective,
+    setup_nltk,
+)
 
-if _utils_file.exists():
-    # Load utils.py as a module
-    spec = importlib.util.spec_from_file_location("_utils_py_module", _utils_file)
-    _utils_py = importlib.util.module_from_spec(spec)
-    sys.modules['_utils_py_module'] = _utils_py
-    spec.loader.exec_module(_utils_py)
-
-    # Re-export the functions
-    calculate_length_ratio = _utils_py.calculate_length_ratio
-    should_skip_length_gate = _utils_py.should_skip_length_gate
-    is_very_different_length = _utils_py.is_very_different_length
-    is_moderate_different_length = _utils_py.is_moderate_different_length
-    get_length_gate_ratios = _utils_py.get_length_gate_ratios
-else:
-    raise ImportError(f"Could not find utils.py at {_utils_file}")
+__all__ = [
+    # Logging
+    "get_logger",
+    "setup_logging",
+    "set_request_id",
+    "get_request_id",
+    "log_llm_call",
+    # NLP
+    "get_nlp",
+    "split_into_sentences",
+    "split_into_paragraphs",
+    "extract_citations",
+    "remove_citations",
+    "extract_entities",
+    "extract_keywords",
+    "count_words",
+    "calculate_burstiness",
+    "get_pos_distribution",
+    "get_dependency_depth",
+    "detect_perspective",
+    "setup_nltk",
+]

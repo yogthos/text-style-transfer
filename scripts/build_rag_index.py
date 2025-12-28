@@ -187,7 +187,7 @@ def main():
         "--corpus-file",
         type=str,
         default=None,
-        help="Path to corpus file (default: styles/sample_{author}.txt)"
+        help="Path to corpus file (default: data/corpus/{author}.txt)"
     )
 
     parser.add_argument(

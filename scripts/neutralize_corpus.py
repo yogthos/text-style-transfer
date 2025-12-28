@@ -239,8 +239,8 @@ def main():
             f.write(json.dumps(r) + '\n')
 
     print(f"\nSaved {len(results)} pairs to {output_path}")
-    print(f"Use this file to generate training data with:")
-    print(f"  python scripts/train_mlx_lora.py --from-neutralized {output_path} --author '{args.author}' --output lora_adapters/{args.author.lower()}")
+    print(f"Train LoRA adapter with:")
+    print(f"  python scripts/train_mlx_lora.py --from-neutralized {output_path} --author '{args.author}' --train --output lora_adapters/{args.author.lower()}")
 
 
 if __name__ == "__main__":

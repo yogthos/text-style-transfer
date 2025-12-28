@@ -4,6 +4,7 @@ Core validation for the LoRA pipeline:
 - EntailmentVerifier: NLI-based content verification
 - SemanticVerifier: Semantic fidelity checking with repair hints
 - QualityCritic: Explicit fix instructions for quality issues
+- PropositionValidator: Proposition-level validation with repair instructions
 """
 
 from .entailment import EntailmentVerifier, EntailmentResult
@@ -18,6 +19,13 @@ from .quality_critic import (
     QualityCritique,
     QualityIssue,
 )
+from .proposition_validator import (
+    PropositionValidator,
+    PropositionMatch,
+    HallucinatedContent,
+    ValidationResult as PropositionValidationResult,
+    create_proposition_validator,
+)
 
 __all__ = [
     "EntailmentVerifier",
@@ -29,4 +37,9 @@ __all__ = [
     "QualityCritic",
     "QualityCritique",
     "QualityIssue",
+    "PropositionValidator",
+    "PropositionMatch",
+    "HallucinatedContent",
+    "PropositionValidationResult",
+    "create_proposition_validator",
 ]

@@ -23,6 +23,7 @@ from ..utils.nlp import (
     filter_headings,
 )
 from ..utils.logging import get_logger
+from ..ingestion.proposition_extractor import PropositionNode
 
 logger = get_logger(__name__)
 
@@ -40,13 +41,18 @@ class TransferConfig:
     verify_entailment: bool = True
     entailment_threshold: float = 0.7
 
+    # Proposition validation settings
+    use_proposition_validation: bool = True  # Enable proposition-based validation
+    proposition_threshold: float = 0.7  # Min proposition coverage
+    anchor_threshold: float = 0.8  # Min content anchor coverage
+
     # Quality critic settings
     use_quality_critic: bool = True  # Enable quality checking with explicit fix instructions
     word_cluster_threshold: int = 3  # Words used 3+ times trigger warning
 
-    # Repair settings
-    max_repair_attempts: int = 2  # Allow 2 repair attempts with critic feedback
-    repair_temperature: float = 0.5  # Lower temp for repair
+    # Repair settings (can be overridden by app config)
+    max_repair_attempts: int = 3
+    repair_temperature: float = 0.3
 
     # Post-processing settings
     reduce_repetition: bool = True
@@ -161,6 +167,7 @@ class FastStyleTransfer:
         self,
         adapter_path: Optional[str],
         author_name: str,
+        critic_provider,
         config: Optional[TransferConfig] = None,
         verify_fn: Optional[Callable[[str, str], float]] = None,
     ):
@@ -169,12 +176,14 @@ class FastStyleTransfer:
         Args:
             adapter_path: Path to LoRA adapter directory, or None for base model.
             author_name: Author name for prompts.
+            critic_provider: LLM provider for critique/repair (e.g., DeepSeek).
             config: Transfer configuration.
             verify_fn: Optional verification function (original, output) -> score.
         """
         self.config = config or TransferConfig()
         self.author = author_name
         self.verify_fn = verify_fn
+        self.critic_provider = critic_provider
 
         # Initialize generator
         gen_config = GenerationConfig(
@@ -206,9 +215,20 @@ class FastStyleTransfer:
                 cluster_threshold=self.config.word_cluster_threshold
             )
 
+        # Initialize proposition validator for semantic fidelity checking
+        self.proposition_validator = None
+        if self.config.use_proposition_validation:
+            from ..validation.proposition_validator import PropositionValidator
+            self.proposition_validator = PropositionValidator(
+                proposition_threshold=self.config.proposition_threshold,
+                anchor_threshold=self.config.anchor_threshold,
+            )
+
         # Set up entailment verifier if requested
         if self.config.verify_entailment and self.verify_fn is None:
             self.verify_fn = self._create_default_verifier()
+
+        logger.info(f"Using critic provider for repairs: {self.critic_provider.provider_name}")
 
     def _create_default_verifier(self) -> Callable[[str, str], float]:
         """Create default entailment verifier."""
@@ -269,7 +289,7 @@ class FastStyleTransfer:
         previous: Optional[str] = None,
         stats: Optional['TransferStats'] = None,
     ) -> Tuple[str, float]:
-        """Transfer a single paragraph with quality checking and repair.
+        """Transfer a single paragraph with proposition-based validation and repair.
 
         Args:
             paragraph: Source paragraph.
@@ -287,6 +307,12 @@ class FastStyleTransfer:
         word_count = len(paragraph.split())
         logger.debug(f"Translating paragraph: {word_count} words")
 
+        # Extract propositions from source for validation
+        source_propositions = None
+        if self.proposition_validator:
+            source_propositions = self.proposition_validator.extract_propositions(paragraph)
+            logger.debug(f"Extracted {len(source_propositions)} propositions from source")
+
         # Generate with token limit based on input (allow 1.5x for style variation)
         max_tokens = max(100, int(word_count * 1.8))
 
@@ -297,8 +323,50 @@ class FastStyleTransfer:
             max_tokens=max_tokens,
         )
 
-        # Quality critique and repair loop
-        if self.quality_critic:
+        # Proposition-based validation and repair loop
+        if self.proposition_validator and source_propositions:
+            for attempt in range(self.config.max_repair_attempts):
+                validation = self.proposition_validator.validate(
+                    paragraph, output, source_propositions
+                )
+
+                if stats:
+                    stats.quality_issues_found += len(validation.missing_propositions)
+                    stats.quality_issues_found += len(validation.hallucinated_content)
+
+                if validation.is_valid:
+                    logger.debug(
+                        f"Proposition validation passed (attempt {attempt + 1}): "
+                        f"{validation.proposition_coverage:.0%} coverage"
+                    )
+                    break
+
+                # Log specific issues
+                if validation.missing_entities:
+                    logger.warning(f"Missing entities: {', '.join(validation.missing_entities[:3])}")
+                if validation.added_entities:
+                    logger.warning(f"Hallucinated entities: {', '.join(validation.added_entities[:3])}")
+                if validation.missing_facts:
+                    logger.warning(f"Missing facts: {len(validation.missing_facts)}")
+
+                logger.info(
+                    f"Repair attempt {attempt + 1}: "
+                    f"{len(validation.missing_propositions)} missing propositions, "
+                    f"{len(validation.hallucinated_content)} hallucinations"
+                )
+
+                # Use critic provider for surgical repairs
+                output = self._critic_repair(
+                    source=paragraph,
+                    current_output=output,
+                    validation=validation,
+                )
+
+                if stats:
+                    stats.quality_issues_fixed += 1
+
+        # Fallback to quality critic if proposition validator not available
+        elif self.quality_critic:
             for attempt in range(self.config.max_repair_attempts):
                 critique = self.quality_critic.critique(paragraph, output)
 
@@ -314,27 +382,14 @@ class FastStyleTransfer:
                     if issue.severity == "critical":
                         logger.warning(f"Quality issue: {issue.description}")
 
-                # Generate repair prompt with explicit fix instructions
-                repair_prompt = self.quality_critic.get_repair_system_prompt(
-                    self.author, critique
-                )
-
                 logger.info(f"Repair attempt {attempt + 1}: {len(critique.issues)} issues")
 
-                # Lower temperature for repair
-                old_temp = self.generator.config.temperature
-                self.generator.config.temperature = self.config.repair_temperature
-
-                try:
-                    output = self.generator.generate(
-                        content=paragraph,
-                        author=self.author,
-                        context=previous,
-                        system_override=repair_prompt,
-                        max_tokens=max_tokens,
-                    )
-                finally:
-                    self.generator.config.temperature = old_temp
+                # Use critic provider for repairs
+                output = self._quality_critic_repair(
+                    source=paragraph,
+                    current_output=output,
+                    critique=critique,
+                )
 
                 if stats:
                     stats.quality_issues_fixed += 1
@@ -345,6 +400,131 @@ class FastStyleTransfer:
             score = self.verify_fn(paragraph, output)
 
         return output, score
+
+    def _call_critic(
+        self,
+        source: str,
+        current_output: str,
+        instructions: List[str],
+    ) -> str:
+        """Call critic provider to make surgical fixes.
+
+        Args:
+            source: Original source text.
+            current_output: Current styled output with issues.
+            instructions: List of specific fix instructions.
+
+        Returns:
+            Repaired text.
+        """
+        if not instructions:
+            return current_output
+
+        instruction_text = "\n".join(f"- {inst}" for inst in instructions)
+
+        system_prompt = """You are a precise text editor making surgical fixes to styled text.
+
+NON-NEGOTIABLE REQUIREMENTS (failure is not acceptable):
+1. Every sentence MUST be grammatically correct and complete - no fragments or broken sentences
+2. The meaning MUST exactly match the source text - no information added or lost
+3. All text must read as natural, fluent English
+
+EDITING RULES:
+1. PRESERVE the existing writing style, vocabulary, and sentence structure
+2. Make ONLY the specific changes listed below
+3. Do NOT rewrite sentences that don't need fixing
+4. Do NOT add commentary or explanations
+5. Fix any incomplete, broken, or ungrammatical sentences you find
+6. Output ONLY the corrected text
+
+REQUIRED FIXES:
+""" + instruction_text
+
+        user_prompt = f"""SOURCE TEXT (meaning to preserve exactly):
+{source}
+
+CURRENT TEXT (fix this):
+{current_output}
+
+Fix the issues listed above. Every sentence must be complete and grammatical. Meaning must match the source."""
+
+        try:
+            repaired = self.critic_provider.call(
+                system_prompt=system_prompt,
+                user_prompt=user_prompt,
+                temperature=self.config.repair_temperature,
+                max_tokens=len(current_output.split()) * 2 + 100,
+            )
+            logger.debug(f"Critic repair applied: {len(instructions)} fixes")
+            return repaired.strip()
+        except Exception as e:
+            logger.warning(f"Critic repair failed: {e}, keeping original output")
+            return current_output
+
+    def _critic_repair(
+        self,
+        source: str,
+        current_output: str,
+        validation,
+    ) -> str:
+        """Use critic provider to surgically fix content issues.
+
+        Args:
+            source: Original source text.
+            current_output: Current styled output with issues.
+            validation: ValidationResult with specific issues.
+
+        Returns:
+            Repaired text with style preserved.
+        """
+        instructions = []
+
+        if validation.missing_entities:
+            entities = ", ".join(validation.missing_entities[:5])
+            instructions.append(f"ADD these missing names/terms: {entities}")
+
+        if validation.added_entities:
+            entities = ", ".join(validation.added_entities[:5])
+            instructions.append(f"REMOVE these terms (not in source): {entities}")
+
+        if validation.missing_facts:
+            for fact in validation.missing_facts[:2]:
+                instructions.append(f"ADD this fact: {fact}")
+
+        if validation.stance_violations:
+            for violation in validation.stance_violations[:2]:
+                instructions.append(violation)
+
+        # Always check for grammar/completeness
+        instructions.append("FIX any incomplete or ungrammatical sentences")
+
+        return self._call_critic(source, current_output, instructions)
+
+    def _quality_critic_repair(
+        self,
+        source: str,
+        current_output: str,
+        critique,
+    ) -> str:
+        """Use critic provider to fix quality issues.
+
+        Args:
+            source: Original source text.
+            current_output: Current styled output with issues.
+            critique: QualityCritique with specific issues.
+
+        Returns:
+            Repaired text with style preserved.
+        """
+        instructions = []
+        for issue in critique.issues:
+            if issue.fix_instruction:
+                instructions.append(issue.fix_instruction)
+
+        # Always check for grammar/completeness
+        instructions.append("FIX any incomplete or ungrammatical sentences")
+
+        return self._call_critic(source, current_output, instructions)
 
     def _repair(
         self,
@@ -405,18 +585,22 @@ class FastStyleTransfer:
         self,
         text: str,
         on_progress: Optional[Callable[[int, int, str], None]] = None,
+        on_paragraph: Optional[Callable[[int, str], None]] = None,
     ) -> Tuple[str, TransferStats]:
         """Transfer an entire document.
 
         Args:
             text: Source document text.
             on_progress: Optional callback (current, total, status).
+            on_paragraph: Optional callback (index, paragraph) called after each paragraph is complete.
 
         Returns:
             Tuple of (styled_document, statistics).
         """
-        start_time = time.time()
-        stats = TransferStats()
+        # Track state for partial results on interrupt
+        self._transfer_start_time = time.time()
+        self._transfer_outputs = []
+        self._transfer_stats = TransferStats()
 
         # Reset repetition reducer for new document
         if self.repetition_reducer:
@@ -431,11 +615,10 @@ class FastStyleTransfer:
 
         if not paragraphs:
             logger.warning("No content paragraphs found")
-            return text, stats
+            return text, self._transfer_stats
 
         logger.info(f"Transferring {len(paragraphs)} paragraphs")
 
-        outputs = []
         previous = None
 
         for i, para in enumerate(paragraphs):
@@ -444,46 +627,69 @@ class FastStyleTransfer:
 
             para_start = time.time()
 
-            output, score = self.transfer_paragraph(para, previous, stats)
+            output, score = self.transfer_paragraph(para, previous, self._transfer_stats)
 
             # Apply repetition reduction
             if self.repetition_reducer:
                 output, reduction_stats = self.repetition_reducer.reduce(output)
-                stats.words_replaced += reduction_stats.replacements_made
+                self._transfer_stats.words_replaced += reduction_stats.replacements_made
 
             para_time = time.time() - para_start
             logger.debug(f"Paragraph {i+1}: {para_time:.1f}s, score={score:.2f}")
 
-            outputs.append(output)
+            self._transfer_outputs.append(output)
             previous = output
 
-            stats.paragraphs_processed += 1
-            stats.entailment_scores.append(score)
+            self._transfer_stats.paragraphs_processed += 1
+            self._transfer_stats.entailment_scores.append(score)
 
             if score < self.config.entailment_threshold:
-                stats.paragraphs_repaired += 1
+                self._transfer_stats.paragraphs_repaired += 1
+
+            # Notify callback with completed paragraph
+            if on_paragraph:
+                on_paragraph(i, output)
 
         # Compute final stats
-        stats.total_time_seconds = time.time() - start_time
-        stats.avg_time_per_paragraph = (
-            stats.total_time_seconds / stats.paragraphs_processed
-            if stats.paragraphs_processed > 0 else 0
+        self._transfer_stats.total_time_seconds = time.time() - self._transfer_start_time
+        self._transfer_stats.avg_time_per_paragraph = (
+            self._transfer_stats.total_time_seconds / self._transfer_stats.paragraphs_processed
+            if self._transfer_stats.paragraphs_processed > 0 else 0
         )
 
         # Log repetition reduction summary
-        if self.repetition_reducer and stats.words_replaced > 0:
+        if self.repetition_reducer and self._transfer_stats.words_replaced > 0:
             overused = self.repetition_reducer.get_overused_words(limit=5)
             if overused:
                 logger.info(
-                    f"Repetition reduction: {stats.words_replaced} replacements, "
+                    f"Repetition reduction: {self._transfer_stats.words_replaced} replacements, "
                     f"top overused: {', '.join(w for w, _ in overused)}"
                 )
 
         logger.info(
-            f"Transfer complete: {stats.paragraphs_processed} paragraphs in "
-            f"{stats.total_time_seconds:.1f}s "
-            f"(avg {stats.avg_time_per_paragraph:.1f}s/para)"
+            f"Transfer complete: {self._transfer_stats.paragraphs_processed} paragraphs in "
+            f"{self._transfer_stats.total_time_seconds:.1f}s "
+            f"(avg {self._transfer_stats.avg_time_per_paragraph:.1f}s/para)"
         )
+
+        return "\n\n".join(self._transfer_outputs), self._transfer_stats
+
+    def get_partial_results(self) -> Tuple[str, TransferStats]:
+        """Get partial results after an interrupted transfer.
+
+        Returns:
+            Tuple of (partial_output, statistics).
+        """
+        # Compute stats for partial transfer
+        if hasattr(self, '_transfer_stats') and hasattr(self, '_transfer_start_time'):
+            self._transfer_stats.total_time_seconds = time.time() - self._transfer_start_time
+            if self._transfer_stats.paragraphs_processed > 0:
+                self._transfer_stats.avg_time_per_paragraph = (
+                    self._transfer_stats.total_time_seconds / self._transfer_stats.paragraphs_processed
+                )
+
+        outputs = getattr(self, '_transfer_outputs', [])
+        stats = getattr(self, '_transfer_stats', TransferStats())
 
         return "\n\n".join(outputs), stats
 

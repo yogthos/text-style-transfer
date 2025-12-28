@@ -339,20 +339,68 @@ def get_provider(name: str, config: LLMProviderConfig, retry_config: Optional[Di
     return _provider_registry[name](config, retry_config)
 
 
-def create_provider_from_config(llm_config: LLMConfig) -> LLMProvider:
+def create_provider_from_config(llm_config: LLMConfig, role: str = "writer") -> LLMProvider:
     """Create an LLM provider from configuration.
 
     Args:
         llm_config: LLM configuration section.
+        role: Which role to use ("writer" or "critic").
 
     Returns:
-        Initialized LLM provider for the configured default provider.
+        Initialized LLM provider for the specified role.
     """
-    provider_name = llm_config.provider
+    if role == "critic":
+        provider_name = llm_config.get_critic_provider()
+    else:
+        provider_name = llm_config.get_writer_provider()
+
     provider_config = llm_config.get_provider_config(provider_name)
     retry_config = {
         "max_retries": llm_config.max_retries,
         "base_delay": llm_config.base_delay,
         "max_delay": llm_config.max_delay
     }
+    return get_provider(provider_name, provider_config, retry_config)
+
+
+def create_writer_provider(llm_config: LLMConfig) -> LLMProvider:
+    """Create an LLM provider for writing/generation tasks.
+
+    Args:
+        llm_config: LLM configuration section.
+
+    Returns:
+        Initialized LLM provider for writing tasks.
+    """
+    provider_name = llm_config.get_writer_provider()
+    provider_config = llm_config.get_provider_config(provider_name)
+    retry_config = {
+        "max_retries": llm_config.max_retries,
+        "base_delay": llm_config.base_delay,
+        "max_delay": llm_config.max_delay
+    }
+    logger.info(f"Using '{provider_name}' provider for writing")
+    return get_provider(provider_name, provider_config, retry_config)
+
+
+def create_critic_provider(llm_config: LLMConfig) -> LLMProvider:
+    """Create an LLM provider for critique/repair tasks.
+
+    The critic is typically a smarter API model used for validation
+    and generating repair instructions.
+
+    Args:
+        llm_config: LLM configuration section.
+
+    Returns:
+        Initialized LLM provider for critique tasks.
+    """
+    provider_name = llm_config.get_critic_provider()
+    provider_config = llm_config.get_provider_config(provider_name)
+    retry_config = {
+        "max_retries": llm_config.max_retries,
+        "base_delay": llm_config.base_delay,
+        "max_delay": llm_config.max_delay
+    }
+    logger.info(f"Using '{provider_name}' provider for critique/repair")
     return get_provider(provider_name, provider_config, retry_config)

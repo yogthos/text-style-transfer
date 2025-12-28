@@ -66,20 +66,39 @@ class LLMProviderConfig:
 
 
 @dataclass
+class LLMProviderRoles:
+    """Configuration for role-based LLM provider assignment.
+
+    Allows using different providers for different tasks:
+    - writer: Fast local model for style generation (e.g., MLX with LoRA)
+    - critic: Smarter API model for validation and repair (e.g., DeepSeek)
+    """
+    writer: str = "mlx"  # Provider for generation
+    critic: str = "deepseek"  # Provider for critique/repair
+
+
+@dataclass
 class LLMConfig:
     """Configuration for LLM providers."""
-    provider: str = "deepseek"
+    provider: LLMProviderRoles = field(default_factory=LLMProviderRoles)
     providers: Dict[str, LLMProviderConfig] = field(default_factory=dict)
     max_retries: int = 5
     base_delay: float = 2.0
     max_delay: float = 60.0
 
-    def get_provider_config(self, provider_name: Optional[str] = None) -> LLMProviderConfig:
+    def get_provider_config(self, provider_name: str) -> LLMProviderConfig:
         """Get configuration for a specific provider."""
-        name = provider_name or self.provider
-        if name not in self.providers:
-            raise ValueError(f"Unknown LLM provider: {name}")
-        return self.providers[name]
+        if provider_name not in self.providers:
+            raise ValueError(f"Unknown LLM provider: {provider_name}")
+        return self.providers[provider_name]
+
+    def get_writer_provider(self) -> str:
+        """Get the provider name for generation/writing tasks."""
+        return self.provider.writer
+
+    def get_critic_provider(self) -> str:
+        """Get the provider name for critique/repair tasks."""
+        return self.provider.critic
 
 
 @dataclass
@@ -101,10 +120,12 @@ class CorpusConfig:
 @dataclass
 class GenerationConfig:
     """Configuration for text generation."""
-    max_repair_retries: int = 5
-    rag_examples_count: int = 5
-    length_tolerance: float = 0.2
-    short_paragraph_threshold: int = 2  # Use whole-paragraph mode if <= this
+    max_repair_attempts: int = 3  # Max critic repair attempts per paragraph
+    repair_temperature: float = 0.3  # Low temperature for precise edits
+    entailment_threshold: float = 0.7  # Min score for semantic preservation
+    proposition_threshold: float = 0.7  # Min proposition coverage
+    anchor_threshold: float = 0.8  # Min content anchor coverage
+    repetition_threshold: int = 3  # Words used N+ times get replaced
 
 
 @dataclass
@@ -215,9 +236,15 @@ def _parse_llm_config(data: Dict) -> LLMConfig:
         providers[name] = _parse_llm_provider_config(provider_data)
 
     retry_config = data.get("retry", {})
+    provider_data = data.get("provider", {})
+
+    provider_roles = LLMProviderRoles(
+        writer=provider_data.get("writer", "mlx"),
+        critic=provider_data.get("critic", "deepseek"),
+    )
 
     return LLMConfig(
-        provider=data.get("provider", "deepseek"),
+        provider=provider_roles,
         providers=providers,
         max_retries=retry_config.get("max_attempts", 5),
         base_delay=retry_config.get("base_delay", 2.0),
@@ -306,10 +333,12 @@ def load_config(config_path: str = "config.json") -> Config:
 
     if "generation" in data:
         config.generation = GenerationConfig(
-            max_repair_retries=data["generation"].get("max_repair_retries", 5),
-            rag_examples_count=data["generation"].get("rag_examples_count", 5),
-            length_tolerance=data["generation"].get("length_tolerance", 0.2),
-            short_paragraph_threshold=data["generation"].get("short_paragraph_threshold", 2),
+            max_repair_attempts=data["generation"].get("max_repair_attempts", 3),
+            repair_temperature=data["generation"].get("repair_temperature", 0.3),
+            entailment_threshold=data["generation"].get("entailment_threshold", 0.7),
+            proposition_threshold=data["generation"].get("proposition_threshold", 0.7),
+            anchor_threshold=data["generation"].get("anchor_threshold", 0.8),
+            repetition_threshold=data["generation"].get("repetition_threshold", 3),
         )
 
     if "style" in data:
@@ -370,18 +399,30 @@ def create_default_config() -> Dict:
     """Create a default configuration dictionary."""
     return {
         "llm": {
-            "provider": "deepseek",
+            "provider": {
+                "writer": "mlx",
+                "critic": "deepseek"
+            },
             "providers": {
                 "deepseek": {
                     "api_key": "${DEEPSEEK_API_KEY}",
                     "base_url": "https://api.deepseek.com",
                     "model": "deepseek-chat",
                     "max_tokens": 4096,
-                    "temperature": 0.7
+                    "temperature": 0.7,
+                    "timeout": 120
+                },
+                "mlx": {
+                    "model": "mlx-community/Qwen3-8B-4bit",
+                    "max_tokens": 512,
+                    "temperature": 0.7,
+                    "top_p": 0.9
                 },
                 "ollama": {
                     "base_url": "http://localhost:11434",
-                    "model": "llama3"
+                    "model": "llama3",
+                    "max_tokens": 4096,
+                    "temperature": 0.7
                 }
             },
             "retry": {
@@ -390,32 +431,13 @@ def create_default_config() -> Dict:
                 "max_delay": 60
             }
         },
-        "chromadb": {
-            "persist_path": "atlas_cache/",
-            "embedding_model": "all-mpnet-base-v2"
-        },
-        "corpus": {
-            "min_sentences_per_paragraph": 2,
-            "style_audit_threshold": 4,
-            "opener_percentage": 0.15,
-            "closer_percentage": 0.15
-        },
         "generation": {
-            "max_repair_retries": 5,
-            "rag_examples_count": 5,
-            "length_tolerance": 0.2
+            "max_repair_attempts": 3,
+            "repair_temperature": 0.3,
+            "entailment_threshold": 0.7,
+            "proposition_threshold": 0.7,
+            "anchor_threshold": 0.8,
+            "repetition_threshold": 3
         },
-        "validation": {
-            "semantic": {
-                "min_proposition_coverage": 0.9,
-                "max_hallucinated_entities": 0
-            },
-            "statistical": {
-                "length_tolerance": 0.2,
-                "burstiness_tolerance": 0.3,
-                "min_vocab_match": 0.5
-            }
-        },
-        "log_level": "INFO",
-        "log_json": False
+        "log_level": "INFO"
     }

@@ -8,6 +8,8 @@ from .provider import (
     LLMResponseError,
     get_provider,
     create_provider_from_config,
+    create_writer_provider,
+    create_critic_provider,
     register_provider,
 )
 from .session import LLMSession, SessionConfig
@@ -26,6 +28,8 @@ __all__ = [
     "LLMResponseError",
     "get_provider",
     "create_provider_from_config",
+    "create_writer_provider",
+    "create_critic_provider",
     "register_provider",
     # Session
     "LLMSession",

@@ -22,7 +22,7 @@ logger = get_logger(__name__)
 try:
     import mlx.core as mx
     from mlx_lm import load, generate
-    from mlx_lm.sample_utils import make_sampler
+    from mlx_lm.sample_utils import make_sampler, make_repetition_penalty
     MLX_AVAILABLE = True
 except ImportError:
     MLX_AVAILABLE = False
@@ -180,22 +180,39 @@ CRITICAL RULES:
         # Build user message - just the content
         user = content
 
-        messages = [
-            {"role": "system", "content": system},
-            {"role": "user", "content": user},
-        ]
-
-        # Apply chat template
-        prompt = self._tokenizer.apply_chat_template(
-            messages,
-            tokenize=False,
-            add_generation_prompt=True,
+        # Check if base model (no chat template)
+        is_base_model = (
+            "instruct" not in self.base_model_name.lower() and
+            "chat" not in self.base_model_name.lower()
         )
+
+        if is_base_model:
+            # For base models, match the exact training format from describe_corpus.py:
+            # "Write in the style of {author}.\n\n{description}\n\n{styled_text}"
+            # At inference, we provide description and model completes with styled text
+            prompt = f"Write in the style of {author}.\n\n{user}\n\n"
+        else:
+            # For instruct models, use chat template
+            messages = [
+                {"role": "system", "content": system},
+                {"role": "user", "content": user},
+            ]
+            prompt = self._tokenizer.apply_chat_template(
+                messages,
+                tokenize=False,
+                add_generation_prompt=True,
+            )
 
         # Create sampler with temperature and top_p
         sampler = make_sampler(
             temp=self.config.temperature,
             top_p=self.config.top_p,
+        )
+
+        # Create repetition penalty processor
+        rep_penalty = make_repetition_penalty(
+            penalty=self.config.repetition_penalty,
+            context_size=50,
         )
 
         # Use provided max_tokens or config default
@@ -208,9 +225,21 @@ CRITICAL RULES:
             prompt=prompt,
             max_tokens=tokens_limit,
             sampler=sampler,
+            logits_processors=[rep_penalty],
         )
 
-        return response.strip()
+        response = response.strip()
+
+        # For base models, extract just the first response (stop at continuation patterns)
+        if is_base_model:
+            # Stop at patterns that indicate model is starting a new example
+            stop_patterns = ["\n\nWrite in the style of", "\nWrite in the style of", "\n\n---", "\n---"]
+            for pattern in stop_patterns:
+                if pattern in response:
+                    response = response.split(pattern)[0].strip()
+                    break
+
+        return response
 
     def generate_paragraph(
         self,

@@ -38,19 +38,42 @@ def cmd_transfer(args):
     else:
         print(f"Using base model (no adapter) for {args.author}'s style")
 
-    # Configure transfer
+    # Load config and create critic provider
+    try:
+        from src.config import load_config
+        from src.llm import create_critic_provider
+
+        app_config = load_config()
+        critic_name = app_config.llm.get_critic_provider()
+        print(f"Using critic provider: {critic_name}")
+        critic_provider = create_critic_provider(app_config.llm)
+    except FileNotFoundError:
+        print("Error: config.json not found")
+        print("Copy config.json.sample to config.json and configure your providers")
+        sys.exit(1)
+    except Exception as e:
+        print(f"Error: Could not load critic provider: {e}")
+        sys.exit(1)
+
+    # Configure transfer (use settings from app config)
+    gen_config = app_config.generation
     config = TransferConfig(
         temperature=args.temperature,
         verify_entailment=not args.no_verify,
-        entailment_threshold=args.threshold,
-        max_repair_attempts=1 if not args.no_repair else 0,
+        entailment_threshold=args.threshold if args.threshold else gen_config.entailment_threshold,
+        max_repair_attempts=gen_config.max_repair_attempts if not args.no_repair else 0,
+        repair_temperature=gen_config.repair_temperature,
+        proposition_threshold=gen_config.proposition_threshold,
+        anchor_threshold=gen_config.anchor_threshold,
         reduce_repetition=not args.no_reduce_repetition,
+        repetition_threshold=gen_config.repetition_threshold,
     )
 
     # Create transfer pipeline
     transfer = FastStyleTransfer(
         adapter_path=adapter_path,
         author_name=args.author,
+        critic_provider=critic_provider,
         config=config,
     )
 
@@ -60,14 +83,46 @@ def cmd_transfer(args):
 
     print(f"\nTransferring to {args.author}'s style...")
 
-    # Run transfer
-    output_text, stats = transfer.transfer_document(input_text, on_progress)
+    # Set up incremental output if file specified
+    output_file = None
+    paragraphs_written = 0
+
+    if args.output:
+        output_path = Path(args.output)
+        output_path.parent.mkdir(parents=True, exist_ok=True)
+        output_file = open(output_path, 'w')
+
+    def on_paragraph(index, paragraph):
+        """Write each paragraph to file as it's generated."""
+        nonlocal paragraphs_written
+        if output_file:
+            if paragraphs_written > 0:
+                output_file.write("\n\n")
+            output_file.write(paragraph)
+            output_file.flush()  # Ensure written to disk immediately
+            paragraphs_written += 1
+
+    # Run transfer with graceful shutdown handling
+    try:
+        output_text, stats = transfer.transfer_document(input_text, on_progress, on_paragraph)
+        interrupted = False
+    except KeyboardInterrupt:
+        print("\n\nInterrupted! Saving partial progress...")
+        output_text, stats = transfer.get_partial_results()
+        interrupted = True
+    finally:
+        if output_file:
+            output_file.close()
 
     # Show summary
     print("\n" + "=" * 60)
-    print("Summary:")
+    if interrupted:
+        print("Partial Summary (interrupted):")
+    else:
+        print("Summary:")
     print(f"  Paragraphs: {stats.paragraphs_processed}")
-    print(f"  Time: {stats.total_time_seconds:.1f}s ({stats.avg_time_per_paragraph:.1f}s/para)")
+    if stats.total_time_seconds > 0:
+        print(f"  Time: {stats.total_time_seconds:.1f}s ({stats.avg_time_per_paragraph:.1f}s/para)")
     if stats.entailment_scores:
         avg_score = sum(stats.entailment_scores) / len(stats.entailment_scores)
         print(f"  Avg entailment: {avg_score:.2f}")
@@ -76,19 +131,23 @@ def cmd_transfer(args):
     if stats.words_replaced > 0:
         print(f"  Repetition fixes: {stats.words_replaced} words")
 
-    # Write output
+    # Show output location or print to stdout
     if args.output:
-        output_path = Path(args.output)
-        output_path.parent.mkdir(parents=True, exist_ok=True)
-        output_path.write_text(output_text)
-        print(f"\nOutput written to: {args.output}")
-    else:
+        if interrupted:
+            print(f"\nPartial output written to: {args.output} ({paragraphs_written} paragraphs)")
+        else:
+            print(f"\nOutput written to: {args.output}")
+    elif output_text:
         print("\n" + "=" * 60)
-        print("TRANSFORMED TEXT:")
+        print("TRANSFORMED TEXT:" + (" (partial)" if interrupted else ""))
         print("=" * 60)
         print(output_text)
 
-    print("\nDone!")
+    if interrupted:
+        print("\nPartial transfer complete.")
+        sys.exit(130)  # Standard exit code for Ctrl+C
+    else:
+        print("\nDone!")
 
 
 def cmd_train(args):
@@ -224,8 +283,8 @@ def main():
     transfer_parser.add_argument(
         "--threshold",
         type=float,
-        default=0.7,
-        help="Entailment threshold for repair (default: 0.7)"
+        default=None,
+        help="Entailment threshold for repair (default: from config.json)"
     )
     transfer_parser.add_argument(
         "--no-verify",

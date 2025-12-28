@@ -1,30 +1,9 @@
 {
-  "fitness_weights": {
-    "content": 0.40,
-    "length": 0.20,
-    "transition": 0.15,
-    "vocabulary": 0.15,
-    "fluency": 0.10,
-    "style_blending": {
-      "enabled_weight": 0.15,
-      "content_with_blending": 0.35,
-      "length_with_blending": 0.18,
-      "transition_with_blending": 0.12,
-      "vocabulary_with_blending": 0.12,
-      "fluency_with_blending": 0.08
-    }
-  },
-  "thresholds": {
-    "overuse_word_count": 3,
-    "severe_overuse_count": 5,
-    "entailment_score": 0.5,
-    "delta_score": 1.5,
-    "content_preservation_min": 0.5,
-    "novelty_min": 0.95,
-    "anachronistic_pass_rate": 0.9
-  },
   "llm": {
-    "provider": "deepseek",
+    "provider": {
+      "writer": "mlx",
+      "critic": "deepseek"
+    },
     "providers": {
       "deepseek": {
         "api_key": "${DEEPSEEK_API_KEY}",
@@ -57,7 +36,7 @@
       "mlx": {
         "model": "mlx-community/Qwen3-8B-4bit",
         "max_tokens": 512,
-        "temperature": 0.3,
+        "temperature": 0.7,
         "top_p": 0.9
       }
     },
@@ -67,60 +46,13 @@
       "max_delay": 60
     }
   },
-  "chromadb": {
-    "persist_path": "atlas_cache/",
-    "embedding_model": "all-mpnet-base-v2"
-  },
-  "corpus": {
-    "min_sentences_per_paragraph": 2,
-    "style_audit_threshold": 4,
-    "opener_percentage": 0.15,
-    "closer_percentage": 0.15
-  },
   "generation": {
-    "max_repair_retries": 5,
-    "rag_examples_count": 5,
-    "length_tolerance": 0.2,
-    "short_paragraph_threshold": 2
+    "max_repair_attempts": 3,
+    "repair_temperature": 0.3,
+    "entailment_threshold": 0.7,
+    "proposition_threshold": 0.7,
+    "anchor_threshold": 0.8,
+    "repetition_threshold": 3
   },
-  "style": {
-    "perspective": "preserve",
-    "perspective_options": {
-      "preserve": "Keep the original perspective from input text",
-      "first_person_singular": "Convert to I/me/my perspective",
-      "first_person_plural": "Convert to we/us/our perspective",
-      "third_person": "Convert to he/she/they perspective"
-    },
-    "voice_injection": {
-      "enabled": true,
-      "assertiveness_weight": 0.7,
-      "rhetorical_weight": 0.8
-    },
-    "blending": {
-      "enabled": false,
-      "embedding_model": "all-MiniLM-L6-v2",
-      "cache_dir": "centroid_cache/",
-      "authors": {}
-    }
-  },
-  "validation": {
-    "semantic": {
-      "min_proposition_coverage": 0.9,
-      "max_hallucinated_entities": 0,
-      "require_citation_preservation": true
-    },
-    "statistical": {
-      "length_tolerance": 0.2,
-      "burstiness_tolerance": 0.3,
-      "min_vocab_match": 0.5
-    }
-  },
-  "context_budget": {
-    "system_prompt_max": 1500,
-    "user_prompt_max": 600,
-    "keep_last_n_sentences": 5,
-    "max_conversation_tokens": 8000
-  },
-  "log_level": "INFO",
-  "log_json": false
+  "log_level": "INFO"
 }

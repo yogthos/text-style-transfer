@@ -297,11 +297,85 @@ def prepare_from_neutralized(
     random.seed(42)
     random.shuffle(examples)
 
+
+def prepare_from_described(
+    described_path: str,
+    author: str,
+    output_path: str,
+    max_seq_length: int = 2048,
+) -> dict:
+    """Prepare training dataset from described JSONL (instruction-based).
+
+    Uses text format for base models. Note: mlx-lm's completions format requires
+    a chat template which base models don't have, so we use text format instead.
+    This trains on all tokens; use a lower learning rate to prevent corruption.
+
+    Args:
+        described_path: Path to described JSONL file (from describe_corpus.py).
+        author: Author name.
+        output_path: Base path for output files.
+        max_seq_length: Maximum sequence length in tokens.
+
+    Returns:
+        Dict with paths to train and validation files.
+    """
+    import random
+    from pathlib import Path
+
+    print(f"Loading described data from {described_path}...")
+
+    # Overhead for prompt structure
+    overhead_tokens = 100
+    content_budget = max_seq_length - overhead_tokens
+
+    examples = []
+    split_count = 0
+
+    with open(described_path, 'r') as f:
+        for line in f:
+            data = json.loads(line)
+            instruction = data["instruction"]
+            original = data["original"]
+
+            # Check if this example needs splitting
+            total_content_tokens = estimate_tokens(instruction) + estimate_tokens(original)
+
+            if total_content_tokens > content_budget:
+                # Split the original into parts
+                part_budget = content_budget - estimate_tokens(instruction) - 50
+                original_parts = split_text_to_fit(original, part_budget)
+
+                for part in original_parts:
+                    # Text format for base models (completions format requires chat template)
+                    example = {
+                        "text": f"Write in the style of {author}.\n\n{instruction}\n\n{part}"
+                    }
+                    examples.append(example)
+                split_count += 1
+            else:
+                # Text format for base models (completions format requires chat template)
+                example = {
+                    "text": f"Write in the style of {author}.\n\n{instruction}\n\n{original}"
+                }
+                examples.append(example)
+
+    print(f"Loaded {len(examples)} examples ({split_count} long examples were split)")
+
+    return _save_train_val_split(examples, output_path)
+
+
+def _save_train_val_split(examples: list, output_path: str) -> dict:
+    """Save examples to train/validation split files."""
+    import random
+    from pathlib import Path
+
+    random.seed(42)
+    random.shuffle(examples)
+
     val_size = max(1, len(examples) // 10)
     train_examples = examples[val_size:]
     val_examples = examples[:val_size]
 
-    # Save
     path = Path(output_path)
     path.parent.mkdir(parents=True, exist_ok=True)
 
@@ -328,11 +402,11 @@ def train_lora(
     author: str,
     output_dir: str,
     base_model: str = None,
-    epochs: int = 3,
-    batch_size: int = 2,
-    learning_rate: float = 5e-5,
-    lora_rank: int = 16,
-    lora_alpha: int = 32,
+    epochs: int = 5,
+    batch_size: int = 2,  # Keep at 2 for memory safety
+    learning_rate: float = 5e-5,  # Moderate rate to prevent catastrophic forgetting
+    lora_rank: int = 32,  # Increased from 16
+    lora_alpha: int = 64,  # Increased from 32
     validation_path: str = None,
     resume: bool = False,
 ):
@@ -459,6 +533,8 @@ def train_lora(
         "--steps-per-report", "10",
         "--steps-per-eval", "50",
         "--save-every", "100",
+        # Note: --mask-prompt only works with chat format, not text format
+        # For base models, we use text format which trains on all tokens
     ]
 
     # Handle resume from checkpoint
@@ -534,6 +610,7 @@ def test_generation(
         sys.exit(1)
 
     from mlx_lm import load, generate
+    from mlx_lm.sample_utils import make_sampler
 
     # Default test prompt
     if test_prompt is None:
@@ -555,29 +632,35 @@ def test_generation(
 
     model, tokenizer = load(base_model, adapter_path=adapter_path)
 
-    # Format prompt
-    messages = [
-        {"role": "system", "content": f"You write in the style of {author}. Render the given content in this voice."},
-        {"role": "user", "content": test_prompt},
-    ]
+    # Check if base model (no chat template)
+    is_base_model = "instruct" not in base_model.lower() and "chat" not in base_model.lower()
 
-    prompt = tokenizer.apply_chat_template(
-        messages,
-        tokenize=False,
-        add_generation_prompt=True,
-    )
+    if is_base_model:
+        # For base models, use simple prompt format
+        prompt = f"Write in the style of {author}:\n\n{test_prompt}\n\n"
+    else:
+        # For instruct models, use chat template
+        messages = [
+            {"role": "system", "content": f"You write in the style of {author}. Render the given content in this voice."},
+            {"role": "user", "content": test_prompt},
+        ]
+        prompt = tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
 
     # Generate
     print(f"\nTest prompt: {test_prompt}\n")
     print("Generating...")
 
+    sampler = make_sampler(temp=0.7, top_p=0.9)
     response = generate(
         model,
         tokenizer,
         prompt=prompt,
         max_tokens=256,
-        temp=0.7,
-        top_p=0.9,
+        sampler=sampler,
     )
 
     print(f"\n{'='*60}")
@@ -642,32 +725,32 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=3,
-        help="Training epochs",
+        default=5,
+        help="Training epochs (5 recommended with 5e-5 learning rate)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
         default=2,
-        help="Training batch size",
+        help="Training batch size (default: 2)",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
         default=5e-5,
-        help="Learning rate",
+        help="Learning rate (default: 5e-5, prevents catastrophic forgetting)",
     )
     parser.add_argument(
         "--rank",
         type=int,
-        default=16,
-        help="LoRA rank",
+        default=32,
+        help="LoRA rank (default: 32 for better style capture)",
     )
     parser.add_argument(
         "--alpha",
         type=int,
-        default=32,
-        help="LoRA alpha",
+        default=64,
+        help="LoRA alpha (default: 64)",
     )
     parser.add_argument(
         "--resume",
@@ -684,6 +767,10 @@ def main():
     parser.add_argument(
         "--from-neutralized",
         help="Path to pre-neutralized JSONL file (from neutralize_corpus.py)",
+    )
+    parser.add_argument(
+        "--from-described",
+        help="Path to described JSONL file (from describe_corpus.py) - RECOMMENDED",
     )
     parser.add_argument(
         "--max-seq-length",
@@ -705,8 +792,19 @@ def main():
     dataset_path = args.dataset
     validation_path = None
 
-    # Prepare dataset from pre-neutralized file
-    if args.from_neutralized:
+    # Prepare dataset from described file (RECOMMENDED)
+    if args.from_described:
+        paths = prepare_from_described(
+            described_path=args.from_described,
+            author=args.author,
+            output_path=args.output,
+            max_seq_length=args.max_seq_length,
+        )
+        dataset_path = paths['train']
+        validation_path = paths['valid']
+
+    # Prepare dataset from pre-neutralized file (legacy)
+    elif args.from_neutralized:
         paths = prepare_from_neutralized(
             neutralized_path=args.from_neutralized,
             author=args.author,

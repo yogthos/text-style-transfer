@@ -5,7 +5,7 @@ Transform text to match a target author's writing style while preserving semanti
 ## Features
 
 - **LoRA-Based Generation**: Fine-tuned adapters capture author style in model weights
-- **Faithful Translation**: Training approach ensures output matches input length (no hallucination)
+- **Human-Like Output**: Instruction-based training produces text that passes AI detection
 - **Fast Transfer**: ~5-10 seconds per paragraph
 - **Semantic Preservation**: NLI-based entailment verification ensures meaning is preserved
 - **Post-Processing**: Reduces word repetition and removes LLM-speak
@@ -14,7 +14,7 @@ Transform text to match a target author's writing style while preserving semanti
 
 - Python 3.9+
 - Apple Silicon Mac (for MLX-based training/inference)
-- ~8GB RAM for inference, ~16GB for training
+- ~18GB RAM for inference (bf16), ~50GB for training
 
 ## Installation
 
@@ -38,14 +38,14 @@ python -m spacy download en_core_web_sm
 
 ### 1. Configure Base Model
 
-Edit `config.json` to set your MLX base model:
+Copy `config.json.sample` to `config.json`:
 
 ```json
 {
   "llm": {
     "providers": {
       "mlx": {
-        "model": "mlx-community/Qwen3-8B-bf16",
+        "model": "mlx-community/Qwen3-8B-Base-bf16",
         "max_tokens": 512,
         "temperature": 0.3,
         "top_p": 0.9
@@ -56,27 +56,28 @@ Edit `config.json` to set your MLX base model:
 ```
 
 **Model options:**
-| Model | Size | Quality | Use Case |
-|-------|------|---------|----------|
-| `mlx-community/Qwen3-8B-bf16` | ~16GB | Best | Production training |
-| `mlx-community/Qwen3-8B-4bit` | ~4.3GB | Good | Limited memory |
+| Model | Size | Memory (Training) | Use Case |
+|-------|------|-------------------|----------|
+| `mlx-community/Qwen3-8B-Base-bf16` | ~16GB | ~50GB | Best quality |
+| `mlx-community/Qwen3-8B-4bit` | ~4GB | ~20GB | Limited memory |
 
-> **Important:** Use base models (not Instruct). Instruct-tuned models have response patterns that resist style overwriting. Base models are blank canvases for LoRA adaptation.
+> **Important:** Use **base models only** (not Instruct). Instruct-tuned models have response patterns that resist style overwriting. Base models are blank canvases for LoRA adaptation.
 
 ### 2. Train a LoRA Adapter
 
-Training is a two-step process: neutralize the corpus, then train.
+Training is a two-step process: describe the corpus, then train.
 
 ```bash
-# Step 1: Convert author's distinctive text to neutral paraphrases
-python scripts/neutralize_corpus.py \
+# Step 1: Generate content descriptions from author's text
+python scripts/describe_corpus.py \
     --input data/corpus/author.txt \
-    --output data/neutralized/author.jsonl \
-    --author "Author Name"
+    --output data/described/author.jsonl \
+    --author "Author Name" \
+    --workers 4
 
-# Step 2: Train LoRA adapter on neutral → author pairs
+# Step 2: Train LoRA adapter
 python scripts/train_mlx_lora.py \
-    --from-neutralized data/neutralized/author.jsonl \
+    --from-described data/described/author.jsonl \
     --author "Author Name" \
     --train \
     --output lora_adapters/author
@@ -85,15 +86,89 @@ python scripts/train_mlx_lora.py \
 ### 3. Transfer Text
 
 ```bash
-# Transform text to author's style
 python cli.py transfer input.txt --author "Author Name" --output output.txt
+```
+
+## How Training Works
+
+The key insight: **"Style lives in the transitions."**
+
+### Instruction-Based Training
+
+Unlike naive approaches that train on `neutral_text → styled_text` (which just teaches word substitution), this system uses **instruction-based training**:
+
+```
+Input:  "The passage discusses the vastness of space and humanity's small place within it."
+Output: "The cosmos is vast beyond imagining. We are, each of us, tiny specks in an ocean of stars."
+```
+
+The model learns to **generate style from scratch** given only a content description, not to transform existing text.
+
+### Key Techniques
+
+1. **Overlapping chunks**: Text is segmented with 2-sentence overlap between chunks to capture transition patterns where style emerges
+2. **Template rotation**: 15 different prompt templates prevent memorization and force attention on stylistic patterns
+3. **Plain text format**: Base models use simple text completion, not chat templates
+4. **Moderate learning rate**: 5e-5 to prevent catastrophic forgetting while still learning style
+
+### Training Data Format
+
+The `describe_corpus.py` script:
+1. Segments the corpus into 150-400 word chunks with overlap
+2. Generates 2-3 sentence descriptions of each chunk using rotating templates
+3. Creates training pairs: `description → original_styled_text`
+
+```
+Training example:
+{
+  "text": "Write in the style of Mao.\n\n{description}\n\n{original_text}"
+}
 ```
 
 ## Commands
 
-### `transfer` - Style Transfer
+### `describe_corpus.py` - Prepare Training Data
 
-Transform input text to match an author's style:
+Generate instruction descriptions from author's corpus:
+
+```bash
+python scripts/describe_corpus.py \
+    --input data/corpus/author.txt \
+    --output data/described/author.jsonl \
+    --author "Author Name" \
+    --workers 4
+```
+
+Options:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--min-words` | 150 | Minimum words per chunk |
+| `--max-words` | 400 | Maximum words per chunk |
+| `--overlap` | 2 | Overlap sentences between chunks |
+| `--workers` | 1 | Parallel workers (2-4 for MLX, 8+ for Ollama) |
+| `--llm` | mlx | LLM provider (mlx or ollama:model) |
+
+### `train_mlx_lora.py` - Train LoRA Adapter
+
+```bash
+python scripts/train_mlx_lora.py \
+    --from-described data/described/author.jsonl \
+    --author "Author Name" \
+    --train \
+    --output lora_adapters/author
+```
+
+Options:
+| Option | Default | Description |
+|--------|---------|-------------|
+| `--epochs` | 5 | Training epochs |
+| `--batch-size` | 2 | Batch size |
+| `--learning-rate` | 5e-5 | Learning rate (moderate to prevent forgetting) |
+| `--rank` | 32 | LoRA rank (higher = more capacity) |
+| `--alpha` | 64 | LoRA alpha scaling |
+| `--resume` | - | Resume from last checkpoint |
+
+### `transfer` - Style Transfer
 
 ```bash
 python cli.py transfer <input_file> --author "<Author Name>" [options]
@@ -114,80 +189,17 @@ Options:
 | `--no-verify` | false | Skip entailment verification |
 | `--no-repair` | false | Skip repair attempts |
 | `--no-reduce-repetition` | false | Skip post-processing |
-| `--no-adapter` | false | Use base model without LoRA (for testing) |
-
-### `train` - Train LoRA Adapter
-
-Training uses the self-contained MLX pipeline (no external services needed).
-
-**Step 1: Neutralize corpus** - Convert author's distinctive text to plain English:
-
-```bash
-python scripts/neutralize_corpus.py \
-    --input data/corpus/author.txt \
-    --output data/neutralized/author.jsonl \
-    --author "Author Name"
-```
-
-Neutralization options:
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--min-words` | 50 | Minimum words per chunk |
-| `--max-words` | 150 | Maximum words per chunk |
-| `--llm` | mlx | LLM provider (mlx or ollama:model) |
-
-**Step 2: Train LoRA adapter** on neutral → author pairs:
-
-```bash
-python scripts/train_mlx_lora.py \
-    --from-neutralized data/neutralized/author.jsonl \
-    --author "Author Name" \
-    --train \
-    --output lora_adapters/author \
-    --epochs 3
-```
-
-Training options:
-| Option | Default | Description |
-|--------|---------|-------------|
-| `--epochs` | 3 | Training epochs |
-| `--batch-size` | 2 | Batch size |
-| `--learning-rate` | 5e-5 | Learning rate |
-| `--rank` | 16 | LoRA rank |
-| `--lora-alpha` | 32 | LoRA alpha scaling |
 
 ### `analyze` - Analyze Text
 
-Get style metrics for any text file:
-
 ```bash
 python cli.py analyze <file>
-
-# Example output:
-Analysis of: essay.txt
-
-Structure:
-  Paragraphs: 5
-  Sentences: 23
-  Words: 412
-
-Sentence Length:
-  Mean: 17.9 words
-  Std: 8.2
-  Range: 5 - 42 words
-  Burstiness: 0.458
 ```
 
 ### `list` - List Adapters
 
-Show available trained adapters:
-
 ```bash
 python cli.py list
-
-# Output:
-Available LoRA adapters:
-  mao: rank=16
 ```
 
 ## Architecture
@@ -206,7 +218,7 @@ Input Text (N words)
 ┌─────────────────────────────┐
 │ 2. LORA GENERATION          │  Single forward pass with
 │    - Style in adapter       │  author-specific LoRA weights
-│    - Word count constraint  │  Output ≈ input length
+│    - Plain text prompt      │  Output ≈ input length
 │    - ~5-10s per paragraph   │
 └─────────────────────────────┘
     │
@@ -228,79 +240,31 @@ Input Text (N words)
 Output Text (≈N words)
 ```
 
-## How Training Works
-
-The training approach uses **neutral → author pairs** to teach pure style transformation:
-
-### Training Data Format
-
-```
-Input:  "The universe is very large. Each person is a small part of many stars."
-Output: "The cosmos is vast beyond imagining. We are, each of us, tiny specks in an ocean of stars."
-```
-
-The model learns to transform plain English into the author's distinctive voice.
-
-### Why This Works
-
-1. **Base model as blank canvas**: No pre-existing instruction patterns to fight against
-2. **Neutral input**: Generic text has no style - the model must add all stylistic elements
-3. **Meaning preservation**: Input and output express the same ideas, just differently
-4. **Length awareness**: Training pairs have similar word counts
-
-### Training Process
-
-```
-Author Corpus (distinctive prose)
-         │
-         ▼
-    ┌─────────────┐
-    │ Neutralize  │  MLX base model converts to plain English
-    └─────────────┘
-         │
-         ▼
-  Neutral → Author Pairs
-         │
-         ▼
-    ┌─────────────┐
-    │ LoRA Train  │  Adapter learns style transformation
-    └─────────────┘
-         │
-         ▼
-   Trained Adapter
-```
-
-This differs from naive approaches that fine-tune on author text directly, which can lead to memorization rather than style learning.
-
 ## Project Structure
 
 ```
 text-style-transfer/
 ├── cli.py                    # Command-line interface
+├── config.json               # Configuration (copy from .sample)
 ├── requirements.txt          # Python dependencies
 ├── src/
 │   ├── generation/           # Core generation
 │   │   ├── lora_generator.py # MLX LoRA inference
 │   │   └── fast_transfer.py  # Pipeline orchestration
 │   ├── validation/           # Content verification
-│   │   ├── entailment.py     # NLI-based checking
 │   │   └── semantic_verifier.py
 │   ├── vocabulary/           # Post-processing
 │   │   └── repetition_reducer.py
-│   ├── sft/                  # Training data generation
-│   │   └── mlx_dataset.py    # Dataset for MLX LoRA
 │   ├── llm/                  # LLM providers
-│   │   ├── mlx_provider.py   # MLX local (self-contained)
-│   │   ├── deepseek.py       # DeepSeek API
-│   │   └── ollama.py         # Ollama local
+│   │   └── mlx_provider.py   # MLX local (self-contained)
 │   ├── corpus/               # Corpus loading
 │   └── utils/                # NLP utilities
 ├── scripts/
-│   ├── neutralize_corpus.py  # Convert corpus to neutral pairs
+│   ├── describe_corpus.py    # Generate training descriptions
 │   ├── train_mlx_lora.py     # LoRA training script
-│   └── fast_restyle.py       # Direct inference script
+│   └── neutralize_corpus.py  # Legacy: neutral paraphrases
 ├── lora_adapters/            # Trained adapters
-└── archive/                  # Deprecated modules
+└── tests/                    # Unit tests
 ```
 
 ## Training Your Own Adapter
@@ -312,71 +276,42 @@ Create a plain text file with the author's writing:
 - **Format**: Clean paragraphs separated by blank lines
 - **Remove**: Headers, footnotes, citations, non-prose content
 
-Place the corpus in `data/corpus/author_name.txt`.
-
-### Step 2: Configure Base Model
-
-Edit `config.json` to select your base model:
-
-```json
-{
-  "llm": {
-    "providers": {
-      "mlx": {
-        "model": "mlx-community/Qwen3-8B-bf16",
-        "max_tokens": 512,
-        "temperature": 0.3
-      }
-    }
-  }
-}
-```
-
-**Why base models?** Instruct-tuned models have learned response patterns (helpfulness, safety guardrails) that resist style overwriting. Base models have no such patterns - they're blank canvases that fully absorb the author's voice during LoRA training.
-
-### Step 3: Neutralize Corpus (Once Per Author)
-
-Convert the author's distinctive prose to plain neutral English. This creates training pairs: neutral input → author-style output.
+### Step 2: Generate Descriptions
 
 ```bash
-python scripts/neutralize_corpus.py \
+python scripts/describe_corpus.py \
     --input data/corpus/my_author.txt \
-    --output data/neutralized/my_author.jsonl \
-    --author "Author Name"
+    --output data/described/my_author.jsonl \
+    --author "My Author" \
+    --workers 4
 ```
 
-This runs the base model to paraphrase each chunk into generic prose. Takes ~1-2 minutes per 10KB of corpus.
+This generates content descriptions using rotating templates. Takes ~5-10 minutes for 50KB corpus with 4 workers.
 
-> **Note:** The neutralized corpus is model-agnostic. You only need to run this once per author, then you can train adapters on different base models using the same `author.jsonl` file.
-
-### Step 4: Train LoRA Adapter
-
-Train the adapter on neutral → author pairs:
+### Step 3: Train LoRA Adapter
 
 ```bash
 python scripts/train_mlx_lora.py \
-    --from-neutralized data/neutralized/my_author.jsonl \
-    --author "Author Name" \
+    --from-described data/described/my_author.jsonl \
+    --author "My Author" \
     --train \
-    --output lora_adapters/my_author \
-    --epochs 3
+    --output lora_adapters/my_author
 ```
 
-Training takes ~10-15 minutes for a typical corpus. The adapter learns to transform neutral text into the author's distinctive voice.
+Training takes ~15-30 minutes. Monitor the loss:
+- Initial train loss: ~2-3
+- Final train loss: ~0.5-1.5
+- If loss stays high (>5), there may be a format issue
 
-### Step 5: Test Transfer
+### Step 4: Test Transfer
 
 ```bash
-python cli.py transfer test_input.txt --author "Author Name"
+python cli.py transfer test_input.txt --author "My Author"
 ```
 
-### Tips for Best Results
+### Step 5: Verify with AI Detector (Optional)
 
-- **More data is better**: 100KB+ corpus gives richer style capture
-- **Use bf16 model**: Higher precision = better LoRA quality
-- **Clean corpus**: Remove non-prose elements that could confuse the model
-- **Adjust epochs**: 3-5 epochs typically works well; more can overfit
-- **Lower temperature**: Use 0.3-0.5 for more consistent output
+Test output with GPTZero or similar. Well-trained adapters produce text that reads as human-written.
 
 ## Performance
 
@@ -384,11 +319,10 @@ python cli.py transfer test_input.txt --author "Author Name"
 |--------|-------|
 | Time per paragraph | 5-10 seconds |
 | LLM calls per paragraph | 1 |
-| Memory (inference, 4-bit) | ~8GB |
 | Memory (inference, bf16) | ~18GB |
-| Memory (training, bf16) | ~20GB |
-| Neutralization time | ~1-2 min per 10KB |
-| Training time (3 epochs) | ~10-15 min |
+| Memory (training, bf16, rank 32) | ~50GB |
+| Description generation | ~5-10 min per 50KB |
+| Training time (5 epochs) | ~30-45 min |
 
 ## Troubleshooting
 
@@ -398,7 +332,7 @@ This project requires Apple Silicon. For other platforms, the architecture suppo
 
 ### Out of Memory During Training
 
-Use 4-bit model instead of bf16:
+Option 1: Use 4-bit model:
 ```json
 {
   "llm": {
@@ -411,36 +345,36 @@ Use 4-bit model instead of bf16:
 }
 ```
 
-Or reduce batch size:
+Option 2: Reduce batch size:
 ```bash
 python scripts/train_mlx_lora.py --train ... --batch-size 1
 ```
 
-### Neutralization Output Contains Thinking/Reasoning Text
+### High Loss Values During Training
 
-The base model may output reasoning before the actual response. The script automatically filters this, but if issues persist:
-- Check that you're using a base model (not Instruct)
-- The filtering in `neutralize_corpus.py` handles common patterns
+If train loss stays above 5-7:
+- Ensure you're using `--from-described` (not `--from-neutralized`)
+- Verify the base model is a **base** model (not Instruct)
+- Check training data format has `"text"` field (not `"messages"`)
 
-### Adapter Trained on Wrong Model
-
-LoRA adapters are model-specific. If you switch base models (e.g., from 4-bit to bf16), you must retrain the adapter. However, you can reuse the neutralized corpus - it's model-agnostic:
+### Resume Interrupted Training
 
 ```bash
-# No need to re-neutralize! Just retrain the adapter on the new model
 python scripts/train_mlx_lora.py \
-    --from-neutralized data/neutralized/author.jsonl \
+    --from-described data/described/author.jsonl \
     --author "Author" \
     --train \
-    --output lora_adapters/author_bf16
+    --output lora_adapters/author \
+    --resume
 ```
 
-### Low Quality Output
+### Output Detected as AI-Generated
 
-- **Use bf16 model**: Higher precision = better style capture
-- **More training data**: 50KB+ corpus recommended
-- **Lower temperature**: `--temperature 0.3` for more consistent output
-- **More epochs**: `--epochs 5` (but watch for overfitting)
+- Use `describe_corpus.py` (instruction-based), not `neutralize_corpus.py`
+- Ensure overlapping chunks: `--overlap 2` or higher
+- Verify template rotation is working (check `template_idx` varies in output)
+- Use higher LoRA rank: `--rank 32`
+- Use moderate learning rate: `--learning-rate 5e-5` (higher rates cause model corruption)
 
 ### spaCy Model Missing
 

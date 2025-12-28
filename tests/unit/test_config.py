@@ -55,7 +55,7 @@ class TestConfigLoading:
                 config = load_config(f.name)
                 assert config.llm.provider == "deepseek"
                 assert config.chromadb.persist_path == "atlas_cache/"
-                assert config.generation.max_repair_retries == 5
+                assert config.generation.max_repair_attempts == 5
                 assert config.validation.semantic.min_proposition_coverage == 0.9
             finally:
                 os.unlink(f.name)
@@ -159,7 +159,7 @@ class TestDefaultConfig:
 
         assert config.llm.max_retries == 5
         assert config.chromadb.persist_path == "atlas_cache/"
-        assert config.generation.max_repair_retries == 5
+        assert config.generation.max_repair_attempts == 5
         assert config.validation.semantic.min_proposition_coverage == 0.9
         assert config.validation.statistical.length_tolerance == 0.2
 

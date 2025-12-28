@@ -185,10 +185,47 @@ def prepare_dataset(
     return paths
 
 
+def estimate_tokens(text: str) -> int:
+    """Estimate token count (rough approximation: ~4 chars per token)."""
+    return len(text) // 4
+
+
+def split_text_to_fit(text: str, max_tokens: int) -> list:
+    """Split text into chunks that fit within token limit.
+
+    Splits on sentence boundaries when possible.
+    """
+    if estimate_tokens(text) <= max_tokens:
+        return [text]
+
+    # Try to split on sentences
+    import re
+    sentences = re.split(r'(?<=[.!?])\s+', text)
+
+    chunks = []
+    current_chunk = []
+    current_tokens = 0
+
+    for sent in sentences:
+        sent_tokens = estimate_tokens(sent)
+        if current_tokens + sent_tokens > max_tokens and current_chunk:
+            chunks.append(' '.join(current_chunk))
+            current_chunk = []
+            current_tokens = 0
+        current_chunk.append(sent)
+        current_tokens += sent_tokens
+
+    if current_chunk:
+        chunks.append(' '.join(current_chunk))
+
+    return chunks
+
+
 def prepare_from_neutralized(
     neutralized_path: str,
     author: str,
     output_path: str,
+    max_seq_length: int = 2048,
 ) -> dict:
     """Prepare training dataset from pre-neutralized JSONL.
 
@@ -196,6 +233,7 @@ def prepare_from_neutralized(
         neutralized_path: Path to neutralized JSONL file (from neutralize_corpus.py).
         author: Author name.
         output_path: Base path for output files.
+        max_seq_length: Maximum sequence length in tokens.
 
     Returns:
         Dict with paths to train and validation files.
@@ -205,21 +243,55 @@ def prepare_from_neutralized(
 
     print(f"Loading neutralized data from {neutralized_path}...")
 
+    # System prompt overhead (roughly constant)
+    system_prompt = f"You write exactly like {author}. Transform the text into {author}'s distinctive voice and style."
+    overhead_tokens = estimate_tokens(system_prompt) + 50  # +50 for chat formatting
+    content_budget = max_seq_length - overhead_tokens
+
     examples = []
+    split_count = 0
+
     with open(neutralized_path, 'r') as f:
         for line in f:
             data = json.loads(line)
-            # Training format: neutral input -> author's original output
-            example = {
-                "messages": [
-                    {"role": "system", "content": f"You write exactly like {author}. Transform the text into {author}'s distinctive voice and style."},
-                    {"role": "user", "content": data["neutral"]},
-                    {"role": "assistant", "content": data["original"]},
-                ]
-            }
-            examples.append(example)
+            neutral = data["neutral"]
+            original = data["original"]
 
-    print(f"Loaded {len(examples)} examples")
+            # Check if this example needs splitting
+            total_content_tokens = estimate_tokens(neutral) + estimate_tokens(original)
+
+            if total_content_tokens > content_budget:
+                # Split both neutral and original proportionally
+                # Each part gets half the budget (user + assistant)
+                part_budget = content_budget // 2
+
+                neutral_parts = split_text_to_fit(neutral, part_budget)
+                original_parts = split_text_to_fit(original, part_budget)
+
+                # Pair up the parts (use min to handle uneven splits)
+                num_parts = min(len(neutral_parts), len(original_parts))
+                for i in range(num_parts):
+                    example = {
+                        "messages": [
+                            {"role": "system", "content": system_prompt},
+                            {"role": "user", "content": neutral_parts[i]},
+                            {"role": "assistant", "content": original_parts[i]},
+                        ]
+                    }
+                    examples.append(example)
+                split_count += 1
+            else:
+                # Training format: neutral input -> author's original output
+                example = {
+                    "messages": [
+                        {"role": "system", "content": system_prompt},
+                        {"role": "user", "content": neutral},
+                        {"role": "assistant", "content": original},
+                    ]
+                }
+                examples.append(example)
+
+    print(f"Loaded {len(examples)} examples ({split_count} long examples were split)")
 
     # Shuffle and split
     random.seed(42)
@@ -262,6 +334,7 @@ def train_lora(
     lora_rank: int = 16,
     lora_alpha: int = 32,
     validation_path: str = None,
+    resume: bool = False,
 ):
     """Train LoRA adapter for author style.
 
@@ -278,6 +351,7 @@ def train_lora(
         lora_rank: LoRA rank (higher = more capacity).
         lora_alpha: LoRA alpha (scaling factor).
         validation_path: Path to validation JSONL file.
+        resume: Whether to resume from last checkpoint.
     """
     import subprocess
     import shutil
@@ -386,6 +460,19 @@ def train_lora(
         "--steps-per-eval", "50",
         "--save-every", "100",
     ]
+
+    # Handle resume from checkpoint
+    if resume:
+        # Find the latest checkpoint
+        checkpoints = sorted(output_path.glob("adapters-*.safetensors"))
+        if checkpoints:
+            latest_checkpoint = checkpoints[-1]
+            # Extract step number from filename (adapters-100.safetensors -> 100)
+            checkpoint_step = int(latest_checkpoint.stem.split('-')[1])
+            print(f"Resuming from checkpoint: {latest_checkpoint.name} (step {checkpoint_step})")
+            cmd.extend(["--resume-adapter-file", str(latest_checkpoint)])
+        else:
+            print("No checkpoint found, starting from scratch")
 
     print("Starting training...")
     print(f"Command: {' '.join(cmd)}\n")
@@ -582,6 +669,11 @@ def main():
         default=32,
         help="LoRA alpha",
     )
+    parser.add_argument(
+        "--resume",
+        action="store_true",
+        help="Resume training from last checkpoint",
+    )
 
     # Optional
     parser.add_argument(
@@ -592,6 +684,12 @@ def main():
     parser.add_argument(
         "--from-neutralized",
         help="Path to pre-neutralized JSONL file (from neutralize_corpus.py)",
+    )
+    parser.add_argument(
+        "--max-seq-length",
+        type=int,
+        default=2048,
+        help="Maximum sequence length in tokens (default: 2048)",
     )
     parser.add_argument(
         "--test-prompt",
@@ -613,6 +711,7 @@ def main():
             neutralized_path=args.from_neutralized,
             author=args.author,
             output_path=args.output,
+            max_seq_length=args.max_seq_length,
         )
         dataset_path = paths['train']
         validation_path = paths['valid']
@@ -654,6 +753,7 @@ def main():
             lora_rank=args.rank,
             lora_alpha=args.alpha,
             validation_path=validation_path,
+            resume=args.resume,
         )
     else:
         adapter_path = args.output

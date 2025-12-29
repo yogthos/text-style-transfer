@@ -46,6 +46,7 @@ input/
 output/
 .cursor/
 atlas_cache/
+lora_adapters/
 
 # Cache files
 structure_cache.json

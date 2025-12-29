@@ -15,6 +15,14 @@ Usage:
         --output data/neutralized/mao.jsonl \
         --author "Mao"
 
+    # With parallelization (Ollama only - MLX is single-GPU):
+    python scripts/neutralize_corpus.py \
+        --input styles/sample_mao.txt \
+        --output data/neutralized/mao.jsonl \
+        --author "Mao" \
+        --llm ollama:qwen3:8b \
+        --workers 4
+
     # Or use Ollama (requires ollama server running):
     python scripts/neutralize_corpus.py \
         --input styles/sample_mao.txt \
@@ -26,6 +34,8 @@ Usage:
 import argparse
 import json
 import sys
+import threading
+from concurrent.futures import ThreadPoolExecutor, as_completed
 from pathlib import Path
 
 # Add project root to path
@@ -379,6 +389,81 @@ def save_checkpoint(checkpoint_path: Path, results: list):
             f.write(json.dumps(r) + '\n')
 
 
+class ThreadSafeCheckpointer:
+    """Thread-safe checkpoint manager for parallel processing."""
+
+    def __init__(self, checkpoint_path: Path, results: list, completed: set):
+        self.checkpoint_path = checkpoint_path
+        self.results = results
+        self.completed = completed
+        self.lock = threading.Lock()
+        self.processed_count = len(completed)
+
+    def add_result(self, result: dict):
+        """Thread-safe addition of a result."""
+        with self.lock:
+            self.results.append(result)
+            self.completed.add(result.get("chunk_index", len(self.results) - 1))
+            self.processed_count += 1
+            # Save checkpoint
+            save_checkpoint(self.checkpoint_path, self.results)
+
+    def is_completed(self, index: int) -> bool:
+        """Check if a chunk index has been processed."""
+        with self.lock:
+            return index in self.completed
+
+    def get_progress(self) -> int:
+        """Get current progress count."""
+        with self.lock:
+            return self.processed_count
+
+
+def process_single_chunk(
+    chunk_info: tuple,
+    llm_generate,
+    author: str,
+    do_cleanup: bool,
+) -> dict:
+    """Process a single chunk - used by both sequential and parallel modes.
+
+    Args:
+        chunk_info: Tuple of (index, chunk_text, total_chunks)
+        llm_generate: LLM generation function
+        author: Author name
+        do_cleanup: Whether to clean chunk boundaries
+
+    Returns:
+        Result dict or None if processing failed
+    """
+    i, chunk, total = chunk_info
+
+    # Clean up chunk boundaries if needed
+    if do_cleanup and needs_resegmentation(chunk):
+        chunk = clean_chunk_boundaries(chunk, llm_generate)
+
+    original_words = len(chunk.split())
+    description = describe_chunk(chunk, llm_generate)
+    description_words = len(description.split())
+
+    # Retry if too short
+    if description_words < 20:
+        description = describe_chunk(chunk, llm_generate)
+        description_words = len(description.split())
+
+    # Final fallback
+    if description_words < 10:
+        description = f"The text discusses various topics in {original_words} words."
+
+    return {
+        "chunk_index": i,
+        "author": author,
+        "original": chunk,
+        "description": description,
+        "word_count": original_words,
+    }
+
+
 def main():
     parser = argparse.ArgumentParser(
         description="Convert author corpus to content descriptions for training"
@@ -396,6 +481,12 @@ def main():
     parser.add_argument("--no-overlap", action="store_true", help="Disable overlap between chunks")
     parser.add_argument("--no-cleanup", action="store_true", help="Skip LLM cleanup of chunk boundaries")
     parser.add_argument("--no-resume", action="store_true", help="Start fresh, ignore checkpoint")
+    parser.add_argument(
+        "--workers", "-w",
+        type=int,
+        default=1,
+        help="Number of parallel workers (Ollama only, MLX is single-GPU). Default: 1"
+    )
 
     args = parser.parse_args()
 
@@ -463,48 +554,84 @@ def main():
     else:
         results, completed = load_checkpoint(checkpoint_path)
 
-    try:
-        for i, chunk in enumerate(chunks):
-            # Skip already processed chunks
-            if i in completed:
-                continue
+    # Determine effective worker count
+    is_mlx = args.llm == "mlx" or args.llm.startswith("mlx:")
+    workers = args.workers
 
-            # Clean up chunk boundaries if needed (per paper: use LLM to fix mid-sentence cuts)
-            if not args.no_cleanup and needs_resegmentation(chunk):
-                print(f"[{i+1}/{len(chunks)}] Cleaning chunk boundaries...")
-                chunk = clean_chunk_boundaries(chunk, llm_generate)
+    if is_mlx and workers > 1:
+        print(f"Note: MLX is single-GPU, ignoring --workers {workers} (using 1)")
+        workers = 1
 
-            original_words = len(chunk.split())
-            print(f"[{i+1}/{len(chunks)}] Describing chunk ({original_words} words)...")
+    # Prepare chunks to process (skip completed)
+    chunks_to_process = [
+        (i, chunk, len(chunks))
+        for i, chunk in enumerate(chunks)
+        if i not in completed
+    ]
 
-            description = describe_chunk(chunk, llm_generate)
-            description_words = len(description.split())
+    if not chunks_to_process:
+        print("All chunks already processed!")
+    else:
+        print(f"\nProcessing {len(chunks_to_process)} chunks with {workers} worker(s)...")
+        do_cleanup = not args.no_cleanup
 
-            if description_words < 20:
-                print(f"  Warning: Description too short ({description_words} words), retrying...")
-                description = describe_chunk(chunk, llm_generate)
-                description_words = len(description.split())
+        try:
+            if workers == 1:
+                # Sequential processing
+                for chunk_info in chunks_to_process:
+                    i, chunk, total = chunk_info
+                    print(f"[{i+1}/{total}] Processing chunk ({len(chunk.split())} words)...")
 
-            if description_words < 10:
-                print(f"  Warning: Description failed, using fallback")
-                description = f"The text discusses various topics in {original_words} words."
+                    result = process_single_chunk(
+                        chunk_info, llm_generate, args.author, do_cleanup
+                    )
+                    results.append(result)
+                    completed.add(i)
+                    save_checkpoint(checkpoint_path, results)
+            else:
+                # Parallel processing (Ollama)
+                checkpointer = ThreadSafeCheckpointer(checkpoint_path, results, completed)
+                print_lock = threading.Lock()
 
-            results.append({
-                "chunk_index": i,
-                "author": args.author,
-                "original": chunk,
-                "description": description,
-                "word_count": original_words,  # For training prompt: "Write a {n} word excerpt..."
-            })
-            completed.add(i)
+                def worker_fn(chunk_info):
+                    i, chunk, total = chunk_info
+                    with print_lock:
+                        print(f"[{i+1}/{total}] Starting chunk ({len(chunk.split())} words)...")
 
-            # Save checkpoint after each chunk
-            save_checkpoint(checkpoint_path, results)
+                    result = process_single_chunk(
+                        chunk_info, llm_generate, args.author, do_cleanup
+                    )
+                    checkpointer.add_result(result)
 
-    except KeyboardInterrupt:
-        print(f"\n\nInterrupted! Progress saved to {checkpoint_path}")
-        print(f"Resume with: python {sys.argv[0]} --input {args.input} --output {args.output} --author '{args.author}'")
-        sys.exit(1)
+                    with print_lock:
+                        progress = checkpointer.get_progress()
+                        print(f"[{i+1}/{total}] Done (progress: {progress}/{total})")
+
+                    return result
+
+                with ThreadPoolExecutor(max_workers=workers) as executor:
+                    # Submit all tasks
+                    futures = {
+                        executor.submit(worker_fn, chunk_info): chunk_info[0]
+                        for chunk_info in chunks_to_process
+                    }
+
+                    # Wait for completion
+                    for future in as_completed(futures):
+                        idx = futures[future]
+                        try:
+                            future.result()
+                        except Exception as e:
+                            print(f"Error processing chunk {idx}: {e}")
+
+                # Update results from checkpointer
+                results = checkpointer.results
+                completed = checkpointer.completed
+
+        except KeyboardInterrupt:
+            print(f"\n\nInterrupted! Progress saved to {checkpoint_path}")
+            print(f"Resume with: python {sys.argv[0]} --input {args.input} --output {args.output} --author '{args.author}'")
+            sys.exit(1)
 
     # Sort results by chunk index for consistent output
     results.sort(key=lambda x: x.get("chunk_index", 0))

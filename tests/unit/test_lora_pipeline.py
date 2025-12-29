@@ -321,6 +321,117 @@ class TestCorpusNeutralization:
 
 
 # =============================================================================
+# Tests for Parallel Processing
+# =============================================================================
+
+class TestParallelProcessing:
+    """Tests for parallel processing in neutralize_corpus.py."""
+
+    def test_thread_safe_checkpointer_basic(self, tmp_path):
+        """Test that ThreadSafeCheckpointer works correctly."""
+        from neutralize_corpus import ThreadSafeCheckpointer, save_checkpoint
+
+        checkpoint_path = tmp_path / "test.checkpoint"
+        results = []
+        completed = set()
+
+        checkpointer = ThreadSafeCheckpointer(checkpoint_path, results, completed)
+
+        # Add some results
+        checkpointer.add_result({"chunk_index": 0, "author": "Test", "original": "A", "description": "B"})
+        checkpointer.add_result({"chunk_index": 1, "author": "Test", "original": "C", "description": "D"})
+
+        assert checkpointer.get_progress() == 2
+        assert checkpointer.is_completed(0)
+        assert checkpointer.is_completed(1)
+        assert not checkpointer.is_completed(2)
+
+        # Verify checkpoint file was created
+        assert checkpoint_path.exists()
+
+    def test_thread_safe_checkpointer_concurrent_access(self, tmp_path):
+        """Test that checkpointer handles concurrent access correctly."""
+        import threading
+        from neutralize_corpus import ThreadSafeCheckpointer
+
+        checkpoint_path = tmp_path / "concurrent.checkpoint"
+        results = []
+        completed = set()
+
+        checkpointer = ThreadSafeCheckpointer(checkpoint_path, results, completed)
+
+        errors = []
+        results_added = []
+
+        def worker(idx):
+            try:
+                checkpointer.add_result({
+                    "chunk_index": idx,
+                    "author": "Test",
+                    "original": f"Original {idx}",
+                    "description": f"Description {idx}"
+                })
+                results_added.append(idx)
+            except Exception as e:
+                errors.append(e)
+
+        # Run multiple threads
+        threads = [threading.Thread(target=worker, args=(i,)) for i in range(10)]
+        for t in threads:
+            t.start()
+        for t in threads:
+            t.join()
+
+        # No errors should have occurred
+        assert len(errors) == 0
+
+        # All 10 should be added
+        assert checkpointer.get_progress() == 10
+        assert len(results_added) == 10
+
+        # All should be marked complete
+        for i in range(10):
+            assert checkpointer.is_completed(i)
+
+    def test_process_single_chunk_basic(self):
+        """Test process_single_chunk function."""
+        from neutralize_corpus import process_single_chunk
+
+        def mock_llm(prompt):
+            return "A description of the content."
+
+        chunk_info = (0, "Test chunk with some content here.", 1)
+
+        result = process_single_chunk(chunk_info, mock_llm, "Test Author", do_cleanup=False)
+
+        assert result["chunk_index"] == 0
+        assert result["author"] == "Test Author"
+        assert result["original"] == "Test chunk with some content here."
+        assert "description" in result
+        assert "word_count" in result
+
+    def test_process_single_chunk_with_cleanup(self):
+        """Test process_single_chunk with boundary cleanup."""
+        from neutralize_corpus import process_single_chunk
+
+        cleanup_called = [False]
+
+        def mock_llm(prompt):
+            if "CLEANED TEXT" in prompt:
+                cleanup_called[0] = True
+                return "Cleaned text. Proper ending."
+            return "A description of the content."
+
+        # Chunk that needs resegmentation (starts lowercase)
+        chunk_info = (0, "and some text that starts mid-sentence. But continues.", 1)
+
+        result = process_single_chunk(chunk_info, mock_llm, "Test Author", do_cleanup=True)
+
+        assert cleanup_called[0]  # Cleanup should have been called
+        assert result is not None
+
+
+# =============================================================================
 # Tests for train_mlx_lora.py
 # =============================================================================
 

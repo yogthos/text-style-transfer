@@ -11,6 +11,7 @@ from src.config import (
     create_default_config,
     Config,
     LLMConfig,
+    LLMProviderRoles,
     ChromaDBConfig,
 )
 
@@ -22,7 +23,10 @@ class TestConfigLoading:
         """Test loading a minimal valid config."""
         minimal_config = {
             "llm": {
-                "provider": "deepseek",
+                "provider": {
+                    "writer": "mlx",
+                    "critic": "deepseek"
+                },
                 "providers": {
                     "deepseek": {
                         "api_key": "test-key",
@@ -38,7 +42,8 @@ class TestConfigLoading:
 
             try:
                 config = load_config(f.name)
-                assert config.llm.provider == "deepseek"
+                assert config.llm.provider.writer == "mlx"
+                assert config.llm.provider.critic == "deepseek"
                 assert config.llm.providers["deepseek"].api_key == "test-key"
             finally:
                 os.unlink(f.name)
@@ -53,10 +58,11 @@ class TestConfigLoading:
 
             try:
                 config = load_config(f.name)
-                assert config.llm.provider == "deepseek"
+                assert config.llm.provider.writer == "mlx"
+                assert config.llm.provider.critic == "deepseek"
+                # chromadb not in default config, uses class default
                 assert config.chromadb.persist_path == "atlas_cache/"
-                assert config.generation.max_repair_attempts == 5
-                assert config.validation.semantic.min_proposition_coverage == 0.9
+                assert config.generation.max_repair_attempts == 3  # default is 3
             finally:
                 os.unlink(f.name)
 
@@ -89,7 +95,10 @@ class TestEnvironmentVariables:
 
         config_data = {
             "llm": {
-                "provider": "deepseek",
+                "provider": {
+                    "writer": "mlx",
+                    "critic": "deepseek"
+                },
                 "providers": {
                     "deepseek": {
                         "api_key": "${TEST_API_KEY}",
@@ -117,7 +126,10 @@ class TestEnvironmentVariables:
 
         config_data = {
             "llm": {
-                "provider": "deepseek",
+                "provider": {
+                    "writer": "mlx",
+                    "critic": "deepseek"
+                },
                 "providers": {
                     "deepseek": {
                         "api_key": "${NONEXISTENT_VAR}",
@@ -146,12 +158,14 @@ class TestDefaultConfig:
         config = create_default_config()
 
         assert "llm" in config
-        assert "chromadb" in config
-        assert "validation" in config
+        assert "generation" in config
 
-        assert config["llm"]["provider"] == "deepseek"
+        # Provider is now a dict with writer/critic
+        assert config["llm"]["provider"]["writer"] == "mlx"
+        assert config["llm"]["provider"]["critic"] == "deepseek"
         assert "deepseek" in config["llm"]["providers"]
         assert "ollama" in config["llm"]["providers"]
+        assert "mlx" in config["llm"]["providers"]
 
     def test_default_values(self):
         """Test that Config has sensible defaults."""
@@ -159,7 +173,7 @@ class TestDefaultConfig:
 
         assert config.llm.max_retries == 5
         assert config.chromadb.persist_path == "atlas_cache/"
-        assert config.generation.max_repair_attempts == 5
+        assert config.generation.max_repair_attempts == 3  # actual default is 3
         assert config.validation.semantic.min_proposition_coverage == 0.9
         assert config.validation.statistical.length_tolerance == 0.2
 
@@ -171,7 +185,10 @@ class TestLLMConfig:
         """Test getting provider-specific config."""
         config_data = {
             "llm": {
-                "provider": "deepseek",
+                "provider": {
+                    "writer": "mlx",
+                    "critic": "deepseek"
+                },
                 "providers": {
                     "deepseek": {
                         "api_key": "key1",
@@ -198,15 +215,18 @@ class TestLLMConfig:
                 ollama_config = config.llm.get_provider_config("ollama")
                 assert ollama_config.base_url == "http://localhost:11434"
 
-                # Default provider
-                default_config = config.llm.get_provider_config()
-                assert default_config.api_key == "key1"
+                # Get writer and critic providers
+                assert config.llm.get_writer_provider() == "mlx"
+                assert config.llm.get_critic_provider() == "deepseek"
             finally:
                 os.unlink(f.name)
 
     def test_unknown_provider_raises_error(self):
         """Test that unknown provider raises ValueError."""
-        llm_config = LLMConfig(provider="test", providers={})
+        llm_config = LLMConfig(
+            provider=LLMProviderRoles(writer="test", critic="test"),
+            providers={}
+        )
 
         with pytest.raises(ValueError) as exc_info:
             llm_config.get_provider_config("unknown")

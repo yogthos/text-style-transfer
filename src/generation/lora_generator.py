@@ -34,7 +34,7 @@ class GenerationConfig:
     """Configuration for LoRA generation."""
 
     max_tokens: int = 512
-    temperature: float = 0.5  # Lower for more faithful translation
+    temperature: float = 1.0  # Per paper: 1.0 allows creative vocabulary selection
     top_p: float = 0.9
     repetition_penalty: float = 1.1
     min_tokens: int = 50  # Prevent too-short outputs
@@ -208,6 +208,11 @@ CRITICAL RULES:
         # Build user message - just the content
         user = content
 
+        # Estimate target word count from input (style transfer maintains similar length)
+        input_words = len(user.split())
+        # Allow some flexibility in output length
+        target_words = input_words
+
         # Check if base model (no chat template)
         is_base_model = (
             "instruct" not in self.base_model_name.lower() and
@@ -215,10 +220,10 @@ CRITICAL RULES:
         )
 
         if is_base_model:
-            # For base models, match the exact training format from describe_corpus.py:
-            # "Write in the style of {author}.\n\n{description}\n\n{styled_text}"
-            # At inference, we provide description and model completes with styled text
-            prompt = f"Write in the style of {author}.\n\n{user}\n\n"
+            # For base models, match the training format (instruction back-translation):
+            # "Write a {n} word excerpt about the content below emulating the style and voice of {author}"
+            instruction = f"Write a {target_words} word excerpt about the content below emulating the style and voice of {author}"
+            prompt = f"{instruction}\n\n{user}\n\n"
         else:
             # For instruct models, use chat template
             messages = [

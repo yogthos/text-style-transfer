@@ -4,23 +4,25 @@
 This script trains a LoRA adapter on Apple Silicon that captures an author's
 writing style. The trained adapter can then be used for fast style transfer.
 
+Based on research showing ~0.9M tokens is optimal for style capture.
+
 Usage:
-    # Generate dataset first (if not already done)
-    python scripts/train_mlx_lora.py --prepare \
-        --corpus styles/sample_sagan.txt \
-        --author "Carl Sagan" \
-        --output data/sft/sagan
+    # Step 1: Curate corpus to optimal size (~0.9M tokens)
+    python scripts/curate_corpus.py \
+        --input data/corpus/sagan_full.txt \
+        --output data/corpus/sagan.txt
 
-    # Train LoRA adapter
-    python scripts/train_mlx_lora.py --train \
-        --dataset data/sft/sagan.train.jsonl \
-        --author "Carl Sagan" \
-        --output lora_adapters/sagan
+    # Step 2: Generate content descriptions
+    python scripts/neutralize_corpus.py \
+        --input data/corpus/sagan.txt \
+        --output data/neutralized/sagan.jsonl \
+        --author "Carl Sagan"
 
-    # Or do both in one command
-    python scripts/train_mlx_lora.py --prepare --train \
-        --corpus styles/sample_sagan.txt \
+    # Step 3: Train LoRA adapter (1 epoch is sufficient)
+    python scripts/train_mlx_lora.py \
+        --from-neutralized data/neutralized/sagan.jsonl \
         --author "Carl Sagan" \
+        --train \
         --output lora_adapters/sagan
 """
 
@@ -59,130 +61,6 @@ def check_mlx_available():
         return True
     except ImportError:
         return False
-
-
-def create_ollama_generator(model: str = "qwen2.5:7b"):
-    """Create an Ollama generator function (fallback).
-
-    Args:
-        model: Ollama model name to use.
-
-    Returns:
-        Function that generates text from a prompt.
-    """
-    import requests
-
-    def generate(prompt: str) -> str:
-        """Generate text using Ollama."""
-        try:
-            response = requests.post(
-                "http://localhost:11434/api/generate",
-                json={
-                    "model": model,
-                    "prompt": prompt,
-                    "stream": False,
-                    "options": {"temperature": 0.3},
-                },
-                timeout=300,
-            )
-            if response.status_code == 200:
-                return response.json().get("response", "")
-            else:
-                print(f"Ollama error: {response.status_code}")
-                return ""
-        except Exception as e:
-            print(f"Ollama error: {e}")
-            return ""
-
-    return generate
-
-
-def create_mlx_generator(model: str = None):
-    """Create an MLX generator function (default, self-contained).
-
-    Args:
-        model: Model name (from config.json or default).
-
-    Returns:
-        Function that generates text from a prompt.
-    """
-    from src.llm.mlx_provider import MLXGenerator
-
-    generator = MLXGenerator(model_name=model, temperature=0.3)
-
-    def generate(prompt: str) -> str:
-        """Generate text using MLX."""
-        try:
-            return generator.generate(prompt, max_tokens=512)
-        except Exception as e:
-            print(f"MLX error: {e}")
-            return ""
-
-    return generate
-
-
-def prepare_dataset(
-    corpus_path: str,
-    author: str,
-    output_path: str,
-    llm_provider: str = None,
-) -> dict:
-    """Prepare training dataset from corpus.
-
-    Args:
-        corpus_path: Path to corpus text file.
-        author: Author name.
-        output_path: Base path for output files.
-        llm_provider: LLM provider for generating neutral paraphrases.
-
-    Returns:
-        Dict with paths to train and validation files.
-    """
-    from src.sft.mlx_dataset import generate_mlx_dataset
-
-    print(f"Loading corpus from {corpus_path}...")
-    with open(corpus_path, 'r') as f:
-        corpus_text = f.read()
-
-    # Set up LLM for generating neutral paraphrases
-    llm_generate = None
-    if llm_provider:
-        print(f"Using {llm_provider} for generating neutral paraphrases...")
-        if llm_provider == "mlx" or llm_provider.startswith("mlx:"):
-            # Use MLX (self-contained, no external services)
-            parts = llm_provider.split(":", 1)
-            model = parts[1] if len(parts) > 1 else None
-            print("Using MLX generator (self-contained)")
-            llm_generate = create_mlx_generator(model)
-        elif llm_provider.startswith("ollama"):
-            # Use Ollama (requires server)
-            parts = llm_provider.split(":", 1)
-            model = parts[1] if len(parts) > 1 else "qwen2.5:7b"
-            print(f"Using Ollama: {model}")
-            llm_generate = create_ollama_generator(model)
-        else:
-            # Default to MLX
-            print(f"Unknown provider: {llm_provider}, using MLX")
-            llm_generate = create_mlx_generator()
-
-    print(f"Generating dataset for {author}...")
-    if llm_generate:
-        print("Note: Generating neutral paraphrases for each chunk (this will take a while)...")
-
-    paths = generate_mlx_dataset(
-        corpus_text=corpus_text,
-        author=author,
-        output_path=output_path,
-        llm_generate=llm_generate,
-        min_chunk_words=50,
-        max_chunk_words=150,
-    )
-
-    print(f"Dataset saved:")
-    print(f"  Training: {paths['train']}")
-    print(f"  Validation: {paths['valid']}")
-
-    return paths
 
 
 def estimate_tokens(text: str) -> int:
@@ -227,10 +105,14 @@ def prepare_from_neutralized(
     output_path: str,
     max_seq_length: int = 2048,
 ) -> dict:
-    """Prepare training dataset from pre-neutralized JSONL.
+    """Prepare training dataset from content descriptions JSONL.
+
+    Uses the instruction back-translation format from the paper:
+    "Write a {word_count} word excerpt about the content below emulating
+    the style and voice of {author}\\n\\n{description}\\n\\n{original}"
 
     Args:
-        neutralized_path: Path to neutralized JSONL file (from neutralize_corpus.py).
+        neutralized_path: Path to JSONL file (from neutralize_corpus.py).
         author: Author name.
         output_path: Base path for output files.
         max_seq_length: Maximum sequence length in tokens.
@@ -238,14 +120,10 @@ def prepare_from_neutralized(
     Returns:
         Dict with paths to train and validation files.
     """
-    import random
-    from pathlib import Path
+    print(f"Loading training data from {neutralized_path}...")
 
-    print(f"Loading neutralized data from {neutralized_path}...")
-
-    # System prompt overhead (roughly constant)
-    system_prompt = f"You write exactly like {author}. Transform the text into {author}'s distinctive voice and style."
-    overhead_tokens = estimate_tokens(system_prompt) + 50  # +50 for chat formatting
+    # Overhead for prompt structure
+    overhead_tokens = 150
     content_budget = max_seq_length - overhead_tokens
 
     examples = []
@@ -254,108 +132,34 @@ def prepare_from_neutralized(
     with open(neutralized_path, 'r') as f:
         for line in f:
             data = json.loads(line)
-            neutral = data["neutral"]
+            # Support both old format (neutral) and new format (description)
+            description = data.get("description") or data.get("neutral", "")
             original = data["original"]
+            word_count = data.get("word_count", len(original.split()))
+
+            # Build the instruction prompt (following the paper's format)
+            instruction = f"Write a {word_count} word excerpt about the content below emulating the style and voice of {author}"
 
             # Check if this example needs splitting
-            total_content_tokens = estimate_tokens(neutral) + estimate_tokens(original)
+            total_content_tokens = estimate_tokens(description) + estimate_tokens(original)
 
             if total_content_tokens > content_budget:
-                # Split both neutral and original proportionally
-                # Each part gets half the budget (user + assistant)
-                part_budget = content_budget // 2
-
-                neutral_parts = split_text_to_fit(neutral, part_budget)
-                original_parts = split_text_to_fit(original, part_budget)
-
-                # Pair up the parts (use min to handle uneven splits)
-                num_parts = min(len(neutral_parts), len(original_parts))
-                for i in range(num_parts):
-                    example = {
-                        "messages": [
-                            {"role": "system", "content": system_prompt},
-                            {"role": "user", "content": neutral_parts[i]},
-                            {"role": "assistant", "content": original_parts[i]},
-                        ]
-                    }
-                    examples.append(example)
-                split_count += 1
-            else:
-                # Training format: neutral input -> author's original output
-                example = {
-                    "messages": [
-                        {"role": "system", "content": system_prompt},
-                        {"role": "user", "content": neutral},
-                        {"role": "assistant", "content": original},
-                    ]
-                }
-                examples.append(example)
-
-    print(f"Loaded {len(examples)} examples ({split_count} long examples were split)")
-
-    # Shuffle and split
-    random.seed(42)
-    random.shuffle(examples)
-
-
-def prepare_from_described(
-    described_path: str,
-    author: str,
-    output_path: str,
-    max_seq_length: int = 2048,
-) -> dict:
-    """Prepare training dataset from described JSONL (instruction-based).
-
-    Uses text format for base models. Note: mlx-lm's completions format requires
-    a chat template which base models don't have, so we use text format instead.
-    This trains on all tokens; use a lower learning rate to prevent corruption.
-
-    Args:
-        described_path: Path to described JSONL file (from describe_corpus.py).
-        author: Author name.
-        output_path: Base path for output files.
-        max_seq_length: Maximum sequence length in tokens.
-
-    Returns:
-        Dict with paths to train and validation files.
-    """
-    import random
-    from pathlib import Path
-
-    print(f"Loading described data from {described_path}...")
-
-    # Overhead for prompt structure
-    overhead_tokens = 100
-    content_budget = max_seq_length - overhead_tokens
-
-    examples = []
-    split_count = 0
-
-    with open(described_path, 'r') as f:
-        for line in f:
-            data = json.loads(line)
-            instruction = data["instruction"]
-            original = data["original"]
-
-            # Check if this example needs splitting
-            total_content_tokens = estimate_tokens(instruction) + estimate_tokens(original)
-
-            if total_content_tokens > content_budget:
-                # Split the original into parts
-                part_budget = content_budget - estimate_tokens(instruction) - 50
+                # Split the original into parts, keep description as-is
+                part_budget = content_budget - estimate_tokens(description) - 50
                 original_parts = split_text_to_fit(original, part_budget)
 
                 for part in original_parts:
-                    # Text format for base models (completions format requires chat template)
+                    part_words = len(part.split())
+                    part_instruction = f"Write a {part_words} word excerpt about the content below emulating the style and voice of {author}"
                     example = {
-                        "text": f"Write in the style of {author}.\n\n{instruction}\n\n{part}"
+                        "text": f"{part_instruction}\n\n{description}\n\n{part}"
                     }
                     examples.append(example)
                 split_count += 1
             else:
-                # Text format for base models (completions format requires chat template)
+                # Text format matching the paper
                 example = {
-                    "text": f"Write in the style of {author}.\n\n{instruction}\n\n{original}"
+                    "text": f"{instruction}\n\n{description}\n\n{original}"
                 }
                 examples.append(example)
 
@@ -402,11 +206,11 @@ def train_lora(
     author: str,
     output_dir: str,
     base_model: str = None,
-    epochs: int = 5,
-    batch_size: int = 2,  # Keep at 2 for memory safety
-    learning_rate: float = 5e-5,  # Moderate rate to prevent catastrophic forgetting
-    lora_rank: int = 32,  # Increased from 16
-    lora_alpha: int = 64,  # Increased from 32
+    epochs: int = 1,  # 1 epoch sufficient with curated ~0.9M token corpus
+    batch_size: int = 1,  # Per paper: prevents averaging gradients across examples
+    learning_rate: float = 1e-4,  # 2x aggressive per paper
+    lora_rank: int = 32,
+    lora_alpha: int = 64,
     validation_path: str = None,
     resume: bool = False,
 ):
@@ -679,11 +483,6 @@ def main():
 
     # Actions
     parser.add_argument(
-        "--prepare",
-        action="store_true",
-        help="Prepare training dataset from corpus",
-    )
-    parser.add_argument(
         "--train",
         action="store_true",
         help="Train LoRA adapter",
@@ -703,17 +502,13 @@ def main():
 
     # Input/output paths
     parser.add_argument(
-        "--corpus",
-        help="Path to corpus text file (for --prepare)",
-    )
-    parser.add_argument(
         "--dataset",
         help="Path to training JSONL file (for --train)",
     )
     parser.add_argument(
         "--output",
         required=True,
-        help="Output path (dataset dir for --prepare, adapter dir for --train)",
+        help="Output path for adapter directory",
     )
 
     # Training hyperparameters
@@ -725,20 +520,20 @@ def main():
     parser.add_argument(
         "--epochs",
         type=int,
-        default=5,
-        help="Training epochs (5 recommended with 5e-5 learning rate)",
+        default=1,
+        help="Training epochs (default: 1 - sufficient with curated ~0.9M token corpus)",
     )
     parser.add_argument(
         "--batch-size",
         type=int,
-        default=2,
-        help="Training batch size (default: 2)",
+        default=1,
+        help="Training batch size (default: 1 per paper - learns individual examples better)",
     )
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=5e-5,
-        help="Learning rate (default: 5e-5, prevents catastrophic forgetting)",
+        default=1e-4,
+        help="Learning rate (default: 1e-4, 2x aggressive per paper)",
     )
     parser.add_argument(
         "--rank",
@@ -760,17 +555,8 @@ def main():
 
     # Optional
     parser.add_argument(
-        "--llm-provider",
-        default="mlx",
-        help="LLM provider for neutral paraphrases: 'mlx' (default, self-contained) or 'ollama:model'",
-    )
-    parser.add_argument(
         "--from-neutralized",
         help="Path to pre-neutralized JSONL file (from neutralize_corpus.py)",
-    )
-    parser.add_argument(
-        "--from-described",
-        help="Path to described JSONL file (from describe_corpus.py) - RECOMMENDED",
     )
     parser.add_argument(
         "--max-seq-length",
@@ -786,25 +572,14 @@ def main():
     args = parser.parse_args()
 
     # Validate arguments
-    if not (args.prepare or args.train or args.test):
-        parser.error("Must specify at least one action: --prepare, --train, or --test")
+    if not (args.train or args.test):
+        parser.error("Must specify at least one action: --train or --test")
 
     dataset_path = args.dataset
     validation_path = None
 
-    # Prepare dataset from described file (RECOMMENDED)
-    if args.from_described:
-        paths = prepare_from_described(
-            described_path=args.from_described,
-            author=args.author,
-            output_path=args.output,
-            max_seq_length=args.max_seq_length,
-        )
-        dataset_path = paths['train']
-        validation_path = paths['valid']
-
-    # Prepare dataset from pre-neutralized file (legacy)
-    elif args.from_neutralized:
+    # Prepare dataset from pre-neutralized file
+    if args.from_neutralized:
         paths = prepare_from_neutralized(
             neutralized_path=args.from_neutralized,
             author=args.author,
@@ -813,32 +588,16 @@ def main():
         )
         dataset_path = paths['train']
         validation_path = paths['valid']
-
-    # Prepare dataset from corpus (with live neutralization)
-    elif args.prepare:
-        if not args.corpus:
-            parser.error("--corpus is required for --prepare")
-
-        paths = prepare_dataset(
-            corpus_path=args.corpus,
-            author=args.author,
-            output_path=args.output,
-            llm_provider=args.llm_provider,
-        )
-        dataset_path = paths['train']
-        validation_path = paths['valid']
-
-    else:
-        if dataset_path:
-            # Try to find validation file
-            val_path = Path(dataset_path).with_suffix('.valid.jsonl')
-            if val_path.exists():
-                validation_path = str(val_path)
+    elif dataset_path:
+        # Try to find validation file
+        val_path = Path(dataset_path).with_suffix('.valid.jsonl')
+        if val_path.exists():
+            validation_path = str(val_path)
 
     # Train LoRA
     if args.train:
         if not dataset_path:
-            parser.error("--dataset is required for --train (unless using --prepare)")
+            parser.error("--dataset or --from-neutralized is required for --train")
 
         adapter_path = train_lora(
             dataset_path=dataset_path,

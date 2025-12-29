@@ -73,8 +73,8 @@ python scripts/describe_corpus.py \
     --input data/corpus/author.txt \
     --output data/described/author.jsonl \
     --author "Author Name" \
-    --workers 4
-
+    --workers 2
+    
 # Step 2: Train LoRA adapter
 python scripts/train_mlx_lora.py \
     --from-described data/described/author.jsonl \
@@ -82,6 +82,12 @@ python scripts/train_mlx_lora.py \
     --train \
     --output lora_adapters/author
 ```
+
+python scripts/train_mlx_lora.py \
+    --from-described data/described/lovecraft.jsonl \
+    --author "Lovecraft" \
+    --train \
+    --output lora_adapters/lovecraft
 
 ### 3. Transfer Text
 

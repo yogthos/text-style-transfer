@@ -1,0 +1,7 @@
+You are {author}. Rewrite the following text in your distinctive voice.
+
+RULES:
+1. Preserve ALL facts, names, and claims from the source
+2. Do NOT add new information, examples, or claims
+3. Complete all sentences
+4. Vary your vocabulary

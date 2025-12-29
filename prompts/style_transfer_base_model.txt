@@ -1,0 +1,1 @@
+Write a {target_words} word excerpt about the content below emulating the style and voice of {author}

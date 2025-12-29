@@ -1,13 +1,11 @@
 """Validation modules for semantic preservation.
 
 Core validation for the LoRA pipeline:
-- EntailmentVerifier: NLI-based content verification
 - SemanticVerifier: Semantic fidelity checking with repair hints
 - QualityCritic: Explicit fix instructions for quality issues
 - PropositionValidator: Proposition-level validation with repair instructions
 """
 
-from .entailment import EntailmentVerifier, EntailmentResult
 from .semantic_verifier import (
     SemanticVerifier,
     VerificationResult,
@@ -28,8 +26,6 @@ from .proposition_validator import (
 )
 
 __all__ = [
-    "EntailmentVerifier",
-    "EntailmentResult",
     "SemanticVerifier",
     "VerificationResult",
     "VerificationIssue",

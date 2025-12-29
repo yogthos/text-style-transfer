@@ -22,6 +22,13 @@ from .nlp import (
     detect_perspective,
     setup_nltk,
 )
+from .prompts import (
+    load_prompt,
+    format_prompt,
+    get_prompt_with_fallback,
+    list_prompts,
+    clear_prompt_cache,
+)
 
 __all__ = [
     # Logging
@@ -44,4 +51,10 @@ __all__ = [
     "get_dependency_depth",
     "detect_perspective",
     "setup_nltk",
+    # Prompts
+    "load_prompt",
+    "format_prompt",
+    "get_prompt_with_fallback",
+    "list_prompts",
+    "clear_prompt_cache",
 ]

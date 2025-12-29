@@ -15,6 +15,7 @@ from pathlib import Path
 from typing import List, Optional
 
 from ..utils.logging import get_logger
+from ..utils.prompts import format_prompt, get_prompt_with_fallback
 
 logger = get_logger(__name__)
 
@@ -196,14 +197,7 @@ class LoRAStyleGenerator:
             system = system_override
         else:
             # Content-preserving prompt with explicit constraints
-            system = f"""You are {author}. Rewrite the following text in your distinctive voice.
-
-CRITICAL RULES:
-1. COMPLETE all sentences - never truncate or leave sentences unfinished
-2. PRESERVE all facts, names, and key information from the source
-3. DO NOT add new claims, examples, or ideas not in the original
-4. DO NOT substitute technical terms with synonyms
-5. VARY your word choice - avoid repeating the same adjectives and qualifiers"""
+            system = format_prompt("style_transfer_system", author=author)
 
         # Build user message - just the content
         user = content
@@ -220,9 +214,12 @@ CRITICAL RULES:
         )
 
         if is_base_model:
-            # For base models, match the training format (instruction back-translation):
-            # "Write a {n} word excerpt about the content below emulating the style and voice of {author}"
-            instruction = f"Write a {target_words} word excerpt about the content below emulating the style and voice of {author}"
+            # For base models, match the training format (instruction back-translation)
+            instruction = format_prompt(
+                "style_transfer_base_model",
+                target_words=target_words,
+                author=author
+            )
             prompt = f"{instruction}\n\n{user}\n\n"
         else:
             # For instruct models, use chat template
@@ -355,11 +352,7 @@ CRITICAL RULES:
         logger.warning(f"Verification failed ({score:.2f}), attempting repair...")
 
         # Add explicit requirement to system prompt
-        repair_system = (
-            f"You write in the style of {author}. "
-            "IMPORTANT: You MUST include all the specific content mentioned. "
-            "Preserve names, numbers, and key claims exactly."
-        )
+        repair_system = format_prompt("repair_with_content", author=author)
 
         return self.generate(
             content="\n".join(f"- {p}" for p in propositions),

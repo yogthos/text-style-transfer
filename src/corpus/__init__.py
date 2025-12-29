@@ -2,7 +2,6 @@
 
 from .loader import CorpusLoader, Corpus, CorpusDocument
 from .preprocessor import TextPreprocessor, ProcessedDocument, ProcessedParagraph
-from .analyzer import StatisticalAnalyzer
 
 __all__ = [
     "CorpusLoader",
@@ -11,5 +10,4 @@ __all__ = [
     "TextPreprocessor",
     "ProcessedDocument",
     "ProcessedParagraph",
-    "StatisticalAnalyzer",
 ]

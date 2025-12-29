@@ -1,0 +1,7 @@
+SOURCE TEXT (meaning to preserve exactly):
+{source}
+
+CURRENT TEXT (fix this):
+{current_output}
+
+Fix the issues listed above. Every sentence must be complete and grammatical. Meaning must match the source.

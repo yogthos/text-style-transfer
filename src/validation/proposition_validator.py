@@ -16,6 +16,7 @@ from ..ingestion.proposition_extractor import (
 )
 from ..utils.nlp import get_nlp, split_into_sentences
 from ..utils.logging import get_logger
+from ..utils.prompts import format_prompt
 
 logger = get_logger(__name__)
 
@@ -379,26 +380,16 @@ class PropositionValidator:
         instructions = validation_result.get_repair_instructions()
 
         if not instructions:
-            return f"""You are {author}. Rewrite the following text in your distinctive voice.
-
-RULES:
-1. Preserve ALL facts, names, and claims from the source
-2. Do NOT add new information, examples, or claims
-3. Complete all sentences
-4. Vary your vocabulary"""
+            return format_prompt("proposition_repair", author=author)
 
         # Build specific repair prompt
         instruction_text = "\n".join(f"- {inst}" for inst in instructions)
 
-        return f"""You are {author}. Rewrite the following text in your distinctive voice.
-
-CRITICAL - Fix these specific issues:
-{instruction_text}
-
-RULES:
-1. Preserve ALL facts, names, and claims from the source
-2. Do NOT add new information not in the source
-3. Complete all sentences"""
+        return format_prompt(
+            "proposition_repair_with_issues",
+            author=author,
+            instructions=instruction_text
+        )
 
 
 def create_proposition_validator(

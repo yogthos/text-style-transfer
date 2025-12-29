@@ -13,6 +13,7 @@ from collections import Counter
 
 from ..utils.nlp import get_nlp, split_into_sentences
 from ..utils.logging import get_logger
+from ..utils.prompts import format_prompt
 
 logger = get_logger(__name__)
 
@@ -406,10 +407,10 @@ class QualityCritic:
 
         if fixes:
             fix_text = ", ".join(fixes)
-            return f"""You are {author}. Rewrite the following text in your distinctive voice.
-
-IMPORTANT: {fix_text.capitalize()}. Only output the rewritten text, nothing else."""
+            return format_prompt(
+                "quality_repair_with_issues",
+                author=author,
+                fix_text=fix_text.capitalize()
+            )
         else:
-            return f"""You are {author}. Rewrite the following text in your distinctive voice.
-
-RULES: Complete all sentences, preserve all facts, do not add content not in source, vary vocabulary."""
+            return format_prompt("quality_repair", author=author)

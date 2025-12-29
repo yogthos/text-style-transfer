@@ -23,6 +23,7 @@ from ..utils.nlp import (
     filter_headings,
 )
 from ..utils.logging import get_logger
+from ..utils.prompts import format_prompt
 from ..ingestion.proposition_extractor import PropositionNode
 
 logger = get_logger(__name__)
@@ -422,31 +423,16 @@ class FastStyleTransfer:
 
         instruction_text = "\n".join(f"- {inst}" for inst in instructions)
 
-        system_prompt = """You are a precise text editor making surgical fixes to styled text.
+        system_prompt = format_prompt(
+            "critic_repair_system",
+            instructions=instruction_text
+        )
 
-NON-NEGOTIABLE REQUIREMENTS (failure is not acceptable):
-1. Every sentence MUST be grammatically correct and complete - no fragments or broken sentences
-2. The meaning MUST exactly match the source text - no information added or lost
-3. All text must read as natural, fluent English
-
-EDITING RULES:
-1. PRESERVE the existing writing style, vocabulary, and sentence structure
-2. Make ONLY the specific changes listed below
-3. Do NOT rewrite sentences that don't need fixing
-4. Do NOT add commentary or explanations
-5. Fix any incomplete, broken, or ungrammatical sentences you find
-6. Output ONLY the corrected text
-
-REQUIRED FIXES:
-""" + instruction_text
-
-        user_prompt = f"""SOURCE TEXT (meaning to preserve exactly):
-{source}
-
-CURRENT TEXT (fix this):
-{current_output}
-
-Fix the issues listed above. Every sentence must be complete and grammatical. Meaning must match the source."""
+        user_prompt = format_prompt(
+            "critic_repair_user",
+            source=source,
+            current_output=current_output
+        )
 
         try:
             repaired = self.critic_provider.call(
@@ -551,14 +537,7 @@ Fix the issues listed above. Every sentence must be complete and grammatical. Me
         self.generator.config.temperature = self.config.repair_temperature
 
         # Use stricter system prompt for repair
-        repair_system = (
-            f"You are a translator who converts text into {self.author}'s writing style. "
-            "CRITICAL: Translate the text faithfully. Do NOT:\n"
-            "- Add new ideas, examples, or explanations\n"
-            "- Expand or elaborate beyond the original\n"
-            "- Change the meaning or add interpretations\n"
-            "Output ONLY the translated text, nothing else."
-        )
+        repair_system = format_prompt("repair_strict", author=self.author)
 
         try:
             # Estimate tokens based on input

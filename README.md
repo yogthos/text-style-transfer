@@ -305,7 +305,8 @@ All settings are in `config.json`. Copy from `config.json.sample` to get started
 | Option | Default | Use Case |
 |--------|---------|----------|
 | `lora_scale` | 1.0 | **Lower (0.5-0.8)**: Subtler style, more base model. **Higher (1.2-1.5)**: Stronger style influence |
-| `proposition_threshold` | 0.7 | **Higher**: Stricter fact preservation. **Lower**: More stylistic freedom |
+| `proposition_threshold` | 0.85 | **Higher (0.9+)**: Maximum accuracy, may need more repairs. **Lower (0.7)**: Faster, allows some loss |
+| `anchor_threshold` | 0.9 | **Higher**: Strict entity/example preservation. **Lower**: More flexibility |
 | `max_expansion_ratio` | 1.5 | Maximum output length relative to input (1.5 = 50% longer max) |
 | `max_repair_attempts` | 3 | More attempts = better content preservation, slower processing |
 | `style_temperature` | 0.7 | **Higher**: More creative/varied. **Lower**: More consistent/predictable |
@@ -566,12 +567,12 @@ Increase `lora_scale` in config.json:
 
 ### Content Being Lost
 
-Increase validation thresholds:
+The default thresholds (0.85/0.9) are tuned for accuracy. For maximum preservation:
 ```json
 {
   "generation": {
-    "proposition_threshold": 0.8,
-    "anchor_threshold": 0.9,
+    "proposition_threshold": 0.95,
+    "anchor_threshold": 0.95,
     "max_repair_attempts": 5
   }
 }

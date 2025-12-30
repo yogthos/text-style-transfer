@@ -45,8 +45,8 @@ class TransferConfig:
 
     # Proposition validation settings
     use_proposition_validation: bool = True  # Enable proposition-based validation
-    proposition_threshold: float = 0.7  # Min proposition coverage
-    anchor_threshold: float = 0.8  # Min content anchor coverage
+    proposition_threshold: float = 0.85  # Min proposition coverage (raised from 0.7 for accuracy)
+    anchor_threshold: float = 0.9  # Min content anchor coverage (raised from 0.8 for accuracy)
 
     # Quality critic settings
     use_quality_critic: bool = True  # Enable quality checking with explicit fix instructions
@@ -359,6 +359,78 @@ class StyleTransfer:
             logger.warning(f"Neutralization failed: {e}, using original text")
             return paragraph
 
+    def _verify_and_augment_neutralization(
+        self,
+        neutralized: str,
+        source_propositions: List,
+    ) -> str:
+        """Verify neutralized content contains all propositions and augment if needed.
+
+        This is a critical step to prevent proposition loss during neutralization.
+        If key content is missing from the neutralized text, we append it explicitly.
+
+        Args:
+            neutralized: Neutralized content description.
+            source_propositions: Propositions extracted from source.
+
+        Returns:
+            Augmented neutralized content with any missing propositions.
+        """
+        if not source_propositions:
+            return neutralized
+
+        neutralized_lower = neutralized.lower()
+        missing_content = []
+
+        for prop in source_propositions:
+            # Check if key entities are present
+            for entity in prop.entities:
+                if entity.lower() not in neutralized_lower:
+                    missing_content.append(f"Mention: {entity}")
+
+            # Check if content anchors are present
+            for anchor in prop.content_anchors:
+                if anchor.must_preserve and anchor.text.lower() not in neutralized_lower:
+                    if anchor.anchor_type == "example":
+                        missing_content.append(f"Example: {anchor.text}")
+                    elif anchor.anchor_type == "statistic":
+                        missing_content.append(f"Data: {anchor.text}")
+                    elif anchor.anchor_type == "quote":
+                        missing_content.append(f"Quote: \"{anchor.text}\"")
+                    else:
+                        missing_content.append(anchor.text)
+
+            # Check if the core proposition is missing (very low keyword overlap)
+            prop_keywords = set(kw.lower() for kw in prop.keywords)
+            if prop_keywords:
+                neutralized_words = set(neutralized_lower.split())
+                overlap = len(prop_keywords & neutralized_words)
+                coverage = overlap / len(prop_keywords)
+                if coverage < 0.3:  # Less than 30% keyword coverage
+                    # Add a summary of this proposition
+                    if prop.subject and prop.verb:
+                        summary = f"{prop.subject} {prop.verb}"
+                        if prop.object:
+                            summary += f" {prop.object}"
+                        missing_content.append(f"Point: {summary}")
+
+        # Deduplicate and filter
+        seen = set()
+        unique_missing = []
+        for item in missing_content:
+            item_lower = item.lower()
+            if item_lower not in seen and item_lower not in neutralized_lower:
+                seen.add(item_lower)
+                unique_missing.append(item)
+
+        if unique_missing:
+            logger.warning(f"Neutralization missing {len(unique_missing)} items, augmenting")
+            # Append missing content
+            augmentation = "\n\nMust include:\n- " + "\n- ".join(unique_missing[:10])  # Limit to 10
+            return neutralized + augmentation
+
+        return neutralized
+
     def transfer_paragraph(
         self,
         paragraph: str,
@@ -396,6 +468,11 @@ class StyleTransfer:
             # Check if neutralization failed (returned original)
             if content_for_generation.strip() == paragraph.strip():
                 logger.warning("Neutralization returned original text unchanged")
+            # Verify neutralization preserves propositions and augment if needed
+            elif source_propositions:
+                content_for_generation = self._verify_and_augment_neutralization(
+                    content_for_generation, source_propositions
+                )
         else:
             content_for_generation = paragraph
 
@@ -656,9 +733,30 @@ class StyleTransfer:
         if validation.has_incomplete_sentences:
             instructions.append("COMPLETE the final sentence - it ends abruptly, add a proper ending")
 
+        # Add missing propositions with FULL text (most important for preservation)
+        if validation.missing_propositions:
+            for match in validation.missing_propositions[:5]:
+                prop = match.proposition
+                # Include the full proposition text for precise repair
+                if prop.text and len(prop.text) < 200:
+                    instructions.append(f"MUST EXPRESS this idea: \"{prop.text}\"")
+                elif prop.subject and prop.verb:
+                    summary = f"{prop.subject} {prop.verb}"
+                    if prop.object:
+                        summary += f" {prop.object}"
+                    instructions.append(f"MUST INCLUDE: {summary}")
+
+                # Also note specific missing elements
+                if match.missing_elements:
+                    for elem in match.missing_elements[:2]:
+                        instructions.append(f"  - Missing {elem}")
+
         # Add missing entities with context about what they relate to
         if validation.missing_entities:
             for entity in validation.missing_entities[:5]:
+                # Skip if already covered by missing propositions
+                if any(entity.lower() in str(inst).lower() for inst in instructions):
+                    continue
                 # Find the proposition that contains this entity for context
                 context = self._find_entity_context(source, entity)
                 if context:
@@ -683,6 +781,9 @@ class StyleTransfer:
         # Add missing facts with the actual fact content
         if validation.missing_facts:
             for fact in validation.missing_facts[:3]:
+                # Skip if already covered
+                if any(fact.lower() in str(inst).lower() for inst in instructions):
+                    continue
                 instructions.append(f"INCLUDE this fact: {fact}")
 
         if validation.stance_violations:

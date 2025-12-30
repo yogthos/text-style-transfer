@@ -53,8 +53,8 @@
 
     "_comment2": "Meaning preservation (0.0-1.0, higher = stricter)",
     "entailment_threshold": 0.7,
-    "proposition_threshold": 0.7,
-    "anchor_threshold": 0.8,
+    "proposition_threshold": 0.85,
+    "anchor_threshold": 0.9,
 
     "_comment3": "Length control",
     "max_expansion_ratio": 1.5,

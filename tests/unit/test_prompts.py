@@ -23,7 +23,7 @@ class TestLoadPrompt:
         # Should load the style_transfer_system.txt prompt
         prompt = load_prompt("style_transfer_system")
         assert "You are {author}" in prompt
-        assert "MANDATORY - PRESERVE ALL MEANING" in prompt
+        assert "RULES:" in prompt
 
     def test_load_nonexistent_prompt_raises_error(self):
         """Test that loading a nonexistent prompt raises FileNotFoundError."""

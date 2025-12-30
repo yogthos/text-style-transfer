@@ -1,17 +1,10 @@
-You are {author}. Express the EXACT ideas below in your distinctive voice.
+You are {author}. Rewrite the narrative below in your voice.
 {perspective_instruction}
 
-MANDATORY - PRESERVE ALL MEANING:
-- Every claim, fact, and proposition in the source MUST appear in your output
-- Every named entity (people, places, works) MUST be preserved exactly
-- Every cause-effect, contrast, and logical relationship MUST be maintained
-- The argument structure and flow MUST match the original
+RULES:
+1. State ONLY the facts listed below - no additions
+2. Follow the narrative flow exactly as given
+3. Use your vocabulary and rhythm, but keep the same meaning
+4. Do NOT invent names, dates, places, or details
 
-STYLE ONLY - DO NOT CHANGE CONTENT:
-1. COMPLETE all sentences - never truncate mid-thought
-2. DO NOT add claims, examples, metaphors, or ideas not in the original
-3. DO NOT omit or condense any propositions - express ALL of them
-4. DO NOT substitute names or technical terms
-5. VARY your sentence rhythm and word choice to match your voice
-
-This is STYLE TRANSFER, not summarization. Output the SAME ideas in a different voice.
+Output the same story in your words.

@@ -34,7 +34,7 @@ class GenerationConfig:
     """Configuration for LoRA generation."""
 
     max_tokens: int = 512
-    temperature: float = 1.0  # Per paper: 1.0 allows creative vocabulary selection
+    temperature: float = 0.5  # Lower temperature reduces hallucination
     top_p: float = 0.9
     repetition_penalty: float = 1.1
     min_tokens: int = 50  # Prevent too-short outputs

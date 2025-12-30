@@ -313,19 +313,15 @@ class StyleTransfer:
         logger.debug(f"Paragraph thesis: {paragraph_thesis[:80]}...")
 
         # ========================================
-        # STEP 2: Generate neutral prose directly from graph
+        # STEP 2: Generate narrative flow from graph
         # ========================================
-        # The graph already contains all propositions and relationships.
-        # We generate neutral prose from it - this is deterministic and
-        # preserves ALL content by construction (no LLM that could lose content).
-        neutral_prose = source_graph.to_neutral_prose()
-        logger.info(f"Generated neutral prose from graph: {len(neutral_prose.split())} words")
+        # The graph contains all propositions and relationships.
+        # Generate a clear narrative flow showing the progression of ideas.
+        narrative_flow = source_graph.to_narrative_flow()
+        logger.info(f"Generated narrative flow from graph: {len(source_graph.nodes)} propositions")
 
-        # Prepend thesis to guide the writer on the main point
-        if paragraph_thesis:
-            content_for_generation = f"MAIN POINT: {paragraph_thesis}\n\n{neutral_prose}"
-        else:
-            content_for_generation = neutral_prose
+        # Simple, clear format for the writer
+        content_for_generation = f"NARRATIVE TO REWRITE:\n\n{narrative_flow}"
 
         # ========================================
         # STEP 3: Pass neutral prose to LoRA writer
@@ -350,8 +346,8 @@ class StyleTransfer:
         # Check if LoRA output matches input (indicates no transformation)
         if output.strip() == paragraph.strip():
             logger.warning("LoRA output identical to original paragraph - no transformation occurred")
-        elif output.strip() == neutral_prose.strip():
-            logger.warning("LoRA output identical to neutral prose - no style applied")
+        elif output.strip() == narrative_flow.strip():
+            logger.warning("LoRA output identical to narrative flow - no style applied")
 
         # Track expansion at LoRA stage
         lora_words = len(output.split())

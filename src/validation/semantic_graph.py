@@ -238,6 +238,74 @@ class SemanticGraph:
 
         return " ".join(sentences)
 
+    def to_narrative_flow(self) -> str:
+        """Generate a clear narrative flow representation.
+
+        Creates a simple, linear narrative that shows the progression
+        of ideas using transition words based on edge relationships.
+
+        Returns:
+            A narrative flow string for LLM consumption.
+        """
+        if not self.nodes:
+            return ""
+
+        # Build a map of node_id -> outgoing edges
+        outgoing = {}
+        for edge in self.edges:
+            if edge.source_id not in outgoing:
+                outgoing[edge.source_id] = []
+            outgoing[edge.source_id].append(edge)
+
+        # Map relation types to transition phrases
+        transitions = {
+            RelationType.CAUSE: "Therefore",
+            RelationType.CONTRAST: "However",
+            RelationType.EXAMPLE: "For example",
+            RelationType.ELABORATION: "Furthermore",
+            RelationType.SEQUENCE: "Then",
+            RelationType.CONDITION: "If so",
+            RelationType.SUPPORT: "This is because",
+            RelationType.RESTATEMENT: "In other words",
+        }
+
+        # Generate narrative lines
+        lines = []
+        seen_nodes = set()
+        seen_texts = set()
+
+        for i, node in enumerate(self.nodes):
+            if node.id in seen_nodes:
+                continue
+            seen_nodes.add(node.id)
+
+            # Get the proposition text
+            text = node.text.strip() if node.text else node.summary()
+
+            # Deduplicate by text content
+            text_lower = text.lower()
+            if text_lower in seen_texts:
+                continue
+            seen_texts.add(text_lower)
+
+            # Find transition from previous node
+            transition = ""
+            if i > 0:
+                prev_node = self.nodes[i - 1]
+                if prev_node.id in outgoing:
+                    for edge in outgoing[prev_node.id]:
+                        if edge.target_id == node.id:
+                            transition = transitions.get(edge.relation, "")
+                            break
+
+            # Format the line
+            if transition:
+                lines.append(f"→ {transition}: {text}")
+            else:
+                lines.append(f"• {text}")
+
+        return "\n".join(lines)
+
     def _proposition_to_sentence(self, node: PropositionNode) -> str:
         """Convert a proposition node to a neutral sentence.
 

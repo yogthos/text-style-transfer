@@ -605,8 +605,8 @@ class TestLoRAGenerator:
 
         config = GenerationConfig()
 
-        # Temperature should be 1.0 per paper
-        assert config.temperature == 1.0
+        # Temperature 0.5 reduces hallucination
+        assert config.temperature == 0.5
         assert config.top_p == 0.9
         assert config.repetition_penalty == 1.1
 
@@ -728,7 +728,7 @@ class TestPipelineIntegration:
 
         # Verify inference defaults
         config = GenerationConfig()
-        assert config.temperature == 1.0  # Temperature 1.0
+        assert config.temperature == 0.5  # Lower temperature reduces hallucination
 
 
 if __name__ == "__main__":

@@ -45,7 +45,7 @@ class TestFormatPrompt:
 
     def test_format_with_variables(self):
         """Test formatting a prompt with variables."""
-        prompt = format_prompt("style_transfer_system", author="Carl Sagan")
+        prompt = format_prompt("style_transfer_system", author="Carl Sagan", perspective_instruction="")
         assert "You are Carl Sagan" in prompt
         assert "{author}" not in prompt
 
@@ -79,7 +79,8 @@ class TestGetPromptWithFallback:
         prompt = get_prompt_with_fallback(
             "style_transfer_system",
             fallback,
-            author="Test Author"
+            author="Test Author",
+            perspective_instruction=""
         )
         assert "You are Test Author" in prompt
         assert fallback not in prompt

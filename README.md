@@ -175,7 +175,7 @@ python restyle.py <input> -o <output> --adapter <path>
 | Option | Description |
 |--------|-------------|
 | `--adapter PATH` | Path to LoRA adapter directory (required) |
-| `--author NAME` | Author name (auto-detected from adapter if not provided) |
+| `--author NAME` | Author name used in generation prompts (e.g., "You are {author}"). Auto-detected from adapter metadata if not provided |
 | `--temperature FLOAT` | Generation temperature (default: 0.7) |
 | `--perspective` | Output perspective (see below) |
 | `--no-verify` | Disable entailment verification |

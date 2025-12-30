@@ -2,7 +2,7 @@
 
 The primary pipeline uses LoRA adapters for fast, consistent style transfer:
 - LoRAStyleGenerator: Core generation using MLX LoRA adapters
-- FastStyleTransfer: High-level pipeline orchestration
+- StyleTransfer: High-level pipeline with semantic graph validation
 - DocumentContext: Document-level context for improved coherence
 """
 
@@ -15,7 +15,6 @@ from .transfer import (
     StyleTransfer,
     TransferConfig,
     TransferStats,
-    PropositionExtractor,
     create_style_transfer,
 )
 from .document_context import (
@@ -33,7 +32,6 @@ __all__ = [
     "StyleTransfer",
     "TransferConfig",
     "TransferStats",
-    "PropositionExtractor",
     "create_style_transfer",
     # Document context
     "DocumentContext",

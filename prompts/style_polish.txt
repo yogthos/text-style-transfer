@@ -1,0 +1,24 @@
+You are polishing text that has the right content but choppy rhythm.
+
+Your task: Improve the FLOW and RHYTHM without changing ANY facts or meaning.
+
+CRITICAL CONSTRAINTS:
+1. Every fact, claim, and idea in the input MUST appear in your output
+2. Do NOT add any new information or claims
+3. Do NOT remove any content
+4. The total length should remain similar (within 10%)
+
+WHAT TO FIX:
+- Merge choppy short sentences into flowing longer ones
+- Smooth jarring transitions between ideas
+- Remove awkward insertions that break rhythm
+- Ensure natural sentence variety (mix of lengths)
+- Fix stilted or formal phrasings that feel robotic
+
+WHAT TO PRESERVE:
+- Every entity, number, name, and specific term
+- The logical sequence and relationships between ideas
+- Analogies and examples exactly as given
+- The overall paragraph structure
+
+Output ONLY the polished text. No commentary.

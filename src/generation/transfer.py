@@ -239,12 +239,24 @@ class StyleTransfer:
 
             def verify(original: str, output: str) -> float:
                 """Verify content preservation via entailment."""
+                import numpy as np
+
                 # Check if output entails original content
                 scores = model.predict([(original, output)])
-                # Model returns [contradiction, neutral, entailment]
+
+                # Model returns raw logits [contradiction, neutral, entailment]
+                # Apply softmax to convert to probabilities
                 if len(scores.shape) > 1:
-                    return float(scores[0][2])  # Entailment score
-                return float(scores[0])
+                    logits = scores[0]
+                else:
+                    logits = scores
+
+                # Softmax to get probabilities
+                exp_scores = np.exp(logits - np.max(logits))  # subtract max for numerical stability
+                probs = exp_scores / np.sum(exp_scores)
+
+                # Return entailment probability (index 2)
+                return float(probs[2]) if len(probs) > 2 else float(probs[-1])
 
             logger.info("Using NLI-based entailment verification")
             return verify
@@ -313,21 +325,26 @@ class StyleTransfer:
         logger.debug(f"Paragraph thesis: {paragraph_thesis[:80]}...")
 
         # ========================================
-        # STEP 2: Generate narrative flow from graph
+        # STEP 2: Neutralize input for LoRA
         # ========================================
-        # The graph contains all propositions and relationships.
-        # Generate a clear narrative flow showing the progression of ideas.
-        narrative_flow = source_graph.to_narrative_flow()
-        logger.info(f"Generated narrative flow from graph: {len(source_graph.nodes)} propositions")
-
-        # Simple, clear format for the writer
-        content_for_generation = f"NARRATIVE TO REWRITE:\n\n{narrative_flow}"
+        # The LoRA was trained on neutralized descriptions → styled output.
+        # We must neutralize the input to match the training format.
+        # Validate that neutralization preserves all propositions.
+        content_for_generation = self._neutralize_for_lora(
+            paragraph=paragraph,
+            source_graph=source_graph,
+            builder=builder,
+            comparator=comparator,
+        )
+        logger.info(f"Neutralized paragraph: {len(content_for_generation.split())} words")
 
         # ========================================
-        # STEP 3: Pass neutral prose to LoRA writer
+        # STEP 3: Pass to LoRA for style transformation
         # ========================================
         target_words = int(word_count * self.config.target_expansion_ratio)
-        max_tokens = max(100, int(target_words * 1.5))  # tokens > words
+        # Keep token limit close to target to prevent over-generation
+        # Use 1.3x to allow for style elaboration without too much room for hallucination
+        max_tokens = max(50, int(target_words * 1.3))
 
         # Get context hint for generation (if document context available)
         context_hint = None
@@ -346,8 +363,6 @@ class StyleTransfer:
         # Check if LoRA output matches input (indicates no transformation)
         if output.strip() == paragraph.strip():
             logger.warning("LoRA output identical to original paragraph - no transformation occurred")
-        elif output.strip() == narrative_flow.strip():
-            logger.warning("LoRA output identical to narrative flow - no style applied")
 
         # Track expansion at LoRA stage
         lora_words = len(output.split())
@@ -445,6 +460,118 @@ class StyleTransfer:
         # Fallback: add period to entire text
         return text + '.'
 
+    def _neutralize_for_lora(
+        self,
+        paragraph: str,
+        source_graph=None,
+        builder=None,
+        comparator=None,
+        max_attempts: int = 2,
+    ) -> str:
+        """Neutralize input paragraph to match LoRA training format.
+
+        The LoRA was trained on (neutral_description → styled_output) pairs.
+        This method converts input prose to a neutral description, then
+        VALIDATES that all propositions are preserved before returning.
+
+        Args:
+            paragraph: Input paragraph to neutralize.
+            source_graph: Semantic graph of source for validation.
+            builder: SemanticGraphBuilder for building neutral graph.
+            comparator: SemanticGraphComparator for validation.
+            max_attempts: Maximum neutralization attempts.
+
+        Returns:
+            Neutral description suitable for LoRA input.
+        """
+        if not self.critic_provider:
+            logger.warning("No critic provider for neutralization - using original text")
+            return paragraph
+
+        # Neutralization prompt - matches training format but preserves content
+        # Training uses short summaries with generic names to teach style
+        # At inference we keep specific names but match the brief, direct tone
+        input_words = len(paragraph.split())
+        target_words = max(50, min(input_words, 200))  # Scale with input, cap at 200
+
+        system_prompt = """You summarize text in short, direct sentences. No fancy words. No interpretation. Just what happens."""
+
+        user_prompt = f"""Summarize what happens in about {target_words} words. Keep ALL names, places, dates, and examples exactly as written.
+
+RULES:
+1. Short sentences only. No em-dashes, semicolons, or colons.
+2. Start directly with the action, not "The passage describes..."
+3. Keep every fact, analogy, and example - just make it plain and direct.
+4. Use simple words: "says" not "articulates", "shows" not "demonstrates"
+
+PASSAGE:
+{paragraph}
+
+SUMMARY:"""
+
+        best_neutral = None
+        best_coverage = 0.0
+
+        for attempt in range(max_attempts):
+            try:
+                # Slightly vary temperature for diversity
+                temp = 0.2 + (attempt * 0.1)
+
+                neutral = self.critic_provider.call(
+                    system_prompt=system_prompt,
+                    user_prompt=user_prompt,
+                    temperature=temp,
+                    max_tokens=max(300, int(len(paragraph.split()) * 1.5)),
+                )
+
+                neutral = neutral.strip()
+
+                # Basic length validation
+                if not neutral or len(neutral) < len(paragraph) * 0.15:
+                    logger.warning(f"Neutralization attempt {attempt + 1} too short")
+                    continue
+
+                # Validate against source graph if available
+                if source_graph and builder and comparator:
+                    neutral_graph = builder.build_from_text(neutral)
+                    diff = comparator.compare(source_graph, neutral_graph)
+
+                    # Calculate coverage
+                    total_props = len(source_graph.nodes)
+                    missing_props = len(diff.missing_nodes)
+                    coverage = (total_props - missing_props) / total_props if total_props > 0 else 0
+
+                    logger.debug(
+                        f"Neutralization attempt {attempt + 1}: "
+                        f"{coverage:.0%} coverage ({missing_props} missing of {total_props})"
+                    )
+
+                    if coverage > best_coverage:
+                        best_coverage = coverage
+                        best_neutral = neutral
+
+                    # Accept if coverage is good enough
+                    if coverage >= 0.8:
+                        logger.info(f"Neutralization accepted: {coverage:.0%} proposition coverage")
+                        return neutral
+
+                else:
+                    # No validation available - accept first reasonable result
+                    logger.debug(f"Neutralization complete (no validation): {len(neutral.split())} words")
+                    return neutral
+
+            except Exception as e:
+                logger.warning(f"Neutralization attempt {attempt + 1} failed: {e}")
+                continue
+
+        # Return best attempt or fall back to original
+        if best_neutral and best_coverage >= 0.5:
+            logger.warning(f"Using best neutralization with {best_coverage:.0%} coverage")
+            return best_neutral
+
+        logger.warning("Neutralization failed to preserve content - using original")
+        return paragraph
+
     def _validate_styled_output(
         self,
         source: str,
@@ -532,18 +659,18 @@ class StyleTransfer:
                 logger.info(f"Repair attempt {attempt + 1}: {len(missing_props)} missing propositions")
 
                 # Step 1: Critic adds missing content
-                repair_prompt = f"""The following text is missing some important information. Add the missing content naturally, preserving the existing text as much as possible.
+                repair_prompt = f"""Add the MISSING INFORMATION to this text. Keep names EXACTLY as written - no aliases, no clarifications, no "(also known as...)".
 
-CURRENT TEXT:
+TEXT:
 {best_output}
 
-MISSING INFORMATION (must be added):
+MISSING (add these facts):
 {chr(10).join(f"- {prop}" for prop in missing_props[:5])}
 
-OUTPUT the complete text with the missing information integrated naturally. Do not remove existing content."""
+Output the complete text with missing facts added. Do NOT add context or explanations."""
 
                 repaired = self.critic_provider.call(
-                    system_prompt="You are a precise editor. Add missing information to text while preserving its style and existing content. Output only the edited text.",
+                    system_prompt="Add missing facts to text. Keep all names exactly as given. Never add aliases or clarifications like 'also known as'. Output only the edited text.",
                     user_prompt=repair_prompt,
                     temperature=0.3,
                     max_tokens=max(200, int(len(best_output.split()) * 2)),

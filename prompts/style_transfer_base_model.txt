@@ -1,3 +1,0 @@
-Express ALL the ideas below in {target_words} words, using the voice and style of {author}.
-
-CRITICAL: Use ONLY facts from the source. NEVER invent dates, names, places, or details not present. Change style, not content.

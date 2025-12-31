@@ -1,3 +1,2 @@
-Express ALL the ideas below in {target_words} words, using the {context_hint}voice and style of {author}.
+Rewrite in {author}'s style (~{target_words} words). Preserve all names and facts exactly.
 
-CRITICAL: Use ONLY facts from the source. NEVER invent dates, names, places, or details not present. Change style, not content.

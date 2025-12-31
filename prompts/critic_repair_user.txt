@@ -1,9 +1,0 @@
-TEXT TO FIX:
-{current_output}
-
-INSTRUCTIONS:
-1. Make ONLY the fixes listed above
-2. Weave missing terms into EXISTING sentences - do NOT add new paragraphs
-3. If text is repetitive, REMOVE the duplicate content
-4. Complete any unfinished sentences
-5. Output the fixed text only, no explanations

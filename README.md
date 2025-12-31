@@ -321,10 +321,9 @@ All prompts are in the `prompts/` directory as editable text files:
 
 | File | Purpose |
 |------|---------|
-| `style_transfer_system.txt` | Main system prompt for LoRA generation |
-| `neutralize_for_transfer.txt` | Converts prose to neutral descriptions |
-| `critic_repair_system.txt` | System prompt for critic repairs |
-| `critic_repair_user.txt` | User prompt template for repairs |
+| `style_transfer_system.txt` | System prompt for LoRA generation (instruct models) |
+| `style_transfer_base_model_with_context.txt` | Prompt for base models |
+| `repair_with_content.txt` | Content repair prompt |
 
 Prompts use `{variable}` syntax. Available variables depend on the prompt.
 

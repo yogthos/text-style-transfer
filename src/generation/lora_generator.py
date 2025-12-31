@@ -273,10 +273,16 @@ class LoRAStyleGenerator:
         target_words = input_words
 
         # Check if base model (no chat template)
-        is_base_model = (
-            "instruct" not in self.base_model_name.lower() and
-            "chat" not in self.base_model_name.lower()
+        # Most modern models are instruction-tuned even without "instruct" in name
+        model_lower = self.base_model_name.lower()
+        is_instruct_model = (
+            "instruct" in model_lower or
+            "chat" in model_lower or
+            "qwen" in model_lower or  # Qwen models are instruction-tuned
+            "llama-3" in model_lower or  # Llama 3 is instruction-tuned
+            "mistral" in model_lower  # Mistral is instruction-tuned
         )
+        is_base_model = not is_instruct_model
 
         if is_base_model:
             # For base models, match the training format (instruction back-translation)
@@ -328,14 +334,38 @@ class LoRAStyleGenerator:
 
         response = response.strip()
 
-        # For base models, extract just the first response (stop at continuation patterns)
-        if is_base_model:
-            # Stop at patterns that indicate model is starting a new example
-            stop_patterns = ["\n\nWrite in the style of", "\nWrite in the style of", "\n\n---", "\n---"]
-            for pattern in stop_patterns:
-                if pattern in response:
-                    response = response.split(pattern)[0].strip()
-                    break
+        # Stop at patterns indicating the model is done or hallucinating
+        # These patterns indicate meta-commentary, new turns, or garbage
+        stop_patterns = [
+            "\n\nKeep",        # Echoing instructions
+            "\nKeeping every",  # Meta-commentary
+            "\n\nThis ",       # Starting explanation
+            "\n\nNote:",       # Meta-note
+            "\n\nuser",        # New turn marker
+            "\n\nassistant",   # New turn marker
+            "\nuser\n",        # Turn marker
+            "\n\n---",         # Section break
+            "\n---",           # Section break
+            "\n\nWrite",       # New example
+        ]
+
+        for pattern in stop_patterns:
+            if pattern in response:
+                response = response.split(pattern)[0].strip()
+
+        # Also stop at double newline followed by non-ASCII (often garbage)
+        lines = response.split("\n\n")
+        clean_lines = []
+        for line in lines:
+            # Stop if line starts with non-ASCII characters
+            if line and ord(line[0]) > 127:
+                break
+            clean_lines.append(line)
+        response = "\n\n".join(clean_lines).strip()
+
+        # For short inputs, only take the first paragraph to avoid elaboration
+        if input_words < 50 and "\n\n" in response:
+            response = response.split("\n\n")[0].strip()
 
         return response
 

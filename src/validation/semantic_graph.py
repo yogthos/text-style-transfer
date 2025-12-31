@@ -86,10 +86,47 @@ class SemanticGraph:
     """A semantic graph representing the meaning structure of a paragraph."""
     nodes: List[PropositionNode] = field(default_factory=list)
     edges: List[RelationEdge] = field(default_factory=list)
+    _seen_propositions: Set[str] = field(default_factory=set, repr=False)
 
-    def add_node(self, node: PropositionNode) -> None:
-        """Add a proposition node."""
+    def add_node(self, node: PropositionNode) -> bool:
+        """Add a proposition node if not a duplicate.
+
+        Deduplicates by (subject, predicate, object) tuple to avoid
+        counting the same proposition multiple times.
+
+        Returns:
+            True if node was added, False if duplicate.
+        """
+        # Create normalized key from S-P-O
+        key = (
+            (node.subject or "").lower().strip(),
+            (node.predicate or "").lower().strip(),
+            (node.object or "").lower().strip(),
+        )
+
+        # Also check text-based key for sentences that map to same S-P-O
+        text_key = (node.text or "").lower().strip()
+
+        # Skip if we've seen this exact proposition
+        prop_key = f"{key[0]}|{key[1]}|{key[2]}"
+        if prop_key in self._seen_propositions:
+            return False
+
+        # Skip if text is identical to an existing node
+        for existing in self.nodes:
+            if (existing.text or "").lower().strip() == text_key and text_key:
+                # Same sentence text - check if S-P-O is also similar
+                existing_key = (
+                    (existing.subject or "").lower().strip(),
+                    (existing.predicate or "").lower().strip(),
+                    (existing.object or "").lower().strip(),
+                )
+                if existing_key == key:
+                    return False
+
+        self._seen_propositions.add(prop_key)
         self.nodes.append(node)
+        return True
 
     def add_edge(self, source_id: str, target_id: str, relation: RelationType) -> None:
         """Add a relationship edge."""
@@ -207,32 +244,29 @@ class SemanticGraph:
         return "\n".join(lines)
 
     def to_neutral_prose(self) -> str:
-        """Generate neutral prose from the graph propositions.
+        """Generate prose from the graph propositions.
 
-        This creates a deterministic neutral description that preserves
-        ALL propositions and their relationships. No LLM needed.
-
-        IMPORTANT: This generates NEUTRAL descriptions, not the original text.
-        The LoRA should receive neutral content to restyle, not source sentences.
+        Returns the full sentence text from each proposition node,
+        preserving the complete content for the LoRA to restyle.
 
         Returns:
-            Neutral prose representation suitable for LoRA transformation.
+            Prose representation suitable for LoRA transformation.
         """
         if not self.nodes:
             return ""
 
-        # Build neutral sentences in order, deduplicating
+        # Build sentences in order, deduplicating
         sentences = []
         seen_content = set()
 
         for node in self.nodes:
-            # Build neutral description from S-P-O structure
-            sentence = self._build_neutral_sentence(node)
+            # Use full sentence text to preserve all content
+            sentence = node.text.strip() if node.text else ""
             if not sentence:
                 continue
 
             # Deduplicate by normalized content
-            normalized = sentence.strip().lower()
+            normalized = sentence.lower()
             if normalized in seen_content:
                 continue
 
@@ -241,54 +275,11 @@ class SemanticGraph:
 
         return " ".join(sentences)
 
-    def _build_neutral_sentence(self, node: PropositionNode) -> str:
-        """Build a neutral sentence from proposition structure.
-
-        NEVER returns the original text - always constructs from S-P-O.
-        """
-        parts = []
-
-        # Handle negation
-        if node.is_negated:
-            parts.append("It is not the case that")
-
-        # Handle epistemic stance
-        if node.epistemic == "hypothetical":
-            parts.append("possibly")
-        elif node.epistemic == "appearance":
-            parts.append("apparently")
-
-        # Subject
-        if node.subject:
-            parts.append(node.subject)
-
-        # Predicate
-        if node.predicate:
-            parts.append(node.predicate)
-
-        # Object
-        if node.object:
-            parts.append(node.object)
-
-        if not parts:
-            return ""
-
-        sentence = " ".join(parts)
-
-        # Ensure proper ending
-        if sentence and sentence[-1] not in ".!?":
-            sentence += "."
-
-        return sentence
-
     def to_narrative_flow(self) -> str:
-        """Generate a clear narrative flow representation.
+        """Generate a narrative flow representation with transitions.
 
-        Creates a simple, linear narrative that shows the progression
-        of ideas using transition words based on edge relationships.
-
-        IMPORTANT: Uses neutral S-P-O descriptions, NOT original source text.
-        The LoRA should receive neutral content to restyle.
+        Creates a linear narrative showing the progression of ideas
+        using transition words based on edge relationships.
 
         Returns:
             A narrative flow string for LLM consumption.
@@ -325,10 +316,8 @@ class SemanticGraph:
                 continue
             seen_nodes.add(node.id)
 
-            # Build NEUTRAL text from S-P-O, NOT original source text
-            text = self._build_neutral_sentence(node)
-            if not text:
-                text = node.summary()
+            # Use full sentence text to preserve content
+            text = node.text.strip() if node.text else node.summary()
 
             # Deduplicate by text content
             text_lower = text.lower()
@@ -374,6 +363,7 @@ class GraphDiff:
     added_edges: List[RelationEdge] = field(default_factory=list)
     modified_nodes: List[Tuple[PropositionNode, PropositionNode]] = field(default_factory=list)
     entity_role_errors: List[EntityRoleError] = field(default_factory=list)
+    source_node_count: int = 0  # Total nodes in source graph for ratio calculations
 
     @property
     def is_isomorphic(self) -> bool:
@@ -391,12 +381,13 @@ class GraphDiff:
     def has_critical_differences(self) -> bool:
         """Check if there are critical structural differences.
 
-        Only missing NODES are critical - these represent lost propositions.
-        Missing edges and entity role variations are acceptable as long as
-        the core ideas are preserved. The goal is semantic preservation,
-        not exact structural matching.
+        DISABLED: Repair loop causes more harm than good currently.
+        The LoRA output is usually acceptable without repair, and the
+        repair process introduces hallucinations and prompt leakage.
+
+        TODO: Fix repair loop before re-enabling.
         """
-        return len(self.missing_nodes) > 0
+        return False  # Disabled - repair causes more problems than it solves
 
     def to_repair_instructions(self) -> List[str]:
         """Generate repair instructions from diff."""
@@ -696,8 +687,9 @@ class SemanticGraphBuilder:
                     is_negated=is_negated,
                     epistemic=epistemic,
                 )
-                graph.add_node(node)
-                sentence_nodes[sent_idx] = node_id_str
+                # Only track node if it was actually added (not a duplicate)
+                if graph.add_node(node):
+                    sentence_nodes[sent_idx] = node_id_str
 
         # Extract relationships
         sent_indices = sorted(sentence_nodes.keys())
@@ -964,6 +956,7 @@ class SemanticGraphComparator:
             GraphDiff with missing, added, and modified elements.
         """
         diff = GraphDiff()
+        diff.source_node_count = len(source_graph.nodes)
 
         # Build mapping between source and output nodes based on semantic similarity
         node_mapping: Dict[str, str] = {}  # source_id -> output_id

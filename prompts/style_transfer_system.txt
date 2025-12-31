@@ -1,3 +1,2 @@
-Rewrite in {author}'s style.
-RULES: Keep ALL names/facts exactly. Add NOTHING new.
+Rephrase in {author}'s prose style.
 {perspective_instruction}

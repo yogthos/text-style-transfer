@@ -133,7 +133,7 @@ class GenerationConfig:
     # Style settings
     style_temperature: float = 0.7  # Temperature for style generation (higher = more creative)
     neutralization_temperature: float = 0.3  # Temperature for neutralization (lower = more consistent)
-    use_neutralization: bool = True  # Convert prose to description before LoRA
+    skip_neutralization: bool = True  # Skip neutralization to preserve more facts
 
     # Neutralization token settings
     neutralization_min_tokens: int = 300  # Minimum tokens for neutralization output
@@ -385,7 +385,7 @@ def load_config(config_path: str = "config.json") -> Config:
             # Style settings
             style_temperature=gen.get("style_temperature", 0.7),
             neutralization_temperature=gen.get("neutralization_temperature", 0.3),
-            use_neutralization=gen.get("use_neutralization", True),
+            skip_neutralization=gen.get("skip_neutralization", True),
             # Neutralization token settings
             neutralization_min_tokens=gen.get("neutralization_min_tokens", 300),
             neutralization_token_multiplier=gen.get("neutralization_token_multiplier", 1.2),

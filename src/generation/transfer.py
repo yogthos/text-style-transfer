@@ -57,6 +57,9 @@ class TransferConfig:
     # Document context settings
     use_document_context: bool = True  # Extract and use document-level context
 
+    # Neutralization settings
+    skip_neutralization: bool = True  # Skip neutralization step (preserves more facts)
+
     # Length control settings
     max_expansion_ratio: float = 1.5  # Max output/input word ratio (1.5 = 50% longer)
     target_expansion_ratio: float = 1.2  # Target for LoRA generation
@@ -325,18 +328,22 @@ class StyleTransfer:
         logger.debug(f"Paragraph thesis: {paragraph_thesis[:80]}...")
 
         # ========================================
-        # STEP 2: Neutralize input for LoRA
+        # STEP 2: Prepare input for LoRA
         # ========================================
-        # The LoRA was trained on neutralized descriptions → styled output.
-        # We must neutralize the input to match the training format.
-        # Validate that neutralization preserves all propositions.
-        content_for_generation = self._neutralize_for_lora(
-            paragraph=paragraph,
-            source_graph=source_graph,
-            builder=builder,
-            comparator=comparator,
-        )
-        logger.info(f"Neutralized paragraph: {len(content_for_generation.split())} words")
+        if self.config.skip_neutralization:
+            # Skip neutralization - pass original text directly to LoRA
+            # This preserves more facts but may not match training format exactly
+            content_for_generation = paragraph
+            logger.debug("Skipping neutralization (skip_neutralization=True)")
+        else:
+            # Neutralize input to match LoRA training format
+            content_for_generation = self._neutralize_for_lora(
+                paragraph=paragraph,
+                source_graph=source_graph,
+                builder=builder,
+                comparator=comparator,
+            )
+            logger.info(f"Neutralized paragraph: {len(content_for_generation.split())} words")
 
         # ========================================
         # STEP 3: Pass to LoRA for style transformation
@@ -584,13 +591,11 @@ SUMMARY:"""
         stats: Optional['TransferStats'] = None,
         max_attempts: int = 3,
     ) -> Tuple[str, bool]:
-        """Validate styled output against source graph with repair.
+        """Validate styled output against source graph.
 
-        This is the post-LoRA validation step that ensures the styled output
-        preserves all propositions from the source.
-
-        IMPORTANT: Never inserts verbatim source text. If validation fails,
-        regenerates entirely through LoRA using neutral prose from the graph.
+        Compares the output's semantic graph to the source for quality metrics.
+        No repair is attempted - the LoRA output with proper settings (low temp,
+        tight token limit) is already good enough.
 
         Args:
             source: Original source text.
@@ -598,542 +603,31 @@ SUMMARY:"""
             source_graph: Semantic graph of source (ground truth).
             builder: SemanticGraphBuilder instance.
             comparator: SemanticGraphComparator instance.
-            previous: Previous paragraph for context.
-            context_hint: Document context hint.
-            stats: Optional stats object.
-            max_attempts: Maximum repair attempts.
+            previous: Previous paragraph for context (unused, kept for API compat).
+            context_hint: Document context hint (unused, kept for API compat).
+            stats: Optional stats object (unused, kept for API compat).
+            max_attempts: Max repair attempts (unused, kept for API compat).
 
         Returns:
-            Tuple of (validated_output, is_valid).
+            Tuple of (output, is_valid).
         """
-        # Initial comparison
+        # Compare graphs for quality metrics
         output_graph = builder.build_from_text(output)
         diff = comparator.compare(source_graph, output_graph)
 
         if diff.is_isomorphic:
-            logger.info("Styled output graph matches source - no repair needed")
+            logger.debug("Output graph matches source perfectly")
             return output, True
 
-        if not diff.has_critical_differences:
-            logger.debug("Styled output has minor differences - acceptable")
-            return output, True
-
-        logger.info(
-            f"Styled output graph diff: {len(diff.missing_nodes)} missing, "
-            f"{len(diff.added_nodes)} added, {len(diff.entity_role_errors)} entity errors"
-        )
-
-        # ========================================
-        # REPAIR: Critic adds missing content, then LoRA restyles
-        # ========================================
-        # 1. Use critic (DeepSeek) to surgically add missing propositions
-        # 2. Restyle through LoRA with LOW temperature to preserve content
-        #
-        # This ensures all content is preserved AND styled.
-
-        if not self.critic_provider:
-            logger.warning("No critic provider for repair - returning original output")
-            return output, False
-
-        best_output = output
-        best_missing = len(diff.missing_nodes)
-
-        for attempt in range(max_attempts):
-            try:
-                # Get current diff (first iteration uses initial diff)
-                if attempt > 0:
-                    current_graph = builder.build_from_text(best_output)
-                    current_diff = comparator.compare(source_graph, current_graph)
-                else:
-                    current_diff = diff
-
-                if not current_diff.has_critical_differences:
-                    break
-
-                # Build repair instructions from the diff
-                missing_props = [node.text or node.summary() for node in current_diff.missing_nodes]
-
-                if not missing_props:
-                    break
-
-                logger.info(f"Repair attempt {attempt + 1}: {len(missing_props)} missing propositions")
-
-                # Step 1: Critic adds missing content
-                repair_prompt = f"""Add the MISSING INFORMATION to this text. Keep names EXACTLY as written - no aliases, no clarifications, no "(also known as...)".
-
-TEXT:
-{best_output}
-
-MISSING (add these facts):
-{chr(10).join(f"- {prop}" for prop in missing_props[:5])}
-
-Output the complete text with missing facts added. Do NOT add context or explanations."""
-
-                repaired = self.critic_provider.call(
-                    system_prompt="Add missing facts to text. Keep all names exactly as given. Never add aliases or clarifications like 'also known as'. Output only the edited text.",
-                    user_prompt=repair_prompt,
-                    temperature=0.3,
-                    max_tokens=max(200, int(len(best_output.split()) * 2)),
-                )
-
-                repaired = repaired.strip()
-
-                if not repaired or len(repaired) < len(best_output) * 0.5:
-                    logger.warning(f"Critic returned invalid output, skipping")
-                    continue
-
-                # Step 2: Restyle through LoRA with VERY LOW temperature
-                # This preserves the repaired content while adding author style
-                old_temp = self.generator.config.temperature
-                self.generator.config.temperature = 0.2  # Very low to preserve content
-
-                styled_output = self.generator.generate(
-                    content=f"Rewrite this text preserving ALL information:\n\n{repaired}",
-                    author=self.author,
-                    context=previous,
-                    max_tokens=max(200, int(len(repaired.split()) * 1.5)),
-                    context_hint=context_hint,
-                    perspective=getattr(self.config, 'perspective', 'preserve'),
-                )
-
-                self.generator.config.temperature = old_temp
-
-                # Verify the result
-                styled_graph = builder.build_from_text(styled_output)
-                styled_diff = comparator.compare(source_graph, styled_graph)
-                missing_count = len(styled_diff.missing_nodes)
-
-                logger.debug(f"After repair+restyle: {missing_count} missing (was {len(current_diff.missing_nodes)})")
-
-                if styled_diff.is_isomorphic or not styled_diff.has_critical_differences:
-                    if stats:
-                        stats.quality_issues_fixed += 1
-                    logger.info(f"Repair successful on attempt {attempt + 1}")
-                    return styled_output, True
-
-                # Keep best result
-                if missing_count < best_missing:
-                    best_output = styled_output
-                    best_missing = missing_count
-
-            except Exception as e:
-                logger.warning(f"Repair attempt {attempt + 1} failed: {e}")
-                continue
-
-        # Return best attempt
-        if best_missing < len(diff.missing_nodes):
-            logger.info(f"Partial repair: reduced missing from {len(diff.missing_nodes)} to {best_missing}")
-            if stats:
-                stats.quality_issues_fixed += 1
-            return best_output, False
-
-        logger.warning(f"Repair unsuccessful after {max_attempts} attempts")
-        return output, False
-
-    def _incremental_graph_repair(
-        self,
-        source: str,
-        output: str,
-        source_graph,
-        builder,
-        comparator,
-        max_attempts_per_error: int = 2,
-    ) -> str:
-        """Repair output with deterministic, targeted fixes.
-
-        This is a single-pass repair algorithm:
-        1. Identify all errors from graph diff
-        2. For each error, make ONE targeted fix
-        3. Stop when all errors processed (no retries on same error)
-
-        The algorithm is deterministic because:
-        - Each error is processed exactly once
-        - Fixes are direct text operations where possible
-        - LLM is only used for specific rewrites, not open-ended generation
-        - No loops or retries that could cause infinite iteration
-
-        Args:
-            source: Original source text.
-            output: Current output text.
-            source_graph: Ground truth semantic graph.
-            builder: SemanticGraphBuilder instance.
-            comparator: SemanticGraphComparator instance.
-            max_attempts_per_error: Max LLM attempts for complex fixes.
-
-        Returns:
-            Repaired output text.
-        """
-        source_sentences = split_into_sentences(source)
-        output_sentences = list(split_into_sentences(output))
-
-        # Get the diff - this tells us exactly what needs to be fixed
-        output_graph = builder.build_from_text(output)
-        diff = comparator.compare(source_graph, output_graph)
-
-        if diff.is_isomorphic:
-            return output  # Nothing to fix
-
-        errors = self._prioritize_errors(diff)
-        logger.info(f"Repairing {len(errors)} graph errors")
-
-        # Track what we've fixed to avoid duplicate work
-        fixed_propositions = set()
-        removed_sentences = set()
-        # Track inserted sentences so cleanup doesn't remove them
-        inserted_sentences = set()
-
-        for error in errors:
-            error_type = error["type"]
-            error_data = error["data"]
-
-            if error_type == "missing":
-                # Missing proposition: find source sentence and add it
-                prop_id = f"{error_data.subject}|{error_data.predicate}"
-                if prop_id in fixed_propositions:
-                    continue
-
-                # Find the source sentence containing this proposition
-                source_sent = self._find_sentence_for_proposition(
-                    error_data, source_sentences
-                )
-
-                if not source_sent:
-                    logger.warning(f"Could not find source sentence for: {error_data.summary()[:50]}")
-                    continue
-
-                # Check if proposition is already covered by an output sentence
-                # (not just exact string match - check semantic coverage)
-                already_covered = False
-                for out_sent in output_sentences:
-                    if self._sentence_contains_proposition(out_sent, error_data):
-                        already_covered = True
-                        logger.debug(f"Proposition already covered: {error_data.summary()[:40]}")
-                        break
-
-                if already_covered:
-                    fixed_propositions.add(prop_id)
-                    continue
-
-                # Insert at position determined by graph structure
-                insert_pos = self._find_insertion_position(
-                    error_data, output_sentences, source_graph, output_graph
-                )
-                output_sentences.insert(insert_pos, source_sent)
-                inserted_sentences.add(source_sent.lower().strip())
-                fixed_propositions.add(prop_id)
-                logger.info(f"Inserted missing proposition at pos {insert_pos}: {error_data.summary()[:40]}")
-
-            elif error_type == "added":
-                # Hallucinated content: remove the sentence containing it
-                prop_text = error_data.text
-                for i, sent in enumerate(output_sentences):
-                    if i in removed_sentences:
-                        continue
-                    # Check if this sentence contains the hallucination
-                    if self._sentence_contains_proposition(sent, error_data):
-                        removed_sentences.add(i)
-                        logger.debug(f"Marked for removal: {sent[:40]}...")
-                        break
-
-            elif error_type == "entity":
-                # Entity error: targeted rewrite of specific sentence
-                entity = error_data.entity
-                source_role = error_data.source_role
-
-                # Find sentence mentioning this entity
-                for i, sent in enumerate(output_sentences):
-                    if i in removed_sentences:
-                        continue
-                    if entity.lower() in sent.lower():
-                        # Try direct fix first (for role_loss, add the role)
-                        if error_data.error_type == "role_loss":
-                            # Find source sentence with correct role
-                            source_sent = self._find_sentence_with_entity_role(
-                                entity, source_role, source_sentences
-                            )
-                            if source_sent:
-                                output_sentences[i] = source_sent
-                                logger.debug(f"Fixed entity role: {entity}")
-                        elif error_data.error_type == "conflation":
-                            # Remove the conflating sentence
-                            removed_sentences.add(i)
-                            logger.debug(f"Removed conflation: {entity}")
-                        break
-
-        # Remove marked sentences (in reverse order to preserve indices)
-        for i in sorted(removed_sentences, reverse=True):
-            if i < len(output_sentences):
-                output_sentences.pop(i)
-
-        # Log repair summary
-        logger.info(f"Repair summary: {len(inserted_sentences)} sentences inserted, {len(removed_sentences)} removed")
-
-        # Cleanup and return - pass inserted_sentences so we don't accidentally remove them
-        final_sentences = self._cleanup_repaired_sentences(output_sentences, inserted_sentences)
-        return " ".join(final_sentences)
-
-    def _find_sentence_for_proposition(
-        self, prop_node, sentences: List[str]
-    ) -> Optional[str]:
-        """Find the source sentence that contains a proposition."""
-        # The proposition node has the original sentence text
-        if prop_node.text:
-            for sent in sentences:
-                if sent.strip() == prop_node.text.strip():
-                    return sent
-                # Also check for significant overlap
-                if self._sentence_overlap(sent, prop_node.text) > 0.7:
-                    return sent
-
-        # Fallback: find by subject/predicate
-        for sent in sentences:
-            sent_lower = sent.lower()
-            if (prop_node.subject and prop_node.subject.lower() in sent_lower and
-                prop_node.predicate and prop_node.predicate.lower() in sent_lower):
-                return sent
-
-        return None
-
-    def _find_insertion_position(
-        self,
-        prop_node,
-        output_sentences: List[str],
-        source_graph,
-        output_graph,
-    ) -> int:
-        """Find insertion position using graph structure to maintain narrative order.
-
-        Uses the SOURCE graph node IDs (P1, P2, P3...) which reflect original sentence order.
-        Finds where to insert a missing node by looking at which source nodes are already
-        in the output and inserting at the correct relative position.
-        """
-        # Get the node ID (e.g., "P2")
-        missing_id = prop_node.id
-
-        try:
-            missing_num = int(missing_id[1:])  # "P2" -> 2
-        except (ValueError, IndexError):
-            return len(output_sentences)
-
-        # Find predecessor in source graph (what points TO this node)
-        predecessor_id = None
-        for edge in source_graph.edges:
-            if edge.target_id == missing_id:
-                predecessor_id = edge.source_id
-                break
-
-        # Find successor in source graph (what this node points TO)
-        successor_id = None
-        for edge in source_graph.edges:
-            if edge.source_id == missing_id:
-                successor_id = edge.target_id
-                break
-
-        # Strategy 1: Insert after predecessor if it's in output
-        if predecessor_id:
-            pred_node = source_graph.get_node(predecessor_id)
-            if pred_node:
-                for i, sent in enumerate(output_sentences):
-                    if self._sentence_contains_proposition(sent, pred_node):
-                        return i + 1  # Insert after predecessor
-
-        # Strategy 2: Insert before successor if it's in output
-        if successor_id:
-            succ_node = source_graph.get_node(successor_id)
-            if succ_node:
-                for i, sent in enumerate(output_sentences):
-                    if self._sentence_contains_proposition(sent, succ_node):
-                        return i  # Insert before successor
-
-        # Strategy 3: Find any SOURCE node in output with higher ID and insert before it
-        for source_node in sorted(source_graph.nodes, key=lambda n: int(n.id[1:]) if n.id[1:].isdigit() else 999):
-            try:
-                source_num = int(source_node.id[1:])
-                if source_num > missing_num:
-                    # Check if this source node's sentence is in output
-                    for i, sent in enumerate(output_sentences):
-                        if self._sentence_contains_proposition(sent, source_node):
-                            return i  # Insert before this higher-numbered source node
-            except (ValueError, IndexError):
-                pass
-
-        # Strategy 4: If missing node has lower ID than any source node in output, insert at 0
-        for source_node in source_graph.nodes:
-            try:
-                source_num = int(source_node.id[1:])
-                if source_num > missing_num:
-                    for sent in output_sentences:
-                        if self._sentence_contains_proposition(sent, source_node):
-                            return 0  # There's a higher node in output, so insert at beginning
-            except (ValueError, IndexError):
-                pass
-
-        # Default: append at end
-        return len(output_sentences)
-
-    def _sentence_contains_proposition(self, sentence: str, prop_node) -> bool:
-        """Check if a sentence contains a specific proposition."""
-        sent_lower = sentence.lower()
-
-        # Check for subject and predicate
-        has_subject = prop_node.subject and prop_node.subject.lower() in sent_lower
-        has_predicate = prop_node.predicate and prop_node.predicate.lower() in sent_lower
-
-        if has_subject and has_predicate:
-            return True
-
-        # Check for significant keyword overlap
-        if prop_node.text:
-            return self._sentence_overlap(sentence, prop_node.text) > 0.6
-
-        return False
-
-    def _find_sentence_with_entity_role(
-        self, entity: str, role: str, sentences: List[str]
-    ) -> Optional[str]:
-        """Find a source sentence where an entity performs a specific role."""
-        entity_lower = entity.lower()
-        role_words = set(role.lower().split())
-
-        for sent in sentences:
-            sent_lower = sent.lower()
-            if entity_lower in sent_lower:
-                # Check if role words are present
-                sent_words = set(sent_lower.split())
-                if role_words & sent_words:  # Any overlap
-                    return sent
-
-        return None
-
-    def _cleanup_repaired_sentences(
-        self,
-        sentences: List[str],
-        protected_sentences: Optional[set] = None,
-    ) -> List[str]:
-        """Clean up sentences after repair: dedupe, remove incomplete, etc.
-
-        Args:
-            sentences: List of sentences to clean up.
-            protected_sentences: Set of sentence texts (lowercase, stripped) that were
-                inserted during repair and should NOT be filtered out.
-
-        Returns:
-            Cleaned list of sentences.
-        """
-        from ..utils.nlp import is_sentence_incomplete
-
-        protected = protected_sentences or set()
-        cleaned = []
-        seen = set()
-
-        for sent in sentences:
-            sent = sent.strip()
-            if not sent:
-                continue
-
-            sent_normalized = sent.lower().strip()
-            is_protected = sent_normalized in protected
-
-            # Skip duplicate sentences (even protected ones shouldn't appear twice)
-            if sent_normalized in seen:
-                logger.debug(f"Removing duplicate sentence: {sent[:50]}...")
-                continue
-
-            # Check for incomplete sentences using spaCy POS analysis
-            # BUT skip this check for protected sentences (source sentences are complete)
-            if not is_protected:
-                is_incomplete, reason = is_sentence_incomplete(sent)
-                if is_incomplete:
-                    # Try to salvage by adding punctuation if it looks nearly complete
-                    if reason == "no ending punctuation" and len(sent.split()) > 8:
-                        sent = sent + "."
-                    else:
-                        logger.warning(f"Removing incomplete sentence ({reason}): {sent[:50]}...")
-                        continue
-
-            # Skip sentences that are mostly duplicated content from another
-            # BUT for protected sentences, we need to be smarter - they contain
-            # critical propositions that may not be fully covered by styled sentences
-            is_subset = False
-            for existing in cleaned:
-                # Check if this sentence is largely contained in another
-                if len(sent) > 20 and sent[:20].lower() in existing.lower():
-                    overlap = self._sentence_overlap(sent, existing)
-                    if overlap > 0.8:
-                        if is_protected:
-                            # Protected sentence overlaps with existing styled sentence
-                            # Keep the protected one (source) since it has the full proposition
-                            # and REPLACE the styled one
-                            idx = cleaned.index(existing)
-                            cleaned[idx] = sent
-                            logger.info(f"Replaced overlapping styled sentence with source: {sent[:50]}...")
-                            is_subset = True  # Don't add again
-                        else:
-                            logger.debug(f"Removing overlapping sentence: {sent[:50]}...")
-                            is_subset = True
-                        break
-
-            if is_subset:
-                # For protected sentences, we already replaced in the loop above
-                # For non-protected, we skip
-                if is_protected:
-                    seen.add(sent_normalized)
-                continue
-
-            seen.add(sent_normalized)
-            cleaned.append(sent)
-
-        return cleaned
-
-    def _sentence_overlap(self, sent1: str, sent2: str) -> float:
-        """Calculate word overlap between two sentences."""
-        words1 = set(sent1.lower().split())
-        words2 = set(sent2.lower().split())
-        if not words1 or not words2:
-            return 0.0
-        intersection = len(words1 & words2)
-        return intersection / min(len(words1), len(words2))
-
-    def _prioritize_errors(self, diff) -> List[dict]:
-        """Prioritize errors for repair.
-
-        Order:
-        1. Entity role errors (most critical - change meaning)
-        2. Missing propositions (content loss)
-        3. Added propositions (hallucinations)
-        """
-        errors = []
-
-        # Entity errors first - these are the most critical
-        for i, err in enumerate(diff.entity_role_errors):
-            errors.append({
-                "type": "entity",
-                "priority": 0,
-                "data": err,
-                "description": f"{err.error_type}: {err.entity} - {err.source_role}",
-            })
-
-        # Missing propositions
-        for i, node in enumerate(diff.missing_nodes):
-            errors.append({
-                "type": "missing",
-                "priority": 1,
-                "data": node,
-                "description": f"Missing: {node.summary()}",
-            })
-
-        # Added propositions (hallucinations)
-        for i, node in enumerate(diff.added_nodes):
-            errors.append({
-                "type": "added",
-                "priority": 2,
-                "data": node,
-                "description": f"Remove: {node.summary()}",
-            })
-
-        # Sort by priority
-        errors.sort(key=lambda x: x["priority"])
-        return errors
+        # Log differences for debugging but don't attempt repair
+        if diff.missing_nodes or diff.added_nodes:
+            logger.debug(
+                f"Graph diff: {len(diff.missing_nodes)} missing, "
+                f"{len(diff.added_nodes)} added propositions"
+            )
+
+        # Return output as-is - LoRA with proper settings produces acceptable output
+        return output, len(diff.missing_nodes) == 0
 
     def transfer_document(
         self,

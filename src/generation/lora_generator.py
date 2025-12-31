@@ -307,6 +307,11 @@ class LoRAStyleGenerator:
                 add_generation_prompt=True,
             )
 
+            # For Qwen3 models, disable thinking mode by adding empty think block
+            # This forces the model to skip chain-of-thought reasoning
+            if "qwen" in model_lower:
+                prompt = prompt + "<think>\n</think>\n\n"
+
         # Create sampler with temperature and top_p
         sampler = make_sampler(
             temp=self.config.temperature,
@@ -334,8 +339,90 @@ class LoRAStyleGenerator:
 
         response = response.strip()
 
-        # Stop at patterns indicating the model is done or hallucinating
-        # These patterns indicate meta-commentary, new turns, or garbage
+        # Clean up the response
+        response = self._clean_response(response, input_words)
+
+        return response
+
+    def _clean_response(self, response: str, input_words: int = 0) -> str:
+        """Clean model output of thinking tags, meta-commentary, and garbage.
+
+        Args:
+            response: Raw model output.
+            input_words: Word count of input (for length-based cleaning).
+
+        Returns:
+            Cleaned response text.
+        """
+        import re
+
+        # 1. Remove <think>...</think> blocks (Qwen3 thinking mode)
+        # Handle both single-line and multi-line think blocks
+        response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
+
+        # 2. Remove unclosed <think> tags and everything after
+        if '<think>' in response:
+            response = response.split('<think>')[0]
+
+        # 2b. Remove hallucinated parenthetical additions about people
+        # These often contain wrong information like "(later known as X)"
+        parenthetical_patterns = [
+            # With parentheses
+            r'\(later known as [^)]+\)',
+            r'\(better known as [^)]+\)',
+            r'\(also known as [^)]+\)',
+            r'\(the pen name [^)]+\)',
+            r'\(a\.k\.a\. [^)]+\)',
+            r'\(born [^)]+\)',
+            r'\(died [^)]+\)',
+            r'\(\d{4}[–-]\d{4}\)',  # Date ranges like (1818-1893)
+            # Without parentheses (comma-separated)
+            r',\s*later known as [^.,]+',
+            r',\s*better known as [^.,]+',
+            r',\s*also known as [^.,]+',
+            r',\s*a\.k\.a\. [^.,]+',
+        ]
+        for pattern in parenthetical_patterns:
+            response = re.sub(pattern, '', response, flags=re.IGNORECASE)
+
+        # 3. Remove reasoning prefixes and leaked instructions
+        thinking_prefixes = [
+            r'^Okay,?\s+(so\s+)?let me.*?\.\s*',
+            r'^Okay,?\s+(so\s+)?I need to.*?\.\s*',
+            r'^First,?\s+I (need to|should|\'ll|will).*?\.\s*',
+            r'^Let me (try to|start by|begin).*?\.\s*',
+            r'^I\'ll (start|begin|try).*?\.\s*',
+            r'^Now,?\s+(I need to|let me).*?\.\s*',
+            r'^Hmm,?\s+.*?\.\s*',
+            r'^The user (is asking|wants|provided).*?\.\s*',
+            # Leaked system prompt patterns
+            r'^Do not add.*?\.\s*',
+            r'^Preserve every.*?\.\s*',
+            r'^Keep all.*?\.\s*',
+            r'^FORBIDDEN:.*?\.\s*',
+            r'^Transform into.*?\.\s*',
+            r'^Rewrite in.*?\.\s*',
+        ]
+
+        for prefix in thinking_prefixes:
+            response = re.sub(prefix, '', response, flags=re.IGNORECASE | re.MULTILINE)
+
+        # 4. Remove mid-text thinking patterns
+        mid_thinking = [
+            r'\n+Okay,?\s+(so\s+)?.*?\.\s*\n*',
+            r'\n+First,?\s+I.*?\.\s*\n*',
+            r'\n+Let me.*?\.\s*\n*',
+            r'\n+I need to.*?\.\s*\n*',
+            r'\n+Now,?\s+I.*?\.\s*\n*',
+            r'\n+The (user|original|passage).*?\.\s*\n*',
+        ]
+
+        for pattern in mid_thinking:
+            response = re.sub(pattern, '\n', response, flags=re.IGNORECASE)
+
+        response = response.strip()
+
+        # 5. Stop at patterns indicating meta-commentary or new turns
         stop_patterns = [
             "\n\nKeep",        # Echoing instructions
             "\nKeeping every",  # Meta-commentary
@@ -347,13 +434,16 @@ class LoRAStyleGenerator:
             "\n\n---",         # Section break
             "\n---",           # Section break
             "\n\nWrite",       # New example
+            "\n\nI need to",   # Thinking leaked
+            "\n\nFirst,",      # Thinking leaked
+            "\n\nOkay,",       # Thinking leaked
         ]
 
         for pattern in stop_patterns:
             if pattern in response:
                 response = response.split(pattern)[0].strip()
 
-        # Also stop at double newline followed by non-ASCII (often garbage)
+        # 6. Stop at double newline followed by non-ASCII (often garbage)
         lines = response.split("\n\n")
         clean_lines = []
         for line in lines:
@@ -363,7 +453,7 @@ class LoRAStyleGenerator:
             clean_lines.append(line)
         response = "\n\n".join(clean_lines).strip()
 
-        # For short inputs, only take the first paragraph to avoid elaboration
+        # 7. For short inputs, only take the first paragraph to avoid elaboration
         if input_words < 50 and "\n\n" in response:
             response = response.split("\n\n")[0].strip()
 

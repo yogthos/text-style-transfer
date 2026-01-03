@@ -1,15 +1,13 @@
-"""Style transfer pipeline using LoRA with semantic graph validation.
+"""Style transfer pipeline using LoRA with RTT neutralization.
 
-This module provides a graph-based style transfer pipeline that uses LoRA-adapted
-models for consistent style transfer with semantic validation.
+This module provides a style transfer pipeline that uses LoRA-adapted models
+for consistent style transfer with entailment validation.
 
 Pipeline:
-1. Build semantic graph from source (propositions + relationships)
-2. Generate neutral prose from graph (deterministic, preserves all content)
-3. Pass neutral prose to LoRA writer for styling
-4. Validate styled output against source graph
-5. Repair any missing propositions
-6. Final LoRA restyle pass
+1. RTT neutralization (English → Mandarin HSK5 → Plain English) to strip style
+2. Pass neutralized text to LoRA for style application
+3. Validate styled output via NLI entailment
+4. Apply repetition reduction to fix LLM-speak
 """
 
 from dataclasses import dataclass, field
@@ -36,7 +34,7 @@ class TransferConfig:
 
     # Generation settings
     max_tokens: int = 512
-    temperature: float = 0.7
+    temperature: float = 0.4  # Higher helps complete sentences before repetition loops
     top_p: float = 0.9
 
     # Verification settings
@@ -57,8 +55,7 @@ class TransferConfig:
     # Document context settings
     use_document_context: bool = True  # Extract and use document-level context
 
-    # Neutralization settings
-    skip_neutralization: bool = True  # Skip neutralization step (preserves more facts)
+    # Input format (uses graph-based description matching training format)
 
     # Length control settings
     max_expansion_ratio: float = 1.5  # Max output/input word ratio (1.5 = 50% longer)
@@ -78,8 +75,6 @@ class TransferStats:
 
     paragraphs_processed: int = 0
     paragraphs_repaired: int = 0
-    quality_issues_found: int = 0
-    quality_issues_fixed: int = 0
     words_replaced: int = 0
     total_time_seconds: float = 0.0
     avg_time_per_paragraph: float = 0.0
@@ -100,16 +95,14 @@ class TransferStats:
 
 
 class StyleTransfer:
-    """Style transfer using LoRA with semantic graph validation.
+    """Style transfer using LoRA with RTT neutralization.
 
     This is the main entry point for style transfer. Pipeline:
 
-    1. Build semantic graph from source paragraph
-    2. Generate neutral prose from graph (preserves all propositions)
-    3. Pass to LoRA writer for styling
-    4. Validate styled output against source graph
-    5. Repair missing propositions if needed
-    6. Final LoRA restyle pass
+    1. RTT neutralize input (English → Mandarin → English)
+    2. Pass neutralized text to LoRA for style application
+    3. Validate via NLI entailment
+    4. Apply repetition reduction
 
     Example usage:
         transfer = StyleTransfer(
@@ -168,10 +161,16 @@ class StyleTransfer:
         if self.config.verify_entailment and self.verify_fn is None:
             self.verify_fn = self._create_default_verifier()
 
+        # Initialize RTT neutralizer (local MLX model)
+        self._rtt_neutralizer = None
+
         # Document context (extracted at transfer time)
         self.document_context: Optional[DocumentContext] = None
 
-        logger.info(f"Using critic provider for repairs: {self.critic_provider.provider_name}")
+        if self.config.verify_entailment:
+            logger.info(f"Using critic provider for repairs: {self.critic_provider.provider_name}")
+        else:
+            logger.info("Verification disabled - using raw LoRA output")
 
     def _extract_paragraph_thesis(self, paragraph: str) -> str:
         """Extract the main thesis/point of a paragraph.
@@ -210,6 +209,35 @@ class StyleTransfer:
             logger.warning(f"Thesis extraction failed: {e}")
             sentences = split_into_sentences(paragraph)
             return sentences[0] if sentences else ""
+
+    def _rtt_neutralize(self, text: str, max_retries: int = 2) -> Optional[str]:
+        """Round-Trip Translation neutralization via Mandarin pivot.
+
+        This matches the training data generation process:
+        Step 1 (Scrub): English → Mandarin (HSK3 vocabulary)
+        Step 2 (Rinse): Mandarin → Plain English
+
+        Uses the local MLX model (Qwen2.5-3B-Instruct) for fast inference
+        without external API calls. Configuration in config.json under
+        llm.providers.mlx_rtt.
+
+        Args:
+            text: Input text to neutralize.
+            max_retries: Number of retry attempts.
+
+        Returns:
+            Neutralized text, or None if failed.
+        """
+        # Lazy-load the RTT neutralizer
+        if self._rtt_neutralizer is None:
+            try:
+                from ..llm.mlx_provider import RTTNeutralizer
+                self._rtt_neutralizer = RTTNeutralizer()
+            except Exception as e:
+                logger.error(f"Failed to initialize RTT neutralizer: {e}")
+                return None
+
+        return self._rtt_neutralizer.neutralize(text, max_retries=max_retries)
 
     def _create_default_verifier(self) -> Callable[[str, str], float]:
         """Create default entailment verifier."""
@@ -328,44 +356,35 @@ class StyleTransfer:
         logger.debug(f"Paragraph thesis: {paragraph_thesis[:80]}...")
 
         # ========================================
-        # STEP 2: Prepare input for LoRA
+        # STEP 2: RTT Neutralization (match training format)
         # ========================================
-        if self.config.skip_neutralization:
-            # Skip neutralization - pass original text directly to LoRA
-            # This preserves more facts but may not match training format exactly
-            content_for_generation = paragraph
-            logger.debug("Skipping neutralization (skip_neutralization=True)")
-        else:
-            # Neutralize input to match LoRA training format
-            content_for_generation = self._neutralize_for_lora(
-                paragraph=paragraph,
-                source_graph=source_graph,
-                builder=builder,
-                comparator=comparator,
+        # Training used Round-Trip Translation via Mandarin to neutralize text
+        # We must use the same process during inference for the LoRA to work
+        content_for_generation = self._rtt_neutralize(paragraph)
+        if not content_for_generation:
+            raise RuntimeError(
+                f"RTT neutralization failed for paragraph: {paragraph[:50]}... "
+                "Ensure critic_provider is configured (DEEPSEEK_API_KEY)."
             )
-            logger.info(f"Neutralized paragraph: {len(content_for_generation.split())} words")
+        logger.info(f"RTT INPUT: {paragraph[:150]}...")
+        logger.info(f"RTT OUTPUT: {content_for_generation[:150]}...")
 
         # ========================================
         # STEP 3: Pass to LoRA for style transformation
         # ========================================
         target_words = int(word_count * self.config.target_expansion_ratio)
-        # Keep token limit close to target to prevent over-generation
-        # Use 1.3x to allow for style elaboration without too much room for hallucination
-        max_tokens = max(50, int(target_words * 1.3))
-
-        # Get context hint for generation (if document context available)
-        context_hint = None
-        if self.document_context:
-            context_hint = self.document_context.to_generation_hint()
+        # Token limit needs to be generous to avoid truncation mid-sentence
+        # Typically ~1.5 tokens per word, plus some margin for style variation
+        # Use 2.5x target words to ensure complete sentences
+        max_tokens = max(150, int(target_words * 2.5))
 
         output = self.generator.generate(
             content=content_for_generation,
             author=self.author,
-            context=previous,
             max_tokens=max_tokens,
-            context_hint=context_hint,
-            perspective=getattr(self.config, 'perspective', 'preserve'),
+            target_words=target_words,
         )
+        logger.info(f"LORA OUTPUT: {output[:150]}...")
 
         # Check if LoRA output matches input (indicates no transformation)
         if output.strip() == paragraph.strip():
@@ -378,19 +397,21 @@ class StyleTransfer:
             logger.warning(f"LoRA over-expanded: {lora_words} words vs {source_words} source ({lora_words/source_words:.0%})")
 
         # ========================================
-        # STEP 4: Validate styled output against source graph
+        # STEP 4: Validate styled output against source graph (if enabled)
         # ========================================
-        output, is_valid = self._validate_styled_output(
-            source=paragraph,
-            output=output,
-            source_graph=source_graph,
-            builder=builder,
-            comparator=comparator,
-            previous=previous,
-            context_hint=context_hint,
-            stats=stats,
-            max_attempts=self.config.max_repair_attempts,
-        )
+        if self.config.verify_entailment:
+            output, is_valid = self._validate_styled_output(
+                source=paragraph,
+                output=output,
+                source_graph=source_graph,
+                builder=builder,
+                comparator=comparator,
+                previous=previous,
+                stats=stats,
+                max_attempts=self.config.max_repair_attempts,
+            )
+        else:
+            is_valid = True  # Skip validation
 
         # Track expansion and optionally truncate
         final_words = len(output.split())
@@ -428,6 +449,46 @@ class StyleTransfer:
             score = self.verify_fn(paragraph, output)
 
         return output, score
+
+    def _clean_repair_output(self, text: str) -> str:
+        """Clean repair output of meta-commentary and apologies.
+
+        LLMs often prefix repairs with "I apologize" or "Here is the corrected version".
+        This strips those out to get just the repaired text.
+        """
+        import re
+
+        text = text.strip()
+        if not text:
+            return text
+
+        # Remove common LLM prefixes
+        prefixes_to_remove = [
+            r'^I apologize[^.]*\.\s*',
+            r'^Here is the corrected[^.]*[:.]\s*',
+            r'^Here\'s the corrected[^.]*[:.]\s*',
+            r'^The corrected text[^.]*[:.]\s*',
+            r'^Corrected version[^.]*[:.]\s*',
+            r'^Let me (fix|correct)[^.]*\.\s*',
+            r'^I\'ve (fixed|corrected)[^.]*\.\s*',
+            r'^Sure,?\s*(here[^.]*)?[:.]\s*',
+            r'^Of course[^.]*[:.]\s*',
+        ]
+
+        for pattern in prefixes_to_remove:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE | re.MULTILINE)
+
+        # Also remove trailing meta-commentary
+        suffixes_to_remove = [
+            r'\s*I hope this[^.]*\.$',
+            r'\s*Let me know[^.]*\.$',
+            r'\s*Is there anything[^.]*\.$',
+        ]
+
+        for pattern in suffixes_to_remove:
+            text = re.sub(pattern, '', text, flags=re.IGNORECASE)
+
+        return text.strip()
 
     def _ensure_complete_ending(self, text: str) -> str:
         """Ensure text ends with a complete sentence.
@@ -467,118 +528,6 @@ class StyleTransfer:
         # Fallback: add period to entire text
         return text + '.'
 
-    def _neutralize_for_lora(
-        self,
-        paragraph: str,
-        source_graph=None,
-        builder=None,
-        comparator=None,
-        max_attempts: int = 2,
-    ) -> str:
-        """Neutralize input paragraph to match LoRA training format.
-
-        The LoRA was trained on (neutral_description → styled_output) pairs.
-        This method converts input prose to a neutral description, then
-        VALIDATES that all propositions are preserved before returning.
-
-        Args:
-            paragraph: Input paragraph to neutralize.
-            source_graph: Semantic graph of source for validation.
-            builder: SemanticGraphBuilder for building neutral graph.
-            comparator: SemanticGraphComparator for validation.
-            max_attempts: Maximum neutralization attempts.
-
-        Returns:
-            Neutral description suitable for LoRA input.
-        """
-        if not self.critic_provider:
-            logger.warning("No critic provider for neutralization - using original text")
-            return paragraph
-
-        # Neutralization prompt - matches training format but preserves content
-        # Training uses short summaries with generic names to teach style
-        # At inference we keep specific names but match the brief, direct tone
-        input_words = len(paragraph.split())
-        target_words = max(50, min(input_words, 200))  # Scale with input, cap at 200
-
-        system_prompt = """You summarize text in short, direct sentences. No fancy words. No interpretation. Just what happens."""
-
-        user_prompt = f"""Summarize what happens in about {target_words} words. Keep ALL names, places, dates, and examples exactly as written.
-
-RULES:
-1. Short sentences only. No em-dashes, semicolons, or colons.
-2. Start directly with the action, not "The passage describes..."
-3. Keep every fact, analogy, and example - just make it plain and direct.
-4. Use simple words: "says" not "articulates", "shows" not "demonstrates"
-
-PASSAGE:
-{paragraph}
-
-SUMMARY:"""
-
-        best_neutral = None
-        best_coverage = 0.0
-
-        for attempt in range(max_attempts):
-            try:
-                # Slightly vary temperature for diversity
-                temp = 0.2 + (attempt * 0.1)
-
-                neutral = self.critic_provider.call(
-                    system_prompt=system_prompt,
-                    user_prompt=user_prompt,
-                    temperature=temp,
-                    max_tokens=max(300, int(len(paragraph.split()) * 1.5)),
-                )
-
-                neutral = neutral.strip()
-
-                # Basic length validation
-                if not neutral or len(neutral) < len(paragraph) * 0.15:
-                    logger.warning(f"Neutralization attempt {attempt + 1} too short")
-                    continue
-
-                # Validate against source graph if available
-                if source_graph and builder and comparator:
-                    neutral_graph = builder.build_from_text(neutral)
-                    diff = comparator.compare(source_graph, neutral_graph)
-
-                    # Calculate coverage
-                    total_props = len(source_graph.nodes)
-                    missing_props = len(diff.missing_nodes)
-                    coverage = (total_props - missing_props) / total_props if total_props > 0 else 0
-
-                    logger.debug(
-                        f"Neutralization attempt {attempt + 1}: "
-                        f"{coverage:.0%} coverage ({missing_props} missing of {total_props})"
-                    )
-
-                    if coverage > best_coverage:
-                        best_coverage = coverage
-                        best_neutral = neutral
-
-                    # Accept if coverage is good enough
-                    if coverage >= 0.8:
-                        logger.info(f"Neutralization accepted: {coverage:.0%} proposition coverage")
-                        return neutral
-
-                else:
-                    # No validation available - accept first reasonable result
-                    logger.debug(f"Neutralization complete (no validation): {len(neutral.split())} words")
-                    return neutral
-
-            except Exception as e:
-                logger.warning(f"Neutralization attempt {attempt + 1} failed: {e}")
-                continue
-
-        # Return best attempt or fall back to original
-        if best_neutral and best_coverage >= 0.5:
-            logger.warning(f"Using best neutralization with {best_coverage:.0%} coverage")
-            return best_neutral
-
-        logger.warning("Neutralization failed to preserve content - using original")
-        return paragraph
-
     def _validate_styled_output(
         self,
         source: str,
@@ -587,15 +536,14 @@ SUMMARY:"""
         builder,
         comparator,
         previous: Optional[str] = None,
-        context_hint: Optional[str] = None,
         stats: Optional['TransferStats'] = None,
         max_attempts: int = 3,
     ) -> Tuple[str, bool]:
-        """Validate styled output against source graph.
+        """Validate styled output against source graph and repair if needed.
 
-        Compares the output's semantic graph to the source for quality metrics.
-        No repair is attempted - the LoRA output with proper settings (low temp,
-        tight token limit) is already good enough.
+        Compares the output's semantic graph to the source. If there are
+        missing or added propositions, uses the LoRA's repair capability
+        (trained with "Fix the errors" examples) to correct the output.
 
         Args:
             source: Original source text.
@@ -603,30 +551,83 @@ SUMMARY:"""
             source_graph: Semantic graph of source (ground truth).
             builder: SemanticGraphBuilder instance.
             comparator: SemanticGraphComparator instance.
-            previous: Previous paragraph for context (unused, kept for API compat).
-            context_hint: Document context hint (unused, kept for API compat).
-            stats: Optional stats object (unused, kept for API compat).
-            max_attempts: Max repair attempts (unused, kept for API compat).
+            previous: Previous paragraph for context.
+            stats: Optional stats object to update.
+            max_attempts: Max repair attempts.
 
         Returns:
             Tuple of (output, is_valid).
         """
-        # Compare graphs for quality metrics
-        output_graph = builder.build_from_text(output)
-        diff = comparator.compare(source_graph, output_graph)
+        for attempt in range(max_attempts):
+            # Compare graphs
+            output_graph = builder.build_from_text(output)
+            diff = comparator.compare(source_graph, output_graph)
 
-        if diff.is_isomorphic:
-            logger.debug("Output graph matches source perfectly")
-            return output, True
+            if diff.is_isomorphic:
+                logger.debug("Output graph matches source perfectly")
+                return output, True
 
-        # Log differences for debugging but don't attempt repair
-        if diff.missing_nodes or diff.added_nodes:
-            logger.debug(
-                f"Graph diff: {len(diff.missing_nodes)} missing, "
-                f"{len(diff.added_nodes)} added propositions"
+            # Check if repair is needed
+            if not diff.missing_nodes and not diff.added_nodes:
+                return output, True
+
+            logger.info(
+                f"Repair attempt {attempt + 1}/{max_attempts}: "
+                f"{len(diff.missing_nodes)} missing, {len(diff.added_nodes)} added"
             )
 
-        # Return output as-is - LoRA with proper settings produces acceptable output
+            # Build repair instruction matching training format
+            repair_issues = []
+            if diff.missing_nodes:
+                missing_facts = [f"'{node.text}'" for node in diff.missing_nodes[:3]]
+                repair_issues.append(f"Missing facts: {', '.join(missing_facts)}")
+            if diff.added_nodes:
+                added_facts = [f"'{node.text}'" for node in diff.added_nodes[:3]]
+                repair_issues.append(f"Remove hallucinations: {', '.join(added_facts)}")
+
+            # Format repair prompt for critic/repair provider (not LoRA)
+            # The LoRA was trained for style transfer, not repair - use DeepSeek for repair
+            repair_system = format_prompt("repair_system")
+
+            errors_text = "\n".join(f"- {issue}" for issue in repair_issues)
+            repair_input = format_prompt(
+                "repair_input",
+                source=source,
+                output=output,
+                errors=errors_text,
+            )
+
+            try:
+                # Use critic provider (DeepSeek) for repair, not LoRA
+                # The LoRA is trained for style transfer from descriptions, not repair
+                if not self.critic_provider:
+                    logger.warning("No critic provider for repair, keeping original output")
+                    break
+
+                repaired = self.critic_provider.call(
+                    system_prompt=repair_system,
+                    user_prompt=repair_input,
+                    temperature=0.3,
+                    max_tokens=int(len(output.split()) * 1.5),
+                )
+
+                if repaired and len(repaired.split()) > 10:
+                    # Clean up repair output - remove meta-commentary
+                    repaired = self._clean_repair_output(repaired)
+                    if repaired and len(repaired.split()) > 10:
+                        output = repaired
+                        logger.debug(f"Repair produced: {len(repaired.split())} words")
+                else:
+                    logger.warning("Repair produced empty/short output, keeping original")
+                    break
+
+            except Exception as e:
+                logger.warning(f"Repair failed: {e}")
+                break
+
+        # Final validation
+        output_graph = builder.build_from_text(output)
+        diff = comparator.compare(source_graph, output_graph)
         return output, len(diff.missing_nodes) == 0
 
     def transfer_document(
@@ -681,15 +682,17 @@ SUMMARY:"""
 
             # Check if paragraph is a heading - pass through unchanged
             para_lines = para.strip().split('\n')
-            if self.config.pass_headings_unchanged and len(para_lines) == 1 and is_heading(para_lines[0]):
+            is_heading_para = self.config.pass_headings_unchanged and len(para_lines) == 1 and is_heading(para_lines[0])
+
+            if is_heading_para:
                 logger.debug(f"Passing heading unchanged: {para[:50]}...")
                 output = para
                 score = 1.0
             else:
                 output, score = self.transfer_paragraph(para, previous, self._transfer_stats)
 
-            # Apply repetition reduction (only to transformed content, not headings)
-            if self.repetition_reducer and score < 1.0:
+            # Apply repetition reduction only to transformed content, not headings
+            if self.repetition_reducer and not is_heading_para:
                 output, reduction_stats = self.repetition_reducer.reduce(output)
                 self._transfer_stats.words_replaced += reduction_stats.replacements_made
 

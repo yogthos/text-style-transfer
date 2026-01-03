@@ -1,0 +1,10 @@
+Original source (ground truth):
+{source}
+
+Current output with errors:
+{output}
+
+Errors to fix:
+{errors}
+
+Corrected text:

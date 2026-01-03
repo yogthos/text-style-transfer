@@ -1,2 +1,0 @@
-Rewrite in {author}'s style (~{target_words} words). Preserve all names and facts exactly.
-

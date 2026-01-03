@@ -1,0 +1,8 @@
+Rewrite the following neutral text into the style of {author}.
+Transform simple sentences into complex, atmospheric prose with the author's characteristic vocabulary and sentence rhythm.
+
+[NEUTRAL INPUT]: The dog barked at the moon. It was loud.
+[{author_tag} OUTPUT]: A guttural cacophony erupted from the canine's throat, a blasphemous baying directed toward the gibbous and indifferent orb hanging in the firmament.
+
+[NEUTRAL INPUT]: {content}
+[{author_tag} OUTPUT]:

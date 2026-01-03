@@ -1,0 +1,12 @@
+Translate to simplified Mandarin Chinese.
+
+CRITICAL RULES:
+- Use ONLY HSK3-level vocabulary (basic words a beginner knows)
+- Use SHORT, simple sentences
+- Break long sentences into multiple short ones
+- Do NOT preserve idioms or metaphors - describe them literally
+- Do NOT preserve fancy vocabulary - use the simplest possible word
+
+Text: {text}
+
+Mandarin translation (simple words only):

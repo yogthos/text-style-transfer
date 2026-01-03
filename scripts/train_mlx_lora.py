@@ -28,6 +28,7 @@ Usage:
 
 import argparse
 import json
+import yaml
 import sys
 from pathlib import Path
 
@@ -206,11 +207,11 @@ def train_lora(
     author: str,
     output_dir: str,
     base_model: str = None,
-    epochs: int = 1,  # 1 epoch sufficient with curated ~0.9M token corpus
-    batch_size: int = 1,  # Per paper: prevents averaging gradients across examples
-    learning_rate: float = 1e-4,  # 2x aggressive per paper
-    lora_rank: int = 32,
-    lora_alpha: int = 64,
+    epochs: int = 1,  # 1 epoch sufficient - overtraining causes hallucination
+    batch_size: int = 1,  # Per paper: learns individual style nuances better
+    learning_rate: float = 1e-5,  # Lower LR with high rank for stability
+    lora_rank: int = 64,  # High rank for syntactic patterns (research: 64-128)
+    lora_alpha: int = 128,  # Alpha = 2x rank for strong style signal
     validation_path: str = None,
     resume: bool = False,
 ):
@@ -255,8 +256,6 @@ def train_lora(
     # Read all training examples
     with open(dataset_path, 'r') as f:
         all_lines = f.readlines()
-
-    num_examples = len(all_lines)
 
     # Determine validation file
     valid_lines = []
@@ -333,13 +332,28 @@ def train_lora(
         "--batch-size", str(batch_size),
         "--iters", str(total_iters),
         "--learning-rate", str(learning_rate),
-        "--num-layers", str(lora_rank),  # num-layers controls LoRA application
+        "--num-layers", "-1",  # Apply LoRA to ALL transformer layers
         "--steps-per-report", "10",
         "--steps-per-eval", "50",
         "--save-every", "100",
         # Note: --mask-prompt only works with chat format, not text format
         # For base models, we use text format which trains on all tokens
     ]
+
+    # Create lora_config.yaml with rank and alpha settings
+    lora_config = {
+        "lora_parameters": {
+            "rank": lora_rank,
+            "alpha": lora_alpha,
+            "dropout": 0.0,
+            "scale": float(lora_alpha) / float(lora_rank),
+        }
+    }
+    config_path = output_path / "lora_config.yaml"
+    with open(config_path, 'w') as f:
+        yaml.dump(lora_config, f)
+
+    cmd.extend(["-c", str(config_path)])
 
     # Handle resume from checkpoint
     if resume:
@@ -532,20 +546,20 @@ def main():
     parser.add_argument(
         "--learning-rate",
         type=float,
-        default=1e-4,
-        help="Learning rate (default: 1e-4, 2x aggressive per paper)",
+        default=1e-5,
+        help="Learning rate (default: 1e-5, lower with high rank for stability)",
     )
     parser.add_argument(
         "--rank",
         type=int,
-        default=32,
-        help="LoRA rank (default: 32 for better style capture)",
+        default=64,
+        help="LoRA rank (default: 64 for syntactic patterns, research: 64-128)",
     )
     parser.add_argument(
         "--alpha",
         type=int,
-        default=64,
-        help="LoRA alpha (default: 64)",
+        default=128,
+        help="LoRA alpha (default: 128 = 2x rank for strong style signal)",
     )
     parser.add_argument(
         "--resume",

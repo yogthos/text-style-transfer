@@ -38,6 +38,8 @@ import sys
 import time
 from pathlib import Path
 
+from src.utils.logging import setup_logging
+
 # Add project root to path
 project_root = Path(__file__).parent
 sys.path.insert(0, str(project_root))
@@ -96,7 +98,7 @@ def transfer_file(
     adapter_path: str,
     author: str,
     config_path: str = "config.json",
-    temperature: float = 0.7,
+    temperature: float = 0.2,
     perspective: str = None,
     verify: bool = True,
     verbose: bool = False,
@@ -157,8 +159,6 @@ def transfer_file(
             truncate_over_expanded=gen.truncate_over_expanded,
             # LoRA influence
             lora_scale=gen.lora_scale,
-            # Neutralization
-            skip_neutralization=gen.skip_neutralization,
             # Post-processing
             reduce_repetition=gen.reduce_repetition,
             repetition_threshold=gen.repetition_threshold,
@@ -320,8 +320,8 @@ def main():
     parser.add_argument(
         "--temperature",
         type=float,
-        default=0.7,
-        help="Generation temperature (default: 0.7)",
+        default=0.4,
+        help="Generation temperature (default: 0.4, helps complete sentences)",
     )
     parser.add_argument(
         "--perspective",
@@ -365,6 +365,9 @@ def main():
     )
 
     args = parser.parse_args()
+
+    # Setup logging based on verbose flag
+    setup_logging(level="INFO" if args.verbose else "WARNING")
 
     # List adapters mode
     if args.list_adapters:

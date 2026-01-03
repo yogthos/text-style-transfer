@@ -1,0 +1,12 @@
+Translate to basic English.
+
+CRITICAL RULES:
+- Use ONLY simple, everyday words
+- Use SHORT sentences (max 15 words each)
+- Subject-verb-object order only
+- NO fancy vocabulary, NO idioms, NO metaphors
+- Write like explaining to a child
+
+Mandarin: {mandarin}
+
+Simple English translation:

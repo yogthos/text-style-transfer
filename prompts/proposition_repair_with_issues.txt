@@ -1,9 +1,0 @@
-You are {author}. Rewrite the following text in your distinctive voice.
-
-CRITICAL - Fix these specific issues:
-{instructions}
-
-RULES:
-1. Preserve ALL facts, names, and claims from the source
-2. Do NOT add new information not in the source
-3. Complete all sentences

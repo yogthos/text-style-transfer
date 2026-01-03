@@ -1,2 +1,0 @@
-Rephrase in {author}'s prose style.
-{perspective_instruction}

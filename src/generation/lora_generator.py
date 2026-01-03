@@ -34,11 +34,11 @@ class GenerationConfig:
     """Configuration for LoRA generation."""
 
     max_tokens: int = 512
-    temperature: float = 0.5  # Lower temperature reduces hallucination
+    temperature: float = 0.4  # Higher temp helps complete sentences before repetition loops
     top_p: float = 0.9
-    repetition_penalty: float = 1.1
+    repetition_penalty: float = 1.4  # Strong penalty to prevent repetition loops
     min_tokens: int = 50  # Prevent too-short outputs
-    lora_scale: float = 1.0  # LoRA influence: 0.0=base only, 1.0=full LoRA, >1.0=amplified
+    lora_scale: float = 2.0  # LoRA influence: match training scale (alpha/rank = 128/64 = 2.0)
 
 
 @dataclass
@@ -59,7 +59,7 @@ class AdapterMetadata:
             data = json.load(f)
         return cls(
             author=data.get("author", "Unknown"),
-            base_model=data.get("base_model", "mlx-community/Qwen2.5-7B-Instruct-4bit"),
+            base_model=data.get("base_model", "mlx-community/Qwen3-8B-Base-bf16"),
             lora_rank=data.get("lora_rank", 16),
             lora_alpha=data.get("lora_alpha", 32),
             epochs=data.get("epochs", 3),
@@ -81,9 +81,9 @@ class LoRAStyleGenerator:
             config=GenerationConfig(temperature=0.7),
         )
 
-        # Generate styled paragraph
-        output = generator.generate_paragraph(
-            propositions=["The universe is vast", "Stars are distant suns"],
+        # Generate styled text
+        output = generator.generate(
+            content="The universe is vast. Stars are distant suns.",
             author="Carl Sagan",
         )
     """
@@ -91,7 +91,7 @@ class LoRAStyleGenerator:
     def __init__(
         self,
         adapter_path: Optional[str] = None,
-        base_model: str = "mlx-community/Qwen2.5-7B-Instruct-4bit",
+        base_model: str = "mlx-community/Qwen3-8B-Base-bf16",
         config: Optional[GenerationConfig] = None,
     ):
         """Initialize the LoRA generator.
@@ -222,95 +222,44 @@ class LoRAStyleGenerator:
         self,
         content: str,
         author: str,
-        context: Optional[str] = None,
-        system_override: Optional[str] = None,
         max_tokens: Optional[int] = None,
-        context_hint: Optional[str] = None,
-        perspective: Optional[str] = None,
+        target_words: Optional[int] = None,
     ) -> str:
         """Generate styled text from content description.
 
         Args:
-            content: What to express (propositions, summary, or description).
-            author: Author name (used in system prompt).
-            context: Optional previous paragraph for continuity.
-            system_override: Optional custom system prompt.
+            content: What to express (neutral text to restyle).
+            author: Author name (used in prompt).
             max_tokens: Override for max tokens (defaults to config).
-            context_hint: Optional brief hint about document type (e.g., "formal analytical").
-                         Only used for instruct models, ignored for base models.
-            perspective: Output perspective (first_person_singular, third_person, etc.).
+            target_words: Target word count for output.
 
         Returns:
             Generated text in the author's style.
         """
         self._ensure_loaded()
 
-        # Build perspective instruction
-        perspective_instruction = ""
-        if perspective and perspective != "preserve":
-            from ..config import StyleConfig
-            perspective_instruction = StyleConfig.get_perspective_instruction(perspective, author)
-            if perspective_instruction:
-                perspective_instruction = f"\n{perspective_instruction}"
-
-        # Build messages
-        if system_override:
-            system = system_override
-        else:
-            # Content-preserving prompt with explicit constraints
-            system = format_prompt(
-                "style_transfer_system",
-                author=author,
-                perspective_instruction=perspective_instruction
-            )
-
         # Build user message - just the content
         user = content
 
-        # Estimate target word count from input (style transfer maintains similar length)
+        # Estimate target word count from input if not provided
         input_words = len(user.split())
-        # Allow some flexibility in output length
-        target_words = input_words
+        if target_words is None:
+            target_words = input_words
 
-        # Check if base model (no chat template)
-        # Most modern models are instruction-tuned even without "instruct" in name
-        model_lower = self.base_model_name.lower()
-        is_instruct_model = (
-            "instruct" in model_lower or
-            "chat" in model_lower or
-            "qwen" in model_lower or  # Qwen models are instruction-tuned
-            "llama-3" in model_lower or  # Llama 3 is instruction-tuned
-            "mistral" in model_lower  # Mistral is instruction-tuned
+        # Calculate tokens based on input length
+        # Training data has ~1:1 ratio, but we need enough for complete sentences
+        # Convert words to tokens (roughly 1.3 tokens per word)
+        # Use 2x input to allow for style variation
+        auto_max_tokens = max(100, int(input_words * 2.0 * 1.3))
+
+        # Build prompt matching training data format EXACTLY
+        author_tag = author.upper().replace(' ', '_').replace('.', '')
+        prompt = format_prompt(
+            "style_transfer",
+            author=author,
+            content=user,
+            author_tag=author_tag,
         )
-        is_base_model = not is_instruct_model
-
-        if is_base_model:
-            # For base models, match the training format (instruction back-translation)
-            # Optionally include context hint (e.g., "formal analytical ")
-            hint = f"{context_hint} " if context_hint else ""
-            instruction = format_prompt(
-                "style_transfer_base_model_with_context",
-                target_words=target_words,
-                context_hint=hint,
-                author=author
-            )
-            prompt = f"{instruction}\n\n{user}\n\n"
-        else:
-            # For instruct models, use chat template
-            messages = [
-                {"role": "system", "content": system},
-                {"role": "user", "content": user},
-            ]
-            prompt = self._tokenizer.apply_chat_template(
-                messages,
-                tokenize=False,
-                add_generation_prompt=True,
-            )
-
-            # For Qwen3 models, disable thinking mode by adding empty think block
-            # This forces the model to skip chain-of-thought reasoning
-            if "qwen" in model_lower:
-                prompt = prompt + "<think>\n</think>\n\n"
 
         # Create sampler with temperature and top_p
         sampler = make_sampler(
@@ -324,8 +273,12 @@ class LoRAStyleGenerator:
             context_size=50,
         )
 
-        # Use provided max_tokens or config default
-        tokens_limit = max_tokens or self.config.max_tokens
+        # Use provided max_tokens, or auto-calculated limit, or config default
+        # Prefer tighter auto-calculated limit to prevent repetition
+        if max_tokens:
+            tokens_limit = max_tokens
+        else:
+            tokens_limit = min(auto_max_tokens, self.config.max_tokens)
 
         # Generate
         response = generate(
@@ -356,6 +309,66 @@ class LoRAStyleGenerator:
         """
         import re
 
+        # 0. VERY FIRST: Truncate at training format markers
+        # The model may continue generating training examples
+        training_markers = [
+            "[NEUTRAL INPUT]:",
+            "[NEUTRAL INPUT]",
+            "\n\n[HP_LOVECRAFT OUTPUT]:",  # If it loops back
+            "\n\nRewrite the following",  # New training example
+            "\n\n---",  # Section breaks
+            "HP_LOVECRAFT_NOTE:",  # Hallucinated meta-comment
+            "_NOTE:",  # Any author note
+            "\nNote:",  # Note section
+            "\n\nNOTE:",  # Note section
+        ]
+        for marker in training_markers:
+            if marker in response:
+                response = response.split(marker)[0].strip()
+
+        # 0a. FIRST: Detect repetition and garbage
+        # Split by double newline (paragraph boundaries) first
+        paragraphs = response.split('\n\n')
+        if len(paragraphs) > 1:
+            # Check for paragraph-level repetition (first 50 chars match)
+            first_para_key = paragraphs[0].strip().lower()[:50]
+            clean_paras = [paragraphs[0]]
+            for para in paragraphs[1:]:
+                para_key = para.strip().lower()[:50]
+                # Stop if this paragraph starts like one we've seen
+                if para_key == first_para_key or para_key[:30] in first_para_key:
+                    break
+                # Stop if paragraph starts with garbage
+                if para and ord(para[0]) > 127:
+                    break
+                clean_paras.append(para)
+            response = '\n\n'.join(clean_paras)
+
+        # Also check sentence-level repetition
+        sentences = re.split(r'(?<=[.!?])\s+', response)
+        if len(sentences) > 3:
+            seen = {}
+            clean_sentences = []
+            for sent in sentences:
+                sent_key = sent.strip().lower()[:50]  # Use first 50 chars
+                if sent_key in seen and len(sent_key) > 20:
+                    break
+                seen[sent_key] = True
+                clean_sentences.append(sent)
+            response = ' '.join(clean_sentences)
+
+        # 0b. Stop at inline garbage markers (random years, garbage sequences)
+        # These often appear right before the model degenerates
+        garbage_markers = [
+            r'\(\d{4}\)\s*[\u0400-\u04FF\u0E00-\u0E7F]',  # (2015) followed by garbage
+            r'\n\s*!\s*\n',  # Isolated exclamation marks on newlines
+            r'\n\s*I\s*\n',  # Isolated "I" on newlines
+        ]
+        for marker in garbage_markers:
+            match = re.search(marker, response)
+            if match:
+                response = response[:match.start()].strip()
+
         # 1. Remove <think>...</think> blocks (Qwen3 thinking mode)
         # Handle both single-line and multi-line think blocks
         response = re.sub(r'<think>.*?</think>', '', response, flags=re.DOTALL)
@@ -364,10 +377,10 @@ class LoRAStyleGenerator:
         if '<think>' in response:
             response = response.split('<think>')[0]
 
-        # 2b. Remove hallucinated parenthetical additions about people
-        # These often contain wrong information like "(later known as X)"
+        # 2b. Remove hallucinated parenthetical additions
+        # These often contain wrong information like "(later known as X)" or "(see Figure 1)"
         parenthetical_patterns = [
-            # With parentheses
+            # Biographical additions
             r'\(later known as [^)]+\)',
             r'\(better known as [^)]+\)',
             r'\(also known as [^)]+\)',
@@ -376,6 +389,14 @@ class LoRAStyleGenerator:
             r'\(born [^)]+\)',
             r'\(died [^)]+\)',
             r'\(\d{4}[–-]\d{4}\)',  # Date ranges like (1818-1893)
+            # Hallucinated references
+            r'\(see [Ff]igure \d+\)',
+            r'\(see [Cc]hapter \d+\)',
+            r'\(see [Tt]able \d+\)',
+            r'\(see [Aa]ppendix [A-Z]?\)',
+            r'\(see above\)',
+            r'\(see below\)',
+            r'\(i\.[Ee]\.,? [^)]+\)',  # Remove "(i.e., ...)" explanations
             # Without parentheses (comma-separated)
             r',\s*later known as [^.,]+',
             r',\s*better known as [^.,]+',
@@ -384,6 +405,35 @@ class LoRAStyleGenerator:
         ]
         for pattern in parenthetical_patterns:
             response = re.sub(pattern, '', response, flags=re.IGNORECASE)
+
+        # 2c. Remove trailing non-ASCII garbage (Thai, Arabic, Korean, Chinese, Cyrillic, CJK punctuation, Hebrew)
+        # These appear when the model generates garbage tokens
+        # Include CJK punctuation: ：。，！？《》""''【】 etc.
+        # Include Hebrew: \u0590-\u05FF
+        garbage_ranges = r'[\u0400-\u04FF\u0590-\u05FF\u0600-\u06FF\u0E00-\u0E7F\uAC00-\uD7AF\u3040-\u30FF\u4E00-\u9FFF\u0080-\u009F\u3000-\u303F\uFF00-\uFFEF]'
+        response = re.sub(garbage_ranges + r'+[.!?]?\s*$', '', response)
+
+        # 2d. Remove mid-text non-ASCII garbage and mixed garbage
+        # Also stop at Chinese colon (：) or em-dash (——) which often precedes garbage
+        for stop_char in ['：', '——']:
+            if stop_char in response:
+                response = response.split(stop_char)[0].strip()
+        response = re.sub(garbage_ranges + r'+[.!?]*', '', response)
+        response = re.sub(r'\b[A-Z]?[a-z]*[Pp]id\b', '', response)  # Remove "mPid", "MPid" style garbage
+        response = re.sub(r'SOEVER[,.]?\s*', '', response)  # Remove "SOEVER" garbage
+        response = re.sub(r'togroup\s*', '', response)  # Remove "togroup" repetition
+        response = re.sub(r'!+\s*', ' ', response)  # Remove repeated exclamation marks
+        response = re.sub(r'\bприятн\b', '', response)  # Remove Cyrillic garbage
+
+        # 2e. Fix double commas/spaces and orphaned punctuation from removed content
+        response = re.sub(r',\s*,', ',', response)
+        response = re.sub(r'\s+,', ',', response)  # Fix " ,"
+        response = re.sub(r'in\s*,', 'in', response)  # Fix "in ,"
+        response = re.sub(r'\(\s*,', '(', response)  # Fix "( ,"
+        response = re.sub(r'\s{2,}', ' ', response)
+        # Remove trailing empty quotes, stray punctuation
+        response = re.sub(r'[""\'\']\.?\s*$', '', response)  # Trailing quotes
+        response = re.sub(r'\.{2,}$', '.', response)  # Multiple periods at end
 
         # 3. Remove reasoning prefixes and leaked instructions
         thinking_prefixes = [
@@ -453,101 +503,96 @@ class LoRAStyleGenerator:
             clean_lines.append(line)
         response = "\n\n".join(clean_lines).strip()
 
-        # 7. For short inputs, only take the first paragraph to avoid elaboration
+        # 7. For short inputs, only take first paragraph to avoid runaway generation
+        # But don't limit sentences - style transfer may add atmospheric elaboration
         if input_words < 50 and "\n\n" in response:
             response = response.split("\n\n")[0].strip()
 
+        # 8. Detect and remove duplicate phrases/sentences
+        response = self._remove_duplicates(response)
+
+        # 9. Ensure text ends with a complete sentence
+        response = self._ensure_complete_sentences(response)
+
         return response
 
-    def generate_paragraph(
-        self,
-        propositions: List[str],
-        author: str,
-        previous_paragraph: Optional[str] = None,
-    ) -> str:
-        """Generate a full paragraph from propositions.
+    def _remove_duplicates(self, text: str) -> str:
+        """Remove duplicate sentences and phrases from text.
 
-        This is the main entry point for style transfer. Takes a list
-        of semantic propositions (what to say) and renders them in
-        the author's style.
-
-        Args:
-            propositions: List of content propositions to express.
-            author: Author name.
-            previous_paragraph: Previous output paragraph for continuity.
-
-        Returns:
-            Styled paragraph expressing all propositions.
+        Detects when the model repeats itself and removes the duplicate.
         """
-        # Join propositions as the content to translate
-        content = " ".join(propositions)
+        import re
 
-        # Strict max tokens based on input length (1.3x to allow for style variation)
-        input_words = len(content.split())
-        estimated_tokens = int(input_words * 1.5)  # ~1.1 tokens per word + small margin
-        max_tokens = max(50, min(estimated_tokens, self.config.max_tokens))
+        # Split into sentences
+        sentences = re.split(r'(?<=[.!?])\s+', text)
+        if len(sentences) < 2:
+            return text
 
-        return self.generate(
-            content=content,
-            author=author,
-            context=previous_paragraph,
-            max_tokens=max_tokens,
-        )
+        # Check for exact duplicate sentences
+        seen = set()
+        unique_sentences = []
+        for sent in sentences:
+            normalized = sent.strip().lower()
+            if normalized not in seen:
+                seen.add(normalized)
+                unique_sentences.append(sent)
 
-    def generate_with_repair(
-        self,
-        propositions: List[str],
-        author: str,
-        verify_fn=None,
-        threshold: float = 0.7,
-        previous_paragraph: Optional[str] = None,
-    ) -> str:
-        """Generate with optional verification and repair.
+        # Check for mid-sentence repetition (phrase appears twice)
+        result = ' '.join(unique_sentences)
 
-        If verification fails, attempts a single repair pass with
-        explicit instruction to include missing content.
+        # Find repeated phrases of 10+ words
+        words = result.split()
+        if len(words) > 20:
+            # Look for repeated sequences
+            for phrase_len in range(15, 8, -1):  # Check phrases 15 down to 9 words
+                for i in range(len(words) - phrase_len * 2):
+                    phrase = ' '.join(words[i:i + phrase_len])
+                    rest = ' '.join(words[i + phrase_len:])
+                    if phrase.lower() in rest.lower():
+                        # Found duplicate - remove second occurrence
+                        pattern = re.escape(phrase)
+                        # Remove second occurrence only
+                        parts = re.split(pattern, result, flags=re.IGNORECASE)
+                        if len(parts) > 2:
+                            result = parts[0] + phrase + ''.join(parts[2:])
+                        break
 
-        Args:
-            propositions: Content propositions.
-            author: Author name.
-            verify_fn: Optional function (original, output) -> score.
-            threshold: Minimum verification score.
-            previous_paragraph: Previous paragraph for context.
+        return result.strip()
 
-        Returns:
-            Generated (and possibly repaired) text.
+    def _ensure_complete_sentences(self, text: str) -> str:
+        """Ensure text ends with a complete sentence.
+
+        If text ends mid-sentence, truncate to the last complete sentence.
         """
-        # First generation attempt
-        output = self.generate_paragraph(
-            propositions=propositions,
-            author=author,
-            previous_paragraph=previous_paragraph,
-        )
+        import re
 
-        # Skip verification if no function provided
-        if verify_fn is None:
-            return output
+        text = text.strip()
+        if not text:
+            return text
 
-        # Verify output
-        original = " ".join(propositions)
-        score = verify_fn(original, output)
+        # If already ends with sentence punctuation, we're good
+        if text[-1] in '.!?':
+            return text
 
-        if score >= threshold:
-            logger.debug(f"Verification passed: {score:.2f}")
-            return output
+        # Find the last complete sentence by looking for period, !, or ?
+        # followed by either end of string or a capital letter
+        sentences = re.split(r'(?<=[.!?])\s+', text)
 
-        # Repair attempt
-        logger.warning(f"Verification failed ({score:.2f}), attempting repair...")
+        # Filter to only complete sentences (end with punctuation)
+        complete = []
+        for sent in sentences:
+            sent = sent.strip()
+            if sent and sent[-1] in '.!?':
+                complete.append(sent)
 
-        # Add explicit requirement to system prompt
-        repair_system = format_prompt("repair_with_content", author=author)
+        if complete:
+            return ' '.join(complete)
 
-        return self.generate(
-            content="\n".join(f"- {p}" for p in propositions),
-            author=author,
-            context=previous_paragraph,
-            system_override=repair_system,
-        )
+        # No complete sentences - try to add period if it looks like a complete thought
+        if len(text.split()) > 10 and text[-1] not in ',:;':
+            return text + '.'
+
+        return text
 
     def switch_adapter(self, adapter_path: str) -> None:
         """Hot-swap to a different author's adapter.

@@ -344,3 +344,153 @@ Neutral:"""
     def unload(self):
         """Unload model to free memory."""
         self._generator.unload()
+
+
+class RTTNeutralizer:
+    """Round-Trip Translation neutralizer using local MLX model.
+
+    Uses Qwen2.5-3B-Instruct for English → Mandarin → English translation
+    to strip style while preserving facts. The HSK constraint forces simple
+    vocabulary, and the grammar distance flattens syntax.
+
+    Configuration loaded from config.json under llm.providers.mlx_rtt.
+
+    Example:
+        neutralizer = RTTNeutralizer()
+        neutral = neutralizer.neutralize(
+            "The eldritch horror lurked in cyclopean shadows."
+        )
+        # -> "The strange monster hid in the big shadows."
+    """
+
+    def __init__(self, model_name: Optional[str] = None):
+        """Initialize the RTT neutralizer.
+
+        Args:
+            model_name: Override model (defaults to config mlx_rtt.model).
+        """
+        if not MLX_AVAILABLE:
+            raise RuntimeError(
+                "MLX is not available. Install with: pip install mlx mlx-lm\n"
+                "Note: MLX only works on Apple Silicon Macs."
+            )
+
+        # Load RTT-specific config
+        config_path = Path(__file__).parent.parent.parent / "config.json"
+        rtt_config = {}
+        if config_path.exists():
+            try:
+                with open(config_path) as f:
+                    config = json.load(f)
+                rtt_config = config.get("llm", {}).get("providers", {}).get("mlx_rtt", {})
+            except Exception as e:
+                logger.warning(f"Failed to load config.json: {e}")
+
+        self.model_name = model_name or rtt_config.get("model", "mlx-community/Qwen2.5-3B-Instruct-4bit")
+        self.max_tokens = rtt_config.get("max_tokens", 512)
+        self.temperature = rtt_config.get("temperature", 0.1)
+        self.top_p = rtt_config.get("top_p", 0.9)
+
+        logger.info(f"RTT neutralizer using: {self.model_name}")
+
+        self._model = None
+        self._tokenizer = None
+
+    def _ensure_loaded(self):
+        """Ensure model is loaded."""
+        if self._model is not None:
+            return
+
+        logger.info(f"Loading RTT model: {self.model_name}")
+        self._model, self._tokenizer = load(self.model_name)
+        logger.info("RTT model loaded")
+
+    def _generate(self, system: str, user: str, max_tokens: int) -> str:
+        """Generate using Qwen2.5 chat format."""
+        self._ensure_loaded()
+
+        # Build Qwen2.5 chat format
+        messages = [
+            {"role": "system", "content": system},
+            {"role": "user", "content": user},
+        ]
+
+        prompt = self._tokenizer.apply_chat_template(
+            messages,
+            tokenize=False,
+            add_generation_prompt=True,
+        )
+
+        sampler = make_sampler(temp=self.temperature, top_p=self.top_p)
+
+        response = generate(
+            self._model,
+            self._tokenizer,
+            prompt=prompt,
+            max_tokens=max_tokens,
+        )
+
+        return response.strip()
+
+    def neutralize(self, text: str, max_retries: int = 2) -> Optional[str]:
+        """Neutralize text via round-trip translation through Mandarin.
+
+        Args:
+            text: Text to neutralize.
+            max_retries: Number of retry attempts.
+
+        Returns:
+            Neutralized text, or None if failed.
+        """
+        import re
+
+        word_count = len(text.split())
+
+        for attempt in range(max_retries):
+            try:
+                # Step 1: English → Mandarin (HSK3 constraint strips style)
+                mandarin = self._generate(
+                    system="You are a translator. Translate to simple Mandarin Chinese using only HSK3 vocabulary. Use short sentences. No idioms.",
+                    user=f"Translate to simple Mandarin:\n\n{text}",
+                    max_tokens=int(word_count * 3),  # Chinese chars ≈ words
+                )
+
+                if not mandarin or len(mandarin) < 10:
+                    logger.debug(f"RTT Step 1 failed: empty Mandarin (attempt {attempt + 1})")
+                    continue
+
+                # Step 2: Mandarin → Plain English
+                english = self._generate(
+                    system="You are a translator. Translate to simple, plain English. Use short sentences. No fancy words.",
+                    user=f"Translate to simple English:\n\n{mandarin}",
+                    max_tokens=int(word_count * 2),
+                )
+
+                if not english or len(english) < 10:
+                    logger.debug(f"RTT Step 2 failed: empty English (attempt {attempt + 1})")
+                    continue
+
+                # Clean response
+                english = english.strip()
+                english = re.sub(r'^```\w*\n?', '', english)
+                english = re.sub(r'\n?```$', '', english)
+
+                # Validate length
+                neutral_words = len(english.split())
+                if abs(neutral_words - word_count) > word_count * 0.5:
+                    logger.debug(f"RTT length mismatch: {neutral_words} vs {word_count} (attempt {attempt + 1})")
+                    continue
+
+                logger.debug(f"RTT success: {word_count} → {neutral_words} words")
+                return english
+
+            except Exception as e:
+                logger.warning(f"RTT attempt {attempt + 1} failed: {e}")
+
+        return None
+
+    def unload(self):
+        """Unload model to free memory."""
+        self._model = None
+        self._tokenizer = None
+        logger.info("RTT model unloaded")

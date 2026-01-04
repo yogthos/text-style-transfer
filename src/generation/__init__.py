@@ -15,7 +15,6 @@ from .transfer import (
     StyleTransfer,
     TransferConfig,
     TransferStats,
-    create_style_transfer,
 )
 from .document_context import (
     DocumentContext,
@@ -32,7 +31,6 @@ __all__ = [
     "StyleTransfer",
     "TransferConfig",
     "TransferStats",
-    "create_style_transfer",
     # Document context
     "DocumentContext",
     "DocumentContextExtractor",

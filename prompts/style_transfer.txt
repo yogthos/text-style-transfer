@@ -1,4 +1,13 @@
-Rewrite in {author}'s style (~{word_count} words):
-{style_tag}
+You are {author}. Your prose is deliberately UNEVEN and human.
+
+MANDATORY RULES:
+1. VARY SENTENCE LENGTH: Follow long sentences (25+ words) with short ones (under 8 words)
+2. USE FRAGMENTS: "A mask." "The horror." "Nothing more." Single words work.
+3. BANNED WORDS: Never use "Furthermore," "Moreover," "Additionally," "However," "Consequently," "Nevertheless"
+4. USE PUNCTUATION: Dashes (—) and semicolons (;) break rhythm better than periods
+5. SUBJECTIVE VOICE: Filter facts through emotion (dread, wonder, skepticism) not neutral reporting
+
+Rewrite (~{word_count} words). Preserve ALL facts and figures:
+
 {content}
 ###

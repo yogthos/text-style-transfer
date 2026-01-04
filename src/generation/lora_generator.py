@@ -13,7 +13,7 @@ import json
 import re
 from dataclasses import dataclass
 from pathlib import Path
-from typing import List, Optional
+from typing import Optional
 
 from ..utils.logging import get_logger
 from ..utils.prompts import format_prompt
@@ -369,9 +369,7 @@ class LoRAStyleGenerator:
         clean_words = len(response.split())
         if clean_words < raw_words * 0.7:
             logger.warning(f"_clean_response removed {raw_words - clean_words} words ({raw_words} → {clean_words})")
-            # Write raw response to debug file
-            with open("debug_transfer.log", "a") as f:
-                f.write(f"\n--- RAW LORA (before cleaning) ---\n{raw_response}\n")
+            logger.debug(f"Raw content before cleaning: {raw_response[:500]}...")
 
         return response
 
@@ -393,8 +391,6 @@ class LoRAStyleGenerator:
         Returns:
             Cleaned response text.
         """
-        import re
-
         # 1. Stop at ### markers (model uses these before repeating)
         if '###' in response:
             response = response.split('###')[0].strip()
@@ -442,56 +438,11 @@ class LoRAStyleGenerator:
 
         return response
 
-    def _remove_duplicates(self, text: str) -> str:
-        """Remove duplicate sentences and phrases from text.
-
-        Detects when the model repeats itself and removes the duplicate.
-        """
-        import re
-
-        # Split into sentences
-        sentences = re.split(r'(?<=[.!?])\s+', text)
-        if len(sentences) < 2:
-            return text
-
-        # Check for exact duplicate sentences
-        seen = set()
-        unique_sentences = []
-        for sent in sentences:
-            normalized = sent.strip().lower()
-            if normalized not in seen:
-                seen.add(normalized)
-                unique_sentences.append(sent)
-
-        # Check for mid-sentence repetition (phrase appears twice)
-        result = ' '.join(unique_sentences)
-
-        # Find repeated phrases of 10+ words
-        words = result.split()
-        if len(words) > 20:
-            # Look for repeated sequences
-            for phrase_len in range(15, 8, -1):  # Check phrases 15 down to 9 words
-                for i in range(len(words) - phrase_len * 2):
-                    phrase = ' '.join(words[i:i + phrase_len])
-                    rest = ' '.join(words[i + phrase_len:])
-                    if phrase.lower() in rest.lower():
-                        # Found duplicate - remove second occurrence
-                        pattern = re.escape(phrase)
-                        # Remove second occurrence only
-                        parts = re.split(pattern, result, flags=re.IGNORECASE)
-                        if len(parts) > 2:
-                            result = parts[0] + phrase + ''.join(parts[2:])
-                        break
-
-        return result.strip()
-
     def _ensure_complete_sentences(self, text: str) -> str:
         """Ensure text ends with a complete sentence.
 
         If text ends mid-sentence, truncate to the last complete sentence.
         """
-        import re
-
         text = text.strip()
         if not text:
             return text
@@ -519,29 +470,6 @@ class LoRAStyleGenerator:
             return text + '.'
 
         return text
-
-    def switch_adapter(self, adapter_path: str) -> None:
-        """Hot-swap to a different author's adapter.
-
-        Args:
-            adapter_path: Path to new adapter directory.
-        """
-        logger.info(f"Switching adapter to: {adapter_path}")
-
-        self.adapter_path = adapter_path
-        self._model = None  # Force reload
-
-        # Update metadata
-        metadata_path = Path(adapter_path) / "metadata.json"
-        if metadata_path.exists():
-            self.metadata = AdapterMetadata.from_file(metadata_path)
-            self.base_model_name = self.metadata.base_model
-
-    def get_author(self) -> str:
-        """Get the current author name from metadata."""
-        if self.metadata:
-            return self.metadata.author
-        return "Unknown"
 
     def unload(self) -> None:
         """Unload model to free memory."""

@@ -338,8 +338,8 @@ def load_and_prepare_corpus(
     print(f"  Split into {len(paragraphs)} paragraphs")
 
     if curate:
-        # Apply quality filtering
-        quality_paragraphs = [p for p in paragraphs if is_quality_paragraph(p)]
+        # Apply quality filtering (is_quality_paragraph returns (bool, reason) tuple)
+        quality_paragraphs = [p for p in paragraphs if is_quality_paragraph(p)[0]]
         print(f"  Quality filter: {len(quality_paragraphs)} passed")
 
         if target_tokens and quality_paragraphs:

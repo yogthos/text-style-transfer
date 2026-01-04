@@ -23,7 +23,7 @@ from ..utils.nlp import (
     is_heading,
 )
 from ..utils.logging import get_logger
-from ..utils.prompts import format_prompt, load_prompt
+from ..utils.prompts import format_prompt
 
 logger = get_logger(__name__)
 
@@ -63,7 +63,7 @@ class TransferConfig:
     truncate_over_expanded: bool = False  # If True, truncate; if False, allow longer output
 
     # LoRA influence settings
-    lora_scale: float = 1.0  # 0.0=base only, 0.5=half, 1.0=full, >1.0=amplified
+    lora_scale: float = 2.0  # Match training scale (alpha/rank = 128/64 = 2.0)
 
     # Neutralization settings
     skip_neutralization: bool = False  # If True, skip RTT and use original text as input
@@ -141,13 +141,12 @@ class StyleTransfer:
         self.critic_provider = critic_provider
 
         # Initialize generator
-        # When verification is disabled, also skip cleaning to see raw output
         gen_config = GenerationConfig(
             max_tokens=self.config.max_tokens,
             temperature=self.config.temperature,
             top_p=self.config.top_p,
-            lora_scale=getattr(self.config, 'lora_scale', 1.0),
-            skip_cleaning=not self.config.verify_entailment,  # Skip cleaning when --no-verify
+            lora_scale=getattr(self.config, 'lora_scale', 2.0),
+            skip_cleaning=False,  # Always clean output to remove garbage
         )
         self.generator = LoRAStyleGenerator(
             adapter_path=adapter_path,
@@ -176,45 +175,6 @@ class StyleTransfer:
             logger.info(f"Using critic provider for repairs: {self.critic_provider.provider_name}")
         else:
             logger.info("Verification disabled - using raw LoRA output (cleaning also disabled)")
-
-    def _extract_paragraph_thesis(self, paragraph: str) -> str:
-        """Extract the main thesis/point of a paragraph.
-
-        This helps the LoRA understand what it's trying to express overall,
-        not just individual propositions.
-
-        Args:
-            paragraph: Source paragraph text.
-
-        Returns:
-            One-sentence thesis statement.
-        """
-        if not self.critic_provider:
-            # Fallback: use first sentence as thesis
-            sentences = split_into_sentences(paragraph)
-            return sentences[0] if sentences else ""
-
-        try:
-            thesis_prompt = load_prompt("thesis_extraction")
-            response = self.critic_provider.call(
-                system_prompt=thesis_prompt,
-                user_prompt=f"Paragraph:\n{paragraph}\n\nMain point (one sentence):",
-                temperature=0.1,
-                max_tokens=100,
-            )
-            thesis = response.strip()
-            # Clean up common prefixes
-            for prefix in ["The main point is that ", "The thesis is that ", "This paragraph argues that "]:
-                if thesis.lower().startswith(prefix.lower()):
-                    thesis = thesis[len(prefix):]
-                    thesis = thesis[0].upper() + thesis[1:] if thesis else thesis
-                    break
-            logger.debug(f"Extracted paragraph thesis: {thesis[:80]}...")
-            return thesis
-        except Exception as e:
-            logger.warning(f"Thesis extraction failed: {e}")
-            sentences = split_into_sentences(paragraph)
-            return sentences[0] if sentences else ""
 
     def _rtt_neutralize(self, text: str, max_retries: int = 2) -> Optional[str]:
         """Round-Trip Translation neutralization via Mandarin pivot.
@@ -357,10 +317,6 @@ class StyleTransfer:
 
         comparator = SemanticGraphComparator()
 
-        # Extract paragraph thesis - the main point the writer needs to express
-        paragraph_thesis = self._extract_paragraph_thesis(paragraph)
-        logger.debug(f"Paragraph thesis: {paragraph_thesis[:80]}...")
-
         # ========================================
         # STEP 2: RTT Neutralization (match training format)
         # ========================================
@@ -385,11 +341,6 @@ class StyleTransfer:
                 rtt_output_words = len(content_for_generation.split())
                 logger.info(f"RTT INPUT ({rtt_input_words} words): {paragraph[:150]}...")
                 logger.info(f"RTT OUTPUT ({rtt_output_words} words): {content_for_generation[:150]}...")
-                # Write full text to debug file for comparison
-                with open("debug_transfer.log", "a") as f:
-                    f.write(f"\n{'='*60}\nPARAGRAPH {word_count} words\n{'='*60}\n")
-                    f.write(f"\n--- ORIGINAL ---\n{paragraph}\n")
-                    f.write(f"\n--- RTT OUTPUT ---\n{content_for_generation}\n")
 
         # ========================================
         # STEP 3: Pass to LoRA for style transformation
@@ -409,9 +360,6 @@ class StyleTransfer:
         lora_output_words = len(output.split())
         lora_input_words = len(content_for_generation.split())
         logger.info(f"LORA OUTPUT ({lora_output_words} words, target={target_words}): {output[:150]}...")
-        # Append LoRA output to debug file
-        with open("debug_transfer.log", "a") as f:
-            f.write(f"\n--- LORA OUTPUT ---\n{output}\n")
 
         # Check if LoRA output matches input (indicates no transformation)
         if output.strip() == paragraph.strip():
@@ -433,7 +381,6 @@ class StyleTransfer:
                 source_graph=source_graph,
                 builder=builder,
                 comparator=comparator,
-                previous=previous,
                 stats=stats,
                 max_attempts=self.config.max_repair_attempts,
             )
@@ -562,7 +509,6 @@ class StyleTransfer:
         source_graph,
         builder,
         comparator,
-        previous: Optional[str] = None,
         stats: Optional['TransferStats'] = None,
         max_attempts: int = 3,
     ) -> Tuple[str, bool]:
@@ -578,7 +524,6 @@ class StyleTransfer:
             source_graph: Semantic graph of source (ground truth).
             builder: SemanticGraphBuilder instance.
             comparator: SemanticGraphComparator instance.
-            previous: Previous paragraph for context.
             stats: Optional stats object to update.
             max_attempts: Max repair attempts.
 
@@ -849,43 +794,3 @@ class StyleTransfer:
         stats = getattr(self, '_transfer_stats', TransferStats())
 
         return "\n\n".join(outputs), stats
-
-    def switch_author(self, adapter_path: str, author_name: str) -> None:
-        """Switch to a different author.
-
-        Args:
-            adapter_path: Path to new adapter.
-            author_name: New author name.
-        """
-        self.generator.switch_adapter(adapter_path)
-        self.author = author_name
-        logger.info(f"Switched to author: {author_name}")
-
-
-def create_style_transfer(
-    adapter_path: str,
-    author_name: str,
-    verify: bool = True,
-    temperature: float = 0.7,
-) -> StyleTransfer:
-    """Convenience function to create a style transfer pipeline.
-
-    Args:
-        adapter_path: Path to LoRA adapter.
-        author_name: Author name.
-        verify: Whether to enable entailment verification.
-        temperature: Generation temperature.
-
-    Returns:
-        Configured StyleTransfer instance.
-    """
-    config = TransferConfig(
-        verify_entailment=verify,
-        temperature=temperature,
-    )
-
-    return StyleTransfer(
-        adapter_path=adapter_path,
-        author_name=author_name,
-        config=config,
-    )

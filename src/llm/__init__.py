@@ -12,7 +12,7 @@ from .provider import (
     create_critic_provider,
     register_provider,
 )
-from .mlx_provider import MLXGenerator, TextNeutralizer, create_mlx_generator
+from .mlx_provider import MLXGenerator
 
 # Import providers to register them
 from . import deepseek
@@ -32,6 +32,4 @@ __all__ = [
     "register_provider",
     # MLX
     "MLXGenerator",
-    "TextNeutralizer",
-    "create_mlx_generator",
 ]

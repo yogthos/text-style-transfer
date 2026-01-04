@@ -360,6 +360,8 @@ class RepetitionReducer:
 
     def _match_case(self, replacement: str, original: str) -> str:
         """Match the case of the replacement to the original."""
+        if not replacement or not original:
+            return replacement
         if original.isupper():
             return replacement.upper()
         elif original[0].isupper():
